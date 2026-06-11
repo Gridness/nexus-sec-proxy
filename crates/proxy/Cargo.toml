@@ -1,0 +1,21 @@
+[package]
+name = "nexus-sec-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+nexus-sec-proxy-cache = { path = "../cache" }
+nexus-sec-proxy-config = { path = "../config" }
+nexus-sec-proxy-security = { path = "../security" }
+percent-encoding.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true

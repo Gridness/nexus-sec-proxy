@@ -1,0 +1,50 @@
+[workspace]
+members = [
+	"crates/cache",
+	"crates/config",
+	"crates/proxy",
+	"crates/security",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+axum = "0.8.4"
+futures-util = "0.3.31"
+moka = { version = "0.12.10", features = ["future"] }
+percent-encoding = "2.3.1"
+reqwest = { version = "0.12.20", default-features = false, features = [
+	"json",
+	"rustls-tls",
+	"stream",
+] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.23.0"
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = [
+	"fs",
+	"io-util",
+	"macros",
+	"process",
+	"rt-multi-thread",
+	"signal",
+	"sync",
+] }
+tokio-util = { version = "0.7.17", features = ["io"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+url = "2.5.4"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -1,0 +1,177 @@
+name: Relase
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          staging="anicli-${tag}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp target/${{ matrix.target }}/release/anicli "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          cd artifacts
+          find . -name '*.tar.gz' -exec mv {} . \;
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+
+  homebrew:
+    name: Update Homebrew
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute macOS checksums and update formula
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            curl -sSL "${base}/anicli-${tag}-${target}.tar.gz" -o "${target}.tar.gz"
+          done
+
+          SHA_MAC_ARM=$(sha256sum aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_MAC_X86=$(sha256sum x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+
+          echo "macOS arm64   ${SHA_MAC_ARM}"
+          echo "macOS x86_64  ${SHA_MAC_X86}"
+
+          cat > anicli.rb << FORMULA
+          class IinaRequirement < Requirement
+            fatal true
+
+            satisfy(build_env: false) do
+              File.exist?("/Applications/IINA.app") ||
+              File.exist?(File.expand_path("~/Applications/IINA.app"))
+            end
+
+            def message
+              "IINA is required by anicli on macOS. Please install it with:\n  brew install --cask iina"
+            end
+          end
+
+          class Anicli < Formula
+            desc "Find your favorite anime titles in the terminal and watch them with mpv"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            license "AGPL-3.0-or-later"
+            version "${tag#v}"
+            depends_on :macos
+
+            on_macos do
+              depends_on IinaRequirement
+
+              if Hardware::CPU.arm?
+                url "${base}/anicli-${tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "${base}/anicli-${tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            def install
+              bin.install "anicli"
+            end
+
+            test do
+              assert_equal "anicli", shell_output("#{bin}/anicli --version").chomp
+            end
+          end
+          FORMULA
+
+          sed -i 's/^          //' anicli.rb
+
+          git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/Gridness/homebrew-oosama.git" tap
+          cp anicli.rb tap/Formula/anicli.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/anicli.rb
+          git diff --cached --quiet || git commit -m "Update anicli to ${tag}"
+          git push

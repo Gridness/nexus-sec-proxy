@@ -1,0 +1,122 @@
+name: nexus-sec-proxy
+
+x-scanner-cache-env: &scanner-cache-env
+  TRIVY_CACHE_DIR: /var/cache/trivy
+  GRYPE_DB_CACHE_DIR: /var/cache/grype/db
+
+services:
+  nexus-sec-proxy:
+    image: nexus-sec-proxy:${NEXUS_SEC_PROXY_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: runtime
+      args:
+        RUST_VERSION: ${RUST_VERSION:-1.95}
+        DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
+        TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
+        GRYPE_VERSION: ${GRYPE_VERSION:-0.112.0}
+        VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
+        VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
+        BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      <<: *scanner-cache-env
+      HOME: /home/nonroot
+      RUST_LOG: ${RUST_LOG:-nexus_sec_proxy=info}
+      NEXUS_SEC_PROXY_BIND_ADDR: 0.0.0.0:3000
+      NEXUS_SEC_PROXY_UPSTREAM_BASE_URL: ${NEXUS_SEC_PROXY_UPSTREAM_BASE_URL:-https://repo1.maven.org/maven2}
+      NEXUS_SEC_PROXY_REPOSITORY_FORMAT: ${NEXUS_SEC_PROXY_REPOSITORY_FORMAT:-maven2}
+      NEXUS_SEC_PROXY_OSV_API_URL: ${NEXUS_SEC_PROXY_OSV_API_URL:-https://api.osv.dev/v1/query}
+      NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY: ${NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY:-HIGH}
+      NEXUS_SEC_PROXY_ALLOWED_VULNERABILITY_IDS: ${NEXUS_SEC_PROXY_ALLOWED_VULNERABILITY_IDS:-}
+      NEXUS_SEC_PROXY_MAX_TOTAL_VULNERABILITIES: ${NEXUS_SEC_PROXY_MAX_TOTAL_VULNERABILITIES:-}
+      NEXUS_SEC_PROXY_MAX_LOW_VULNERABILITIES: ${NEXUS_SEC_PROXY_MAX_LOW_VULNERABILITIES:-}
+      NEXUS_SEC_PROXY_MAX_MEDIUM_VULNERABILITIES: ${NEXUS_SEC_PROXY_MAX_MEDIUM_VULNERABILITIES:-}
+      NEXUS_SEC_PROXY_MAX_HIGH_VULNERABILITIES: ${NEXUS_SEC_PROXY_MAX_HIGH_VULNERABILITIES:-}
+      NEXUS_SEC_PROXY_MAX_CRITICAL_VULNERABILITIES: ${NEXUS_SEC_PROXY_MAX_CRITICAL_VULNERABILITIES:-}
+      NEXUS_SEC_PROXY_FAIL_OPEN: ${NEXUS_SEC_PROXY_FAIL_OPEN:-true}
+      NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY: ${NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY:-allow}
+      NEXUS_SEC_PROXY_CACHE_ALLOWED_TTL_SECS: ${NEXUS_SEC_PROXY_CACHE_ALLOWED_TTL_SECS:-86400}
+      NEXUS_SEC_PROXY_CACHE_BLOCKED_TTL_SECS: ${NEXUS_SEC_PROXY_CACHE_BLOCKED_TTL_SECS:-3600}
+      NEXUS_SEC_PROXY_CACHE_MAX_CAPACITY: ${NEXUS_SEC_PROXY_CACHE_MAX_CAPACITY:-100000}
+      NEXUS_SEC_PROXY_REQUEST_TIMEOUT_SECS: ${NEXUS_SEC_PROXY_REQUEST_TIMEOUT_SECS:-30}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER:-trivy}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER_COMMAND: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_COMMAND:-trivy}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE:-true}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER_OFFLINE: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_OFFLINE:-true}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS:-300}
+      NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES: ${NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES:-536870912}
+      NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY:-2}
+      NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR: /var/tmp/nexus-sec-proxy
+    ports:
+      - "${NEXUS_SEC_PROXY_PORT:-3000}:3000"
+    volumes:
+      - artifact-tmp:/var/tmp/nexus-sec-proxy
+      - grype-cache:/var/cache/grype
+      - trivy-cache:/var/cache/trivy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/busybox",
+          "wget",
+          "-q",
+          "-O",
+          "-",
+          "http://127.0.0.1:3000/healthz",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Run before enabling offline Trivy scans:
+  # docker compose run --rm trivy-db-init
+  trivy-db-init:
+    image: aquasec/trivy:${TRIVY_VERSION:-0.71.0}
+    profiles:
+      - scanner-db
+    environment:
+      TRIVY_CACHE_DIR: /var/cache/trivy
+    command:
+      - image
+      - --download-db-only
+      - --cache-dir
+      - /var/cache/trivy
+    volumes:
+      - trivy-cache:/var/cache/trivy
+    network_mode: bridge
+
+  # Run before enabling offline Grype scans:
+  # docker compose run --rm grype-db-init
+  grype-db-init:
+    image: anchore/grype:v${GRYPE_VERSION:-0.112.0}
+    profiles:
+      - scanner-db
+    environment:
+      GRYPE_DB_CACHE_DIR: /var/cache/grype/db
+    command:
+      - db
+      - update
+    volumes:
+      - grype-cache:/var/cache/grype
+    network_mode: bridge
+
+volumes:
+  artifact-tmp:
+  grype-cache:
+  trivy-cache:
