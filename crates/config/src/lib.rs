@@ -1,16 +1,18 @@
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
 use nexus_sec_proxy_security::{
-	SecurityPolicy, Severity, SeverityParseError, VulnerabilityLimits,
-	default_osv_ecosystem_for_format,
+	PolicySet, PolicySetError, SecurityPolicy, Severity, SeverityParseError,
+	VulnerabilityLimits, default_osv_ecosystem_for_format,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_OSV_API_URL: &str = "https://api.osv.dev/v1/query";
+const DEFAULT_REPOSITORY_NAME: &str = "default";
 const DEFAULT_REPOSITORY_FORMAT: &str = "generic";
 const DEFAULT_CACHE_ALLOWED_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_CACHE_BLOCKED_TTL_SECS: u64 = 60 * 60;
@@ -56,6 +58,18 @@ pub enum ConfigError {
 	InvalidArtifactScanner { name: &'static str, value: String },
 	#[error("missing required environment variable: {name}")]
 	MissingRequired { name: &'static str },
+	#[error("failed to read policy file {path}")]
+	PolicyFileRead {
+		path: String,
+		#[source]
+		source: std::io::Error,
+	},
+	#[error("invalid policy file {path}")]
+	PolicyFileParse {
+		path: String,
+		#[source]
+		source: PolicySetError,
+	},
 }
 
 #[derive(
@@ -106,13 +120,16 @@ impl FromStr for ArtifactScannerKind {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppConfig {
 	pub bind_addr: SocketAddr,
 	pub upstream_base_url: String,
+	pub repository_name: String,
 	pub repository_format: String,
 	pub osv_ecosystem: Option<String>,
 	pub osv_api_url: String,
+	pub policy_file: Option<String>,
+	pub log_json: bool,
 	pub fail_open: bool,
 	pub unsupported_target_policy: UnsupportedTargetPolicy,
 	pub cache_allowed_ttl_secs: u64,
@@ -128,6 +145,7 @@ pub struct AppConfig {
 	pub artifact_scanner_concurrency: u64,
 	pub artifact_tmp_dir: Option<String>,
 	pub security_policy: SecurityPolicy,
+	pub policy_set: PolicySet,
 }
 
 impl AppConfig {
@@ -148,6 +166,11 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
 			Some("NEXUS_SEC_PROXY_UPSTREAM_REGISTRY"),
 		)?;
+		let repository_name = string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_REPOSITORY_NAME",
+			DEFAULT_REPOSITORY_NAME,
+		);
 		let repository_format = string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_REPOSITORY_FORMAT",
@@ -164,6 +187,10 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_OSV_API_URL",
 			DEFAULT_OSV_API_URL,
 		);
+		let policy_file =
+			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_POLICY_FILE");
+		let log_json =
+			bool_env(&mut lookup, "NEXUS_SEC_PROXY_LOG_JSON", false)?;
 		let fail_open =
 			bool_env(&mut lookup, "NEXUS_SEC_PROXY_FAIL_OPEN", true)?;
 		let unsupported_target_policy = unsupported_target_policy_env(
@@ -230,14 +257,18 @@ impl AppConfig {
 			&mut lookup,
 			"NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR",
 		);
-		let security_policy = security_policy_env(&mut lookup)?;
+		let (security_policy, policy_set) =
+			load_policy(&mut lookup, policy_file.as_deref())?;
 
 		Ok(Self {
 			bind_addr,
 			upstream_base_url,
+			repository_name,
 			repository_format,
 			osv_ecosystem,
 			osv_api_url,
+			policy_file,
+			log_json,
 			fail_open,
 			unsupported_target_policy,
 			cache_allowed_ttl_secs,
@@ -253,7 +284,37 @@ impl AppConfig {
 			artifact_scanner_concurrency,
 			artifact_tmp_dir,
 			security_policy,
+			policy_set,
 		})
+	}
+}
+
+fn load_policy(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	policy_file: Option<&str>,
+) -> Result<(SecurityPolicy, PolicySet), ConfigError> {
+	if let Some(path) = policy_file {
+		let content = fs::read_to_string(path).map_err(|source| {
+			ConfigError::PolicyFileRead {
+				path: path.to_owned(),
+				source,
+			}
+		})?;
+		let policy_set =
+			PolicySet::from_toml_str(&content).map_err(|source| {
+				ConfigError::PolicyFileParse {
+					path: path.to_owned(),
+					source,
+				}
+			})?;
+		let security_policy = policy_set.default_policy.policy.clone();
+
+		Ok((security_policy, policy_set))
+	} else {
+		let security_policy = security_policy_env(lookup)?;
+		let policy_set = PolicySet::from_legacy_policy(security_policy.clone());
+
+		Ok((security_policy, policy_set))
 	}
 }
 
@@ -483,6 +544,7 @@ fn list_env(
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeMap;
+	use std::io::Write;
 
 	use super::*;
 
@@ -502,6 +564,10 @@ mod tests {
 			config.security_policy.minimum_blocking_severity,
 			Severity::High
 		);
+		assert_eq!(config.repository_name, "default");
+		assert_eq!(config.policy_file, None);
+		assert!(!config.log_json);
+		assert_eq!(config.policy_set.default_policy.id, "default");
 		assert_eq!(
 			config.security_policy.effective_limit(Severity::Medium),
 			None
@@ -559,6 +625,54 @@ mod tests {
 		assert_eq!(config.security_policy.limits.medium, Some(2));
 		assert_eq!(config.security_policy.limits.high, Some(1));
 		assert_eq!(config.security_policy.limits.critical, Some(0));
+		assert_eq!(
+			config
+				.policy_set
+				.default_policy
+				.policy
+				.minimum_blocking_severity,
+			Severity::Medium
+		);
+	}
+
+	#[test]
+	fn loads_policy_file_and_ignores_legacy_policy_env() {
+		let mut policy_file = tempfile::NamedTempFile::new().unwrap();
+		write!(
+			policy_file,
+			r#"
+			[default_policy]
+			id = "file-default"
+			minimum_blocking_severity = "critical"
+			mode = "report_only"
+			"#
+		)
+		.unwrap();
+		let path = policy_file.path().to_string_lossy().into_owned();
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_POLICY_FILE", path.as_str()),
+			("NEXUS_SEC_PROXY_REPOSITORY_NAME", "npm-internal"),
+			("NEXUS_SEC_PROXY_LOG_JSON", "true"),
+			("NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY", "LOW"),
+		]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(config.repository_name, "npm-internal");
+		assert_eq!(config.policy_file.as_deref(), Some(path.as_str()));
+		assert!(config.log_json);
+		assert_eq!(config.policy_set.default_policy.id, "file-default");
+		assert_eq!(
+			config.security_policy.minimum_blocking_severity,
+			Severity::Critical
+		);
 	}
 
 	#[test]

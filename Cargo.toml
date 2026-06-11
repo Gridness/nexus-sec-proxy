@@ -28,6 +28,12 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tempfile = "3.23.0"
 thiserror = "2.0.12"
+time = { version = "0.3.44", features = [
+	"formatting",
+	"parsing",
+	"serde",
+	"std",
+] }
 tokio = { version = "1.45.1", features = [
 	"fs",
 	"io-util",
@@ -38,8 +44,13 @@ tokio = { version = "1.45.1", features = [
 	"sync",
 ] }
 tokio-util = { version = "0.7.17", features = ["io"] }
+toml = "0.9.8"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.19", features = [
+	"env-filter",
+	"fmt",
+	"json",
+] }
 url = "2.5.4"
 
 [profile.release]

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
+use nexus_sec_proxy_security::Vulnerability;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,50 +44,33 @@ impl CacheKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CachedDecision {
-	Allowed,
-	Blocked {
-		vulnerability_ids: Vec<String>,
-		body: String,
-	},
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedScan {
-	pub decision: CachedDecision,
+	pub vulnerabilities: Vec<Vulnerability>,
 }
 
 impl CachedScan {
 	#[must_use]
-	pub fn allowed() -> Self {
+	pub fn new(vulnerabilities: Vec<Vulnerability>) -> Self {
+		Self { vulnerabilities }
+	}
+
+	#[must_use]
+	pub fn empty() -> Self {
 		Self {
-			decision: CachedDecision::Allowed,
+			vulnerabilities: Vec::new(),
 		}
 	}
 
 	#[must_use]
-	pub fn blocked(
-		vulnerability_ids: Vec<String>,
-		body: impl Into<String>,
-	) -> Self {
-		Self {
-			decision: CachedDecision::Blocked {
-				vulnerability_ids,
-				body: body.into(),
-			},
-		}
-	}
-
-	#[must_use]
-	pub fn is_blocked(&self) -> bool {
-		matches!(self.decision, CachedDecision::Blocked { .. })
+	pub fn has_vulnerabilities(&self) -> bool {
+		!self.vulnerabilities.is_empty()
 	}
 }
 
 #[derive(Debug, Clone)]
 pub struct MokaScanCache {
-	allowed: Cache<CacheKey, CachedScan>,
-	blocked: Cache<CacheKey, CachedScan>,
+	clean: Cache<CacheKey, CachedScan>,
+	vulnerable: Cache<CacheKey, CachedScan>,
 }
 
 impl MokaScanCache {
@@ -97,11 +81,11 @@ impl MokaScanCache {
 		blocked_ttl: Duration,
 	) -> Self {
 		Self {
-			allowed: Cache::builder()
+			clean: Cache::builder()
 				.max_capacity(max_capacity)
 				.time_to_live(allowed_ttl)
 				.build(),
-			blocked: Cache::builder()
+			vulnerable: Cache::builder()
 				.max_capacity(max_capacity)
 				.time_to_live(blocked_ttl)
 				.build(),
@@ -110,7 +94,7 @@ impl MokaScanCache {
 
 	#[must_use]
 	pub fn len(&self) -> u64 {
-		self.allowed.entry_count() + self.blocked.entry_count()
+		self.clean.entry_count() + self.vulnerable.entry_count()
 	}
 
 	#[must_use]
@@ -141,10 +125,10 @@ impl ScanCache for MokaScanCache {
 		&self,
 		key: &CacheKey,
 	) -> Result<Option<CachedScan>, CacheError> {
-		if let Some(scan) = self.blocked.get(key).await {
+		if let Some(scan) = self.vulnerable.get(key).await {
 			Ok(Some(scan))
 		} else {
-			Ok(self.allowed.get(key).await)
+			Ok(self.clean.get(key).await)
 		}
 	}
 
@@ -153,29 +137,34 @@ impl ScanCache for MokaScanCache {
 		key: CacheKey,
 		scan: CachedScan,
 	) -> Result<(), CacheError> {
-		if scan.is_blocked() {
-			self.allowed.invalidate(&key).await;
-			self.blocked.insert(key, scan).await;
+		if scan.has_vulnerabilities() {
+			self.clean.invalidate(&key).await;
+			self.vulnerable.insert(key, scan).await;
 		} else {
-			self.blocked.invalidate(&key).await;
-			self.allowed.insert(key, scan).await;
+			self.vulnerable.invalidate(&key).await;
+			self.clean.insert(key, scan).await;
 		}
 		Ok(())
 	}
 
 	async fn invalidate(&self, key: &CacheKey) -> Result<(), CacheError> {
-		self.allowed.invalidate(key).await;
-		self.blocked.invalidate(key).await;
+		self.clean.invalidate(key).await;
+		self.vulnerable.invalidate(key).await;
 		Ok(())
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use nexus_sec_proxy_security::{
+		PackageCoordinate, PolicyContext, PolicyEvaluator, PolicyOutcome,
+		ScanTarget, SecurityPolicy, Severity, VulnerabilityLimits,
+	};
+
 	use super::*;
 
 	#[tokio::test]
-	async fn stores_and_reads_allowed_scan() {
+	async fn stores_and_reads_empty_scan() {
 		let cache = MokaScanCache::new(
 			100,
 			Duration::from_secs(60),
@@ -183,9 +172,9 @@ mod tests {
 		);
 		let key = CacheKey::new("Maven", "Maven/org.example:demo", "1.0.0");
 
-		cache.put(key.clone(), CachedScan::allowed()).await.unwrap();
+		cache.put(key.clone(), CachedScan::empty()).await.unwrap();
 
-		assert_eq!(cache.get(&key).await.unwrap(), Some(CachedScan::allowed()));
+		assert_eq!(cache.get(&key).await.unwrap(), Some(CachedScan::empty()));
 	}
 
 	#[tokio::test]
@@ -197,14 +186,14 @@ mod tests {
 		);
 		let key = CacheKey::new("npm", "npm/left-pad", "1.0.0");
 
-		cache.put(key.clone(), CachedScan::allowed()).await.unwrap();
+		cache.put(key.clone(), CachedScan::empty()).await.unwrap();
 		cache.invalidate(&key).await.unwrap();
 
 		assert_eq!(cache.get(&key).await.unwrap(), None);
 	}
 
 	#[tokio::test]
-	async fn expires_using_decision_specific_ttl() {
+	async fn expires_using_vulnerability_presence_ttl() {
 		let cache = MokaScanCache::new(
 			100,
 			Duration::from_millis(50),
@@ -214,13 +203,13 @@ mod tests {
 		let blocked_key = CacheKey::new("npm", "npm/blocked", "1.0.0");
 
 		cache
-			.put(allowed_key.clone(), CachedScan::allowed())
+			.put(allowed_key.clone(), CachedScan::empty())
 			.await
 			.unwrap();
 		cache
 			.put(
 				blocked_key.clone(),
-				CachedScan::blocked(vec!["CVE-1".to_owned()], "blocked"),
+				CachedScan::new(vec![vulnerability("CVE-1")]),
 			)
 			.await
 			.unwrap();
@@ -228,5 +217,71 @@ mod tests {
 
 		assert_eq!(cache.get(&allowed_key).await.unwrap(), None);
 		assert!(cache.get(&blocked_key).await.unwrap().is_some());
+	}
+
+	#[tokio::test]
+	async fn cached_vulnerabilities_are_re_evaluated_under_current_policy() {
+		let cache = MokaScanCache::new(
+			100,
+			Duration::from_secs(60),
+			Duration::from_secs(60),
+		);
+		let key = CacheKey::new("npm", "npm/left-pad", "1.0.0");
+		let target = ScanTarget::Package(PackageCoordinate::new(
+			"npm", "left-pad", "1.0.0",
+		));
+		let context = PolicyContext::new("default", "npm", None::<String>);
+
+		cache
+			.put(
+				key.clone(),
+				CachedScan::new(vec![vulnerability_with_severity(
+					"CVE-1",
+					Severity::High,
+				)]),
+			)
+			.await
+			.unwrap();
+
+		let cached = cache.get(&key).await.unwrap().unwrap();
+		let strict = PolicyEvaluator::default().evaluate_with_context(
+			&context,
+			&target,
+			cached.vulnerabilities.clone(),
+		);
+		let lenient = PolicyEvaluator::new(SecurityPolicy::new(
+			Severity::Critical,
+			std::iter::empty::<&str>(),
+			VulnerabilityLimits::default(),
+		))
+		.evaluate_with_context(&context, &target, cached.vulnerabilities);
+
+		assert!(strict.is_blocked());
+		assert!(matches!(lenient.outcome, PolicyOutcome::Allowed));
+	}
+
+	fn vulnerability(id: &str) -> Vulnerability {
+		Vulnerability {
+			id: id.to_owned(),
+			aliases: Vec::new(),
+			summary: None,
+			details: None,
+			severity: None,
+			references: Vec::new(),
+		}
+	}
+
+	fn vulnerability_with_severity(
+		id: &str,
+		severity: Severity,
+	) -> Vulnerability {
+		Vulnerability {
+			id: id.to_owned(),
+			aliases: Vec::new(),
+			summary: None,
+			details: None,
+			severity: Some(severity),
+			references: Vec::new(),
+		}
 	}
 }

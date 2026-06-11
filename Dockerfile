@@ -75,11 +75,12 @@ FROM debian:${DEBIAN_VERSION}-slim AS runtime-layout
 
 RUN set -eux; \
 	mkdir -p \
+		/layout/etc/nexus-sec-proxy \
 		/layout/home/nonroot \
 		/layout/var/cache/grype/db \
 		/layout/var/cache/trivy \
 		/layout/var/tmp/nexus-sec-proxy; \
-	chown -R 65532:65532 /layout/home/nonroot /layout/var
+	chown -R 65532:65532 /layout/etc/nexus-sec-proxy /layout/home/nonroot /layout/var
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
@@ -97,10 +98,13 @@ LABEL org.opencontainers.image.title="nexus-sec-proxy" \
 ENV HOME=/home/nonroot \
 	RUST_LOG=nexus_sec_proxy=info \
 	NEXUS_SEC_PROXY_BIND_ADDR=0.0.0.0:3000 \
+	NEXUS_SEC_PROXY_REPOSITORY_NAME=default \
+	NEXUS_SEC_PROXY_LOG_JSON=false \
 	NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy \
 	TRIVY_CACHE_DIR=/var/cache/trivy \
 	GRYPE_DB_CACHE_DIR=/var/cache/grype/db
 
+COPY --from=runtime-layout --chown=65532:65532 /layout/etc /etc
 COPY --from=runtime-layout --chown=65532:65532 /layout/home /home
 COPY --from=runtime-layout --chown=65532:65532 /layout/var /var
 COPY --from=builder /out/nexus-sec-proxy /usr/local/bin/nexus-sec-proxy
