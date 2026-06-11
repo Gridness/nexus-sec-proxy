@@ -116,3 +116,28 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
 	CMD ["/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/healthz"]
 
 ENTRYPOINT ["/usr/local/bin/nexus-sec-proxy"]
+
+FROM debian:${DEBIAN_VERSION}-slim AS scanner-db-updater
+
+RUN set -eux; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends ca-certificates; \
+	rm -rf /var/lib/apt/lists/*; \
+	mkdir -p /home/nonroot /var/cache/grype/db /var/cache/trivy; \
+	chown -R 65532:65532 /home/nonroot /var/cache/grype /var/cache/trivy
+
+ENV HOME=/home/nonroot \
+	TRIVY_CACHE_DIR=/var/cache/trivy \
+	GRYPE_DB_CACHE_DIR=/var/cache/grype/db \
+	NEXUS_SEC_PROXY_SCANNER_DB_UPDATE_INTERVAL_SECS=21600 \
+	NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS=300
+
+COPY --from=scanners /out/trivy /usr/local/bin/trivy
+COPY --from=scanners /out/grype /usr/local/bin/grype
+COPY scripts/scanner-db-updater.sh /usr/local/bin/scanner-db-updater
+
+RUN chmod 0755 /usr/local/bin/scanner-db-updater
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/scanner-db-updater"]
+CMD ["loop"]
