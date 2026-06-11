@@ -743,7 +743,9 @@ mod tests {
 	use nexus_sec_proxy_config::{
 		AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy,
 	};
-	use nexus_sec_proxy_security::{PackageIdentity, SecurityPolicy};
+	use nexus_sec_proxy_security::{
+		PackageIdentity, PolicySet, SecurityPolicy,
+	};
 
 	use super::*;
 
@@ -972,9 +974,12 @@ mod tests {
 		AppConfig {
 			bind_addr: "127.0.0.1:3000".parse().unwrap(),
 			upstream_base_url: "https://repo.example.invalid".to_owned(),
+			repository_name: "default".to_owned(),
 			repository_format: format.to_owned(),
 			osv_ecosystem: ecosystem.map(str::to_owned),
 			osv_api_url: "https://api.osv.dev/v1/query".to_owned(),
+			policy_file: None,
+			log_json: false,
 			fail_open: true,
 			unsupported_target_policy: UnsupportedTargetPolicy::Allow,
 			cache_allowed_ttl_secs: 86_400,
@@ -990,6 +995,7 @@ mod tests {
 			artifact_scanner_concurrency: 2,
 			artifact_tmp_dir: None,
 			security_policy: SecurityPolicy::default(),
+			policy_set: PolicySet::default(),
 		}
 	}
 

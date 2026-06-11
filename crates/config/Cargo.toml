@@ -8,3 +8,6 @@ rust-version.workspace = true
 nexus-sec-proxy-security = { path = "../security" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

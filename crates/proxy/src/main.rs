@@ -1,5 +1,6 @@
 mod classifier;
 
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,16 +14,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use classifier::{RequestClassification, classify_request};
 use futures_util::StreamExt;
-use nexus_sec_proxy_cache::{
-	CacheKey, CachedDecision, CachedScan, MokaScanCache, ScanCache,
-};
+use nexus_sec_proxy_cache::{CacheKey, CachedScan, MokaScanCache, ScanCache};
 use nexus_sec_proxy_config::{
 	AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy,
 };
 use nexus_sec_proxy_security::{
 	BlockReport, ExternalScanner, ExternalScannerKind, OsvClient,
-	PolicyEvaluator, ScanDecision, ScanTarget, SecurityError,
-	VulnerabilityEvaluator, VulnerabilitySource,
+	PolicyContext, PolicyEvaluation, PolicyEvaluator, PolicyOutcome,
+	ScanTarget, SecurityError, VulnerabilitySource,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -39,6 +38,7 @@ struct AppState {
 	osv: OsvClient,
 	artifact_scanner: Option<ExternalScanner>,
 	artifact_scanner_semaphore: Arc<Semaphore>,
+	policy_context: PolicyContext,
 	evaluator: PolicyEvaluator,
 }
 
@@ -56,14 +56,7 @@ enum ArtifactFetch {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	tracing_subscriber::fmt()
-		.with_env_filter(
-			tracing_subscriber::EnvFilter::try_from_default_env()
-				.unwrap_or_else(|_| {
-					"nexus_sec_proxy=info,tower_http=info".into()
-				}),
-		)
-		.init();
+	init_tracing(env_log_json());
 
 	let config = AppConfig::from_env().map_err(|error| {
 		error!(%error, "failed to load configuration");
@@ -88,7 +81,10 @@ async fn main() -> anyhow::Result<()> {
 	let artifact_scanner_semaphore = Arc::new(Semaphore::new(
 		config.artifact_scanner_concurrency.max(1) as usize,
 	));
-	let evaluator = PolicyEvaluator::new(config.security_policy.clone());
+	let evaluator = PolicyEvaluator::from_policy_set(config.policy_set.clone());
+	let policy_context = config
+		.policy_set
+		.context(&config.repository_name, &config.repository_format);
 	let state = Arc::new(AppState {
 		config: Arc::new(config),
 		upstream_base_url,
@@ -97,15 +93,19 @@ async fn main() -> anyhow::Result<()> {
 		osv,
 		artifact_scanner,
 		artifact_scanner_semaphore,
+		policy_context,
 		evaluator,
 	});
 
 	info!(
 		bind_addr = %bind_addr,
 		upstream_base_url = %state.config.upstream_base_url,
+		repository_name = %state.config.repository_name,
 		repository_format = %state.config.repository_format,
+		team = state.policy_context.team.as_deref().unwrap_or(""),
 		osv_ecosystem = ?state.config.osv_ecosystem,
 		osv_api_url = %state.config.osv_api_url,
+		policy_file = ?state.config.policy_file,
 		fail_open = state.config.fail_open,
 		unsupported_target_policy = ?state.config.unsupported_target_policy,
 		artifact_scanner = ?state.config.artifact_scanner,
@@ -128,6 +128,27 @@ async fn main() -> anyhow::Result<()> {
 		.context("server failed")?;
 
 	Ok(())
+}
+
+fn init_tracing(json: bool) {
+	let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| "nexus_sec_proxy=info,tower_http=info".into());
+
+	if json {
+		tracing_subscriber::fmt()
+			.json()
+			.with_env_filter(filter)
+			.init();
+	} else {
+		tracing_subscriber::fmt().with_env_filter(filter).init();
+	}
+}
+
+fn env_log_json() -> bool {
+	env::var("NEXUS_SEC_PROXY_LOG_JSON")
+		.ok()
+		.and_then(|value| value.parse().ok())
+		.unwrap_or(false)
 }
 
 async fn healthz() -> &'static str {
@@ -192,7 +213,15 @@ async fn authorize_package_target(
 
 	match state.cache.get(&cache_key).await {
 		Ok(Some(scan)) => {
-			return cached_decision_to_result(scan);
+			return handle_policy_evaluation(
+				state,
+				&target,
+				state.evaluator.evaluate_with_context(
+					&state.policy_context,
+					&target,
+					scan.vulnerabilities,
+				),
+			);
 		}
 		Ok(None) => {}
 		Err(error) => {
@@ -202,7 +231,18 @@ async fn authorize_package_target(
 
 	let decision = match state.osv.vulnerabilities(&target).await {
 		Ok(vulnerabilities) => {
-			state.evaluator.evaluate(&target, vulnerabilities)
+			put_cache(
+				state,
+				cache_key,
+				CachedScan::new(vulnerabilities.clone()),
+				&target,
+			)
+			.await;
+			state.evaluator.evaluate_with_context(
+				&state.policy_context,
+				&target,
+				vulnerabilities,
+			)
 		}
 		Err(SecurityError::UnsupportedTarget(reason)) => {
 			return handle_unsupported_target(state, target, reason).await;
@@ -228,28 +268,7 @@ async fn authorize_package_target(
 		}
 	};
 
-	match decision {
-		ScanDecision::Allowed => {
-			put_cache(state, cache_key, CachedScan::allowed(), &target).await;
-			Ok(())
-		}
-		ScanDecision::Blocked(report) => {
-			let body = report.to_plain_text();
-			let vulnerability_ids = report
-				.vulnerabilities
-				.iter()
-				.map(|vulnerability| vulnerability.id.clone())
-				.collect();
-			put_cache(
-				state,
-				cache_key,
-				CachedScan::blocked(vulnerability_ids, body.clone()),
-				&report.target,
-			)
-			.await;
-			Err(Box::new(response_with_text(StatusCode::FORBIDDEN, body)))
-		}
-	}
+	handle_policy_evaluation(state, &target, decision)
 }
 
 async fn handle_artifact_request(
@@ -265,13 +284,21 @@ async fn handle_artifact_request(
 
 	let cache_key = cache_key_for_target(&target);
 	match state.cache.get(&cache_key).await {
-		Ok(Some(scan)) => match cached_decision_to_result(scan) {
-			Ok(()) => {
-				return forward_or_bad_gateway(state, method, uri, headers)
-					.await;
+		Ok(Some(scan)) => {
+			let evaluation = state.evaluator.evaluate_with_context(
+				&state.policy_context,
+				&target,
+				scan.vulnerabilities,
+			);
+
+			match handle_policy_evaluation(state, &target, evaluation) {
+				Ok(()) => {
+					return forward_or_bad_gateway(state, method, uri, headers)
+						.await;
+				}
+				Err(response) => return *response,
 			}
-			Err(response) => return *response,
-		},
+		}
 		Ok(None) => {}
 		Err(error) => {
 			error!(%error, target = %target.display_name(), "cache lookup failed");
@@ -343,7 +370,18 @@ async fn handle_artifact_request(
 		.await
 	{
 		Ok(vulnerabilities) => {
-			state.evaluator.evaluate(&target, vulnerabilities)
+			put_cache(
+				state,
+				cache_key,
+				CachedScan::new(vulnerabilities.clone()),
+				&target,
+			)
+			.await;
+			state.evaluator.evaluate_with_context(
+				&state.policy_context,
+				&target,
+				vulnerabilities,
+			)
 		}
 		Err(error) => {
 			error!(%error, target = %target.display_name(), "artifact scanner failed");
@@ -366,27 +404,9 @@ async fn handle_artifact_request(
 		}
 	};
 
-	match decision {
-		ScanDecision::Allowed => {
-			put_cache(state, cache_key, CachedScan::allowed(), &target).await;
-			prefetched_or_bad_gateway(prefetched).await
-		}
-		ScanDecision::Blocked(report) => {
-			let body = report.to_plain_text();
-			let vulnerability_ids = report
-				.vulnerabilities
-				.iter()
-				.map(|vulnerability| vulnerability.id.clone())
-				.collect();
-			put_cache(
-				state,
-				cache_key,
-				CachedScan::blocked(vulnerability_ids, body.clone()),
-				&report.target,
-			)
-			.await;
-			response_with_text(StatusCode::FORBIDDEN, body)
-		}
+	match handle_policy_evaluation(state, &target, decision) {
+		Ok(()) => prefetched_or_bad_gateway(prefetched).await,
+		Err(response) => *response,
 	}
 }
 
@@ -414,15 +434,106 @@ async fn handle_unsupported_target(
 	}
 }
 
-fn cached_decision_to_result(
-	scan: CachedScan,
+fn handle_policy_evaluation(
+	state: &AppState,
+	target: &ScanTarget,
+	evaluation: PolicyEvaluation,
 ) -> Result<(), Box<Response<Body>>> {
-	match scan.decision {
-		CachedDecision::Allowed => Ok(()),
-		CachedDecision::Blocked { body, .. } => {
-			Err(Box::new(response_with_text(StatusCode::FORBIDDEN, body)))
+	audit_policy_evaluation(state, target, &evaluation);
+
+	match evaluation.outcome {
+		PolicyOutcome::Allowed | PolicyOutcome::ReportOnly(_) => Ok(()),
+		PolicyOutcome::Blocked(report) => Err(Box::new(response_with_text(
+			StatusCode::FORBIDDEN,
+			report.to_plain_text(),
+		))),
+	}
+}
+
+fn audit_policy_evaluation(
+	state: &AppState,
+	target: &ScanTarget,
+	evaluation: &PolicyEvaluation,
+) {
+	let context = &state.policy_context;
+	let target_display = target.display_name();
+	let team = context.team.as_deref().unwrap_or("");
+
+	for exception in &evaluation.applied_exceptions {
+		info!(
+			repository = %context.repository,
+			format = %context.format,
+			team = %team,
+			policy_id = %evaluation.policy_id,
+			mode = %evaluation.mode,
+			target = %target_display,
+			vulnerability_ids = ?exception.vulnerability_ids,
+			exception_id = %exception.id,
+			exception_owner = %exception.owner,
+			exception_ticket = %exception.ticket,
+			exception_reason = %exception.reason,
+			exception_expires_at = %exception.expires_at,
+			"policy_exception_applied"
+		);
+	}
+
+	for exception in &evaluation.expired_exceptions {
+		warn!(
+			repository = %context.repository,
+			format = %context.format,
+			team = %team,
+			policy_id = %evaluation.policy_id,
+			mode = %evaluation.mode,
+			target = %target_display,
+			vulnerability_ids = ?exception.vulnerability_ids,
+			exception_id = %exception.id,
+			exception_owner = %exception.owner,
+			exception_ticket = %exception.ticket,
+			exception_reason = %exception.reason,
+			exception_expires_at = %exception.expires_at,
+			"policy_exception_expired_match"
+		);
+	}
+
+	match &evaluation.outcome {
+		PolicyOutcome::Allowed => {}
+		PolicyOutcome::ReportOnly(report) => {
+			warn!(
+				repository = %context.repository,
+				format = %context.format,
+				team = %team,
+				policy_id = %evaluation.policy_id,
+				mode = %evaluation.mode,
+				target = %target_display,
+				vulnerability_ids = ?vulnerability_ids(report),
+				applied_exceptions = ?evaluation.applied_exceptions,
+				expired_exceptions = ?evaluation.expired_exceptions,
+				"policy_report_only_violation"
+			);
+		}
+		PolicyOutcome::Blocked(report) => {
+			warn!(
+				repository = %context.repository,
+				format = %context.format,
+				team = %team,
+				policy_id = %evaluation.policy_id,
+				mode = %evaluation.mode,
+				target = %target_display,
+				vulnerability_ids = ?vulnerability_ids(report),
+				applied_exceptions = ?evaluation.applied_exceptions,
+				expired_exceptions = ?evaluation.expired_exceptions,
+				"policy_blocked"
+			);
 		}
 	}
+}
+
+fn vulnerability_ids(report: &BlockReport) -> Vec<String> {
+	report
+		.vulnerabilities
+		.iter()
+		.map(|vulnerability| vulnerability.id.clone())
+		.collect()
 }
 
 async fn put_cache(

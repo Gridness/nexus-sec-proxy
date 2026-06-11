@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -6,11 +6,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::process::Command;
-use tokio::time;
+use tokio::time as tokio_time;
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -239,9 +242,7 @@ fn normalize_repository_format(repository_format: &str) -> String {
 		.collect()
 }
 
-#[derive(
-	Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Severity {
 	Low,
@@ -286,6 +287,37 @@ impl FromStr for Severity {
 				input: input.to_owned(),
 			}),
 		}
+	}
+}
+
+impl<'de> Deserialize<'de> for Severity {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct SeverityVisitor;
+
+		impl<'de> Visitor<'de> for SeverityVisitor {
+			type Value = Severity;
+
+			fn expecting(
+				&self,
+				formatter: &mut fmt::Formatter<'_>,
+			) -> fmt::Result {
+				formatter.write_str(
+					"a severity such as LOW, MEDIUM, HIGH, or CRITICAL",
+				)
+			}
+
+			fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+			where
+				E: de::Error,
+			{
+				value.parse().map_err(E::custom)
+			}
+		}
+
+		deserializer.deserialize_str(SeverityVisitor)
 	}
 }
 
@@ -393,6 +425,639 @@ impl VulnerabilityLimits {
 	}
 }
 
+#[derive(Debug, Error)]
+pub enum PolicySetError {
+	#[error("invalid policy file TOML: {0}")]
+	Parse(#[from] toml::de::Error),
+	#[error("policy id is required for [[policies]] entry at index {index}")]
+	MissingPolicyId { index: usize },
+	#[error("{entity} field {field} must not be empty")]
+	EmptyField {
+		entity: &'static str,
+		field: &'static str,
+	},
+	#[error("duplicate policy id: {id}")]
+	DuplicatePolicyId { id: String },
+	#[error("duplicate exception id: {id}")]
+	DuplicateExceptionId { id: String },
+	#[error("invalid expires_at for exception {id}: {expires_at}")]
+	InvalidExceptionExpiry {
+		id: String,
+		expires_at: String,
+		#[source]
+		source: time::error::Parse,
+	},
+	#[error("exception {id} must list at least one vulnerability id")]
+	EmptyExceptionVulnerabilityIds { id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+	Enforce,
+	ReportOnly,
+}
+
+impl EnforcementMode {
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Enforce => "enforce",
+			Self::ReportOnly => "report_only",
+		}
+	}
+}
+
+impl Default for EnforcementMode {
+	fn default() -> Self {
+		Self::Enforce
+	}
+}
+
+impl fmt::Display for EnforcementMode {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.as_str())
+	}
+}
+
+impl FromStr for EnforcementMode {
+	type Err = ();
+
+	fn from_str(input: &str) -> Result<Self, Self::Err> {
+		match input.trim().to_ascii_lowercase().as_str() {
+			"enforce" | "enforced" | "block" | "blocking" => Ok(Self::Enforce),
+			"report_only" | "report-only" | "reportonly" | "audit" => {
+				Ok(Self::ReportOnly)
+			}
+			_ => Err(()),
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for EnforcementMode {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct EnforcementModeVisitor;
+
+		impl<'de> Visitor<'de> for EnforcementModeVisitor {
+			type Value = EnforcementMode;
+
+			fn expecting(
+				&self,
+				formatter: &mut fmt::Formatter<'_>,
+			) -> fmt::Result {
+				formatter.write_str("enforce or report_only")
+			}
+
+			fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+			where
+				E: de::Error,
+			{
+				value.parse().map_err(|()| {
+					E::custom(format!("invalid enforcement mode: {value}"))
+				})
+			}
+		}
+
+		deserializer.deserialize_str(EnforcementModeVisitor)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PolicyScope {
+	#[serde(default)]
+	pub repositories: Vec<String>,
+	#[serde(default)]
+	pub formats: Vec<String>,
+	#[serde(default)]
+	pub teams: Vec<String>,
+}
+
+impl PolicyScope {
+	#[must_use]
+	pub fn new(
+		repositories: Vec<String>,
+		formats: Vec<String>,
+		teams: Vec<String>,
+	) -> Self {
+		Self {
+			repositories: normalized_selector_list(repositories),
+			formats: normalized_selector_list(formats),
+			teams: normalized_selector_list(teams),
+		}
+	}
+
+	#[must_use]
+	pub fn matches(&self, context: &PolicyContext) -> bool {
+		matches_case_insensitive_selector(
+			&self.repositories,
+			Some(&context.repository),
+		) && matches_case_insensitive_selector(
+			&self.formats,
+			Some(&context.format),
+		) && matches_case_insensitive_selector(
+			&self.teams,
+			context.team.as_deref(),
+		)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyRule {
+	pub id: String,
+	pub mode: EnforcementMode,
+	pub scope: PolicyScope,
+	pub policy: SecurityPolicy,
+}
+
+impl PolicyRule {
+	#[must_use]
+	pub fn new(
+		id: impl Into<String>,
+		mode: EnforcementMode,
+		scope: PolicyScope,
+		policy: SecurityPolicy,
+	) -> Self {
+		Self {
+			id: id.into(),
+			mode,
+			scope,
+			policy,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryPolicy {
+	pub team: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyExceptionScope {
+	pub repositories: Vec<String>,
+	pub formats: Vec<String>,
+	pub teams: Vec<String>,
+	pub packages: Vec<String>,
+	pub versions: Vec<String>,
+}
+
+impl PolicyExceptionScope {
+	#[must_use]
+	pub fn new(
+		repositories: Vec<String>,
+		formats: Vec<String>,
+		teams: Vec<String>,
+		packages: Vec<String>,
+		versions: Vec<String>,
+	) -> Self {
+		Self {
+			repositories: normalized_selector_list(repositories),
+			formats: normalized_selector_list(formats),
+			teams: normalized_selector_list(teams),
+			packages: normalized_selector_list(packages),
+			versions: normalized_selector_list(versions),
+		}
+	}
+
+	#[must_use]
+	pub fn matches(
+		&self,
+		context: &PolicyContext,
+		target: &ScanTarget,
+	) -> bool {
+		matches_case_insensitive_selector(
+			&self.repositories,
+			Some(&context.repository),
+		) && matches_case_insensitive_selector(
+			&self.formats,
+			Some(&context.format),
+		) && matches_case_insensitive_selector(
+			&self.teams,
+			context.team.as_deref(),
+		) && matches_case_insensitive_selector(
+			&self.packages,
+			Some(&target_policy_package_name(target)),
+		) && matches_case_insensitive_selector(
+			&self.versions,
+			target.cache_version(),
+		)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyException {
+	pub id: String,
+	pub owner: String,
+	pub ticket: String,
+	pub reason: String,
+	pub expires_at: OffsetDateTime,
+	pub vulnerability_ids: BTreeSet<String>,
+	pub scope: PolicyExceptionScope,
+}
+
+impl PolicyException {
+	#[must_use]
+	pub fn is_active_at(&self, now: OffsetDateTime) -> bool {
+		now < self.expires_at
+	}
+
+	#[must_use]
+	pub fn matches_vulnerability(&self, vulnerability: &Vulnerability) -> bool {
+		vulnerability.identifiers().any(|id| {
+			normalize_vulnerability_id(id).is_some_and(|normalized_id| {
+				self.vulnerability_ids.contains(&normalized_id)
+			})
+		})
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyExceptionMetadata {
+	pub id: String,
+	pub owner: String,
+	pub ticket: String,
+	pub reason: String,
+	pub expires_at: String,
+	pub vulnerability_ids: Vec<String>,
+}
+
+impl PolicyExceptionMetadata {
+	fn from_exception(exception: &PolicyException) -> Self {
+		Self {
+			id: exception.id.clone(),
+			owner: exception.owner.clone(),
+			ticket: exception.ticket.clone(),
+			reason: exception.reason.clone(),
+			expires_at: format_rfc3339(exception.expires_at),
+			vulnerability_ids: exception
+				.vulnerability_ids
+				.iter()
+				.cloned()
+				.collect(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySet {
+	pub default_policy: PolicyRule,
+	pub repositories: BTreeMap<String, RepositoryPolicy>,
+	pub policies: Vec<PolicyRule>,
+	pub exceptions: Vec<PolicyException>,
+}
+
+impl PolicySet {
+	#[must_use]
+	pub fn from_legacy_policy(policy: SecurityPolicy) -> Self {
+		Self {
+			default_policy: PolicyRule::new(
+				"default",
+				EnforcementMode::Enforce,
+				PolicyScope::default(),
+				policy,
+			),
+			repositories: BTreeMap::new(),
+			policies: Vec::new(),
+			exceptions: Vec::new(),
+		}
+	}
+
+	pub fn from_toml_str(input: &str) -> Result<Self, PolicySetError> {
+		let raw = toml::from_str::<RawPolicySet>(input)?;
+		Self::from_raw(raw)
+	}
+
+	#[must_use]
+	pub fn context(
+		&self,
+		repository: impl Into<String>,
+		format: impl Into<String>,
+	) -> PolicyContext {
+		let repository = repository.into();
+		let team = self.team_for_repository(&repository).map(str::to_owned);
+
+		PolicyContext::new(repository, format, team)
+	}
+
+	#[must_use]
+	pub fn team_for_repository(&self, repository: &str) -> Option<&str> {
+		let normalized_repository = normalize_match_value(repository)?;
+
+		self.repositories
+			.iter()
+			.find(|(candidate, _)| {
+				normalize_match_value(candidate).as_ref()
+					== Some(&normalized_repository)
+			})
+			.map(|(_, repository)| repository.team.as_str())
+	}
+
+	#[must_use]
+	pub fn select_policy(&self, context: &PolicyContext) -> &PolicyRule {
+		self.policies
+			.iter()
+			.find(|policy| policy.scope.matches(context))
+			.unwrap_or(&self.default_policy)
+	}
+
+	fn from_raw(raw: RawPolicySet) -> Result<Self, PolicySetError> {
+		let default_policy = raw_policy_rule_to_policy_rule(
+			raw.default_policy,
+			Some("default"),
+			0,
+		)?;
+		let mut policies = Vec::with_capacity(raw.policies.len());
+
+		for (index, raw_policy) in raw.policies.into_iter().enumerate() {
+			policies
+				.push(raw_policy_rule_to_policy_rule(raw_policy, None, index)?);
+		}
+
+		let repositories = raw
+			.repositories
+			.into_iter()
+			.map(|(name, repository)| {
+				Ok((
+					trim_required(name, "repository", "name")?,
+					RepositoryPolicy {
+						team: trim_required(
+							repository.team,
+							"repository",
+							"team",
+						)?,
+					},
+				))
+			})
+			.collect::<Result<BTreeMap<_, _>, PolicySetError>>()?;
+
+		let exceptions = raw
+			.exceptions
+			.into_iter()
+			.map(raw_exception_to_exception)
+			.collect::<Result<Vec<_>, _>>()?;
+
+		validate_unique_ids(&default_policy, &policies, &exceptions)?;
+
+		Ok(Self {
+			default_policy,
+			repositories,
+			policies,
+			exceptions,
+		})
+	}
+}
+
+impl Default for PolicySet {
+	fn default() -> Self {
+		Self::from_legacy_policy(SecurityPolicy::default())
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyContext {
+	pub repository: String,
+	pub format: String,
+	pub team: Option<String>,
+}
+
+impl PolicyContext {
+	#[must_use]
+	pub fn new(
+		repository: impl Into<String>,
+		format: impl Into<String>,
+		team: Option<impl Into<String>>,
+	) -> Self {
+		Self {
+			repository: normalize_context_value(repository, "default"),
+			format: normalize_context_value(format, "generic"),
+			team: team.and_then(|team| normalize_match_value(&team.into())),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyEvaluation {
+	pub outcome: PolicyOutcome,
+	pub policy_id: String,
+	pub mode: EnforcementMode,
+	pub applied_exceptions: Vec<PolicyExceptionMetadata>,
+	pub expired_exceptions: Vec<PolicyExceptionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum PolicyOutcome {
+	Allowed,
+	ReportOnly(BlockReport),
+	Blocked(BlockReport),
+}
+
+impl PolicyEvaluation {
+	#[must_use]
+	pub fn is_blocked(&self) -> bool {
+		matches!(self.outcome, PolicyOutcome::Blocked(_))
+	}
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicySet {
+	default_policy: RawPolicyRule,
+	#[serde(default)]
+	repositories: BTreeMap<String, RawRepositoryPolicy>,
+	#[serde(default)]
+	policies: Vec<RawPolicyRule>,
+	#[serde(default)]
+	exceptions: Vec<RawPolicyException>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepositoryPolicy {
+	team: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyRule {
+	id: Option<String>,
+	#[serde(default)]
+	mode: EnforcementMode,
+	#[serde(default = "default_minimum_blocking_severity")]
+	minimum_blocking_severity: Severity,
+	#[serde(default)]
+	allowed_vulnerability_ids: Vec<String>,
+	max_total_vulnerabilities: Option<u32>,
+	max_low_vulnerabilities: Option<u32>,
+	max_medium_vulnerabilities: Option<u32>,
+	max_high_vulnerabilities: Option<u32>,
+	max_critical_vulnerabilities: Option<u32>,
+	#[serde(default)]
+	repositories: Vec<String>,
+	#[serde(default)]
+	formats: Vec<String>,
+	#[serde(default)]
+	teams: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyException {
+	id: String,
+	owner: String,
+	ticket: String,
+	reason: String,
+	expires_at: String,
+	vulnerability_ids: Vec<String>,
+	#[serde(default)]
+	repositories: Vec<String>,
+	#[serde(default)]
+	formats: Vec<String>,
+	#[serde(default)]
+	teams: Vec<String>,
+	#[serde(default)]
+	packages: Vec<String>,
+	#[serde(default)]
+	versions: Vec<String>,
+}
+
+fn raw_policy_rule_to_policy_rule(
+	raw: RawPolicyRule,
+	default_id: Option<&str>,
+	index: usize,
+) -> Result<PolicyRule, PolicySetError> {
+	let id = match (raw.id, default_id) {
+		(Some(id), _) => trim_required(id, "policy", "id")?,
+		(None, Some(default_id)) => default_id.to_owned(),
+		(None, None) => return Err(PolicySetError::MissingPolicyId { index }),
+	};
+	let limits = VulnerabilityLimits {
+		total: raw.max_total_vulnerabilities,
+		low: raw.max_low_vulnerabilities,
+		medium: raw.max_medium_vulnerabilities,
+		high: raw.max_high_vulnerabilities,
+		critical: raw.max_critical_vulnerabilities,
+	};
+	let policy = SecurityPolicy::new(
+		raw.minimum_blocking_severity,
+		raw.allowed_vulnerability_ids,
+		limits,
+	);
+
+	Ok(PolicyRule::new(
+		id,
+		raw.mode,
+		PolicyScope::new(raw.repositories, raw.formats, raw.teams),
+		policy,
+	))
+}
+
+fn raw_exception_to_exception(
+	raw: RawPolicyException,
+) -> Result<PolicyException, PolicySetError> {
+	let id = trim_required(raw.id, "exception", "id")?;
+	let expires_at = trim_required(raw.expires_at, "exception", "expires_at")?;
+	let expires_at =
+		OffsetDateTime::parse(&expires_at, &Rfc3339).map_err(|source| {
+			PolicySetError::InvalidExceptionExpiry {
+				id: id.clone(),
+				expires_at: expires_at.clone(),
+				source,
+			}
+		})?;
+	let vulnerability_ids = raw
+		.vulnerability_ids
+		.into_iter()
+		.filter_map(|id| normalize_vulnerability_id(&id))
+		.collect::<BTreeSet<_>>();
+
+	if vulnerability_ids.is_empty() {
+		return Err(PolicySetError::EmptyExceptionVulnerabilityIds { id });
+	}
+
+	Ok(PolicyException {
+		id,
+		owner: trim_required(raw.owner, "exception", "owner")?,
+		ticket: trim_required(raw.ticket, "exception", "ticket")?,
+		reason: trim_required(raw.reason, "exception", "reason")?,
+		expires_at,
+		vulnerability_ids,
+		scope: PolicyExceptionScope::new(
+			raw.repositories,
+			raw.formats,
+			raw.teams,
+			raw.packages,
+			raw.versions,
+		),
+	})
+}
+
+fn validate_unique_ids(
+	default_policy: &PolicyRule,
+	policies: &[PolicyRule],
+	exceptions: &[PolicyException],
+) -> Result<(), PolicySetError> {
+	let mut policy_ids = BTreeSet::new();
+	insert_policy_id(&mut policy_ids, &default_policy.id)?;
+
+	for policy in policies {
+		insert_policy_id(&mut policy_ids, &policy.id)?;
+	}
+
+	let mut exception_ids = BTreeSet::new();
+	for exception in exceptions {
+		let id = normalize_match_value(&exception.id).ok_or(
+			PolicySetError::EmptyField {
+				entity: "exception",
+				field: "id",
+			},
+		)?;
+		if !exception_ids.insert(id) {
+			return Err(PolicySetError::DuplicateExceptionId {
+				id: exception.id.clone(),
+			});
+		}
+	}
+
+	Ok(())
+}
+
+fn insert_policy_id(
+	policy_ids: &mut BTreeSet<String>,
+	id: &str,
+) -> Result<(), PolicySetError> {
+	let normalized_id =
+		normalize_match_value(id).ok_or(PolicySetError::EmptyField {
+			entity: "policy",
+			field: "id",
+		})?;
+
+	if !policy_ids.insert(normalized_id) {
+		return Err(PolicySetError::DuplicatePolicyId { id: id.to_owned() });
+	}
+
+	Ok(())
+}
+
+fn default_minimum_blocking_severity() -> Severity {
+	Severity::High
+}
+
+fn trim_required(
+	value: String,
+	entity: &'static str,
+	field: &'static str,
+) -> Result<String, PolicySetError> {
+	let trimmed = value.trim();
+
+	if trimmed.is_empty() {
+		Err(PolicySetError::EmptyField { entity, field })
+	} else {
+		Ok(trimmed.to_owned())
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyViolation {
 	pub reason: String,
@@ -402,6 +1067,7 @@ pub struct PolicyViolation {
 pub struct BlockReport {
 	pub target: ScanTarget,
 	pub reason: String,
+	pub policy_id: Option<String>,
 	pub policy_violations: Vec<PolicyViolation>,
 	pub vulnerabilities: Vec<Vulnerability>,
 }
@@ -412,6 +1078,7 @@ impl BlockReport {
 		Self {
 			target,
 			reason: reason.into(),
+			policy_id: None,
 			policy_violations: Vec::new(),
 			vulnerabilities: Vec::new(),
 		}
@@ -424,6 +1091,12 @@ impl BlockReport {
 			self.target.display_name(),
 			self.reason
 		);
+
+		if let Some(policy_id) = self.policy_id.as_deref() {
+			body.push_str("Policy: ");
+			body.push_str(policy_id);
+			body.push('\n');
+		}
 
 		if !self.policy_violations.is_empty() {
 			body.push_str("\nPolicy violations:\n");
@@ -503,18 +1176,106 @@ pub trait VulnerabilityEvaluator: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluator {
-	policy: SecurityPolicy,
+	policy_set: PolicySet,
 }
 
 impl PolicyEvaluator {
 	#[must_use]
 	pub fn new(policy: SecurityPolicy) -> Self {
-		Self { policy }
+		Self::from_policy_set(PolicySet::from_legacy_policy(policy))
+	}
+
+	#[must_use]
+	pub fn from_policy_set(policy_set: PolicySet) -> Self {
+		Self { policy_set }
 	}
 
 	#[must_use]
 	pub fn policy(&self) -> &SecurityPolicy {
-		&self.policy
+		&self.policy_set.default_policy.policy
+	}
+
+	#[must_use]
+	pub fn policy_set(&self) -> &PolicySet {
+		&self.policy_set
+	}
+
+	#[must_use]
+	pub fn evaluate_with_context(
+		&self,
+		context: &PolicyContext,
+		target: &ScanTarget,
+		vulnerabilities: Vec<Vulnerability>,
+	) -> PolicyEvaluation {
+		self.evaluate_at(
+			context,
+			target,
+			vulnerabilities,
+			OffsetDateTime::now_utc(),
+		)
+	}
+
+	#[must_use]
+	pub fn evaluate_at(
+		&self,
+		context: &PolicyContext,
+		target: &ScanTarget,
+		vulnerabilities: Vec<Vulnerability>,
+		now: OffsetDateTime,
+	) -> PolicyEvaluation {
+		let rule = self.policy_set.select_policy(context);
+		let mut applied_exceptions = BTreeMap::new();
+		let mut expired_exceptions = BTreeMap::new();
+		let evaluated_vulnerabilities = vulnerabilities
+			.into_iter()
+			.filter(|vulnerability| {
+				let exception_applies = matching_exception_applies(
+					&self.policy_set.exceptions,
+					context,
+					target,
+					vulnerability,
+					now,
+					&mut applied_exceptions,
+					&mut expired_exceptions,
+				);
+
+				!exception_applies
+					&& !rule.policy.allows_vulnerability(vulnerability)
+			})
+			.collect::<Vec<_>>();
+		let violations =
+			policy_violations(&rule.policy, &evaluated_vulnerabilities);
+		let applied_exceptions =
+			applied_exceptions.into_values().collect::<Vec<_>>();
+		let expired_exceptions =
+			expired_exceptions.into_values().collect::<Vec<_>>();
+
+		let outcome = if violations.is_empty() {
+			PolicyOutcome::Allowed
+		} else {
+			let report = BlockReport {
+				target: target.clone(),
+				reason: "vulnerability policy was violated".to_owned(),
+				policy_id: Some(rule.id.clone()),
+				policy_violations: violations,
+				vulnerabilities: evaluated_vulnerabilities,
+			};
+
+			match rule.mode {
+				EnforcementMode::Enforce => PolicyOutcome::Blocked(report),
+				EnforcementMode::ReportOnly => {
+					PolicyOutcome::ReportOnly(report)
+				}
+			}
+		};
+
+		PolicyEvaluation {
+			outcome,
+			policy_id: rule.id.clone(),
+			mode: rule.mode,
+			applied_exceptions,
+			expired_exceptions,
+		}
 	}
 }
 
@@ -530,26 +1291,57 @@ impl VulnerabilityEvaluator for PolicyEvaluator {
 		target: &ScanTarget,
 		vulnerabilities: Vec<Vulnerability>,
 	) -> ScanDecision {
-		let evaluated_vulnerabilities: Vec<_> = vulnerabilities
-			.into_iter()
-			.filter(|vulnerability| {
-				!self.policy.allows_vulnerability(vulnerability)
-			})
-			.collect();
-		let violations =
-			policy_violations(&self.policy, &evaluated_vulnerabilities);
+		let context = PolicyContext::new(
+			"default",
+			target.cache_namespace(),
+			None::<String>,
+		);
 
-		if violations.is_empty() {
-			ScanDecision::Allowed
-		} else {
-			ScanDecision::Blocked(BlockReport {
-				target: target.clone(),
-				reason: "vulnerability policy was violated".to_owned(),
-				policy_violations: violations,
-				vulnerabilities: evaluated_vulnerabilities,
-			})
+		match self
+			.evaluate_with_context(&context, target, vulnerabilities)
+			.outcome
+		{
+			PolicyOutcome::Allowed | PolicyOutcome::ReportOnly(_) => {
+				ScanDecision::Allowed
+			}
+			PolicyOutcome::Blocked(report) => ScanDecision::Blocked(report),
 		}
 	}
+}
+
+fn matching_exception_applies(
+	exceptions: &[PolicyException],
+	context: &PolicyContext,
+	target: &ScanTarget,
+	vulnerability: &Vulnerability,
+	now: OffsetDateTime,
+	applied_exceptions: &mut BTreeMap<String, PolicyExceptionMetadata>,
+	expired_exceptions: &mut BTreeMap<String, PolicyExceptionMetadata>,
+) -> bool {
+	let mut active_match = false;
+
+	for exception in exceptions {
+		if !exception.scope.matches(context, target)
+			|| !exception.matches_vulnerability(vulnerability)
+		{
+			continue;
+		}
+
+		let key = normalize_match_value(&exception.id)
+			.unwrap_or_else(|| exception.id.clone());
+		if exception.is_active_at(now) {
+			active_match = true;
+			applied_exceptions.entry(key).or_insert_with(|| {
+				PolicyExceptionMetadata::from_exception(exception)
+			});
+		} else {
+			expired_exceptions.entry(key).or_insert_with(|| {
+				PolicyExceptionMetadata::from_exception(exception)
+			});
+		}
+	}
+
+	active_match
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,7 +1412,7 @@ impl ExternalScanner {
 			}
 		}
 
-		let output = time::timeout(self.timeout, command.output())
+		let output = tokio_time::timeout(self.timeout, command.output())
 			.await
 			.map_err(|_| SecurityError::ScannerTimeout(self.timeout))?
 			.map_err(|error| SecurityError::Request(error.to_string()))?;
@@ -961,6 +1753,58 @@ fn normalize_vulnerability_id(id: &str) -> Option<String> {
 	(!normalized.is_empty()).then_some(normalized)
 }
 
+fn normalize_match_value(value: &str) -> Option<String> {
+	let normalized = value.trim().to_ascii_lowercase();
+
+	(!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_context_value(value: impl Into<String>, default: &str) -> String {
+	normalize_match_value(&value.into()).unwrap_or_else(|| default.to_owned())
+}
+
+fn normalized_selector_list(values: Vec<String>) -> Vec<String> {
+	let mut normalized = values
+		.into_iter()
+		.filter_map(|value| normalize_match_value(&value))
+		.collect::<Vec<_>>();
+
+	normalized.sort();
+	normalized.dedup();
+	normalized
+}
+
+fn matches_case_insensitive_selector(
+	selectors: &[String],
+	value: Option<&str>,
+) -> bool {
+	if selectors.is_empty() {
+		return true;
+	}
+
+	value.and_then(normalize_match_value).is_some_and(|value| {
+		selectors.iter().any(|selector| selector == &value)
+	})
+}
+
+fn target_policy_package_name(target: &ScanTarget) -> String {
+	match target {
+		ScanTarget::Package(package) => match &package.identity {
+			PackageIdentity::Osv { name, .. } => name.clone(),
+			PackageIdentity::Purl { purl } => purl.clone(),
+			PackageIdentity::GitCommit { commit } => commit.clone(),
+		},
+		ScanTarget::Artifact(artifact) => artifact
+			.digest
+			.clone()
+			.unwrap_or_else(|| artifact.uri.clone()),
+	}
+}
+
+fn format_rfc3339(value: OffsetDateTime) -> String {
+	value.format(&Rfc3339).unwrap_or_else(|_| value.to_string())
+}
+
 fn purl_contains_version(purl: &str) -> bool {
 	purl.rsplit('/')
 		.next()
@@ -1278,10 +2122,273 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_policy_toml_with_repository_team_mapping() {
+		let policy_set = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "critical"
+			mode = "report_only"
+			max_total_vulnerabilities = 3
+
+			[repositories."npm-internal"]
+			team = "Web"
+
+			[[policies]]
+			id = "npm-web"
+			repositories = [" npm-internal "]
+			formats = ["NPM"]
+			teams = ["web"]
+			minimum_blocking_severity = "medium"
+			mode = "enforce"
+			max_medium_vulnerabilities = 0
+
+			[[exceptions]]
+			id = "SEC-001"
+			owner = "security"
+			ticket = "SEC-1"
+			reason = "accepted during rollout"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = [" cve-2026-0001 "]
+			packages = ["left-pad"]
+			versions = ["1.0.0"]
+			"#,
+		)
+		.unwrap();
+
+		let context = policy_set.context("NPM-INTERNAL", "npm");
+		let selected = policy_set.select_policy(&context);
+
+		assert_eq!(context.team.as_deref(), Some("web"));
+		assert_eq!(selected.id, "npm-web");
+		assert_eq!(selected.policy.minimum_blocking_severity, Severity::Medium);
+		assert_eq!(selected.policy.limits.medium, Some(0));
+		assert_eq!(policy_set.exceptions[0].vulnerability_ids.len(), 1);
+	}
+
+	#[test]
+	fn rejects_unknown_policy_file_fields() {
+		let error = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+			unexpected = true
+			"#,
+		)
+		.unwrap_err();
+
+		assert!(matches!(error, PolicySetError::Parse(_)));
+	}
+
+	#[test]
+	fn rejects_exception_without_required_metadata() {
+		let error = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[exceptions]]
+			id = "SEC-001"
+			ticket = "SEC-1"
+			reason = "accepted during rollout"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0001"]
+			"#,
+		)
+		.unwrap_err();
+
+		assert!(matches!(error, PolicySetError::Parse(_)));
+	}
+
+	#[test]
+	fn rejects_duplicate_policy_and_exception_ids() {
+		let duplicate_policy = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			id = "base"
+
+			[[policies]]
+			id = "Team"
+
+			[[policies]]
+			id = " team "
+			"#,
+		)
+		.unwrap_err();
+		assert!(matches!(
+			duplicate_policy,
+			PolicySetError::DuplicatePolicyId { .. }
+		));
+
+		let duplicate_exception = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[exceptions]]
+			id = "SEC-001"
+			owner = "security"
+			ticket = "SEC-1"
+			reason = "accepted"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0001"]
+
+			[[exceptions]]
+			id = "sec-001"
+			owner = "security"
+			ticket = "SEC-2"
+			reason = "accepted"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0002"]
+			"#,
+		)
+		.unwrap_err();
+		assert!(matches!(
+			duplicate_exception,
+			PolicySetError::DuplicateExceptionId { .. }
+		));
+	}
+
+	#[test]
+	fn policy_selection_uses_first_matching_scope_then_default() {
+		let policy_set = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			id = "fallback"
+			minimum_blocking_severity = "critical"
+
+			[[policies]]
+			id = "first"
+			repositories = ["repo-a"]
+			formats = ["npm"]
+			minimum_blocking_severity = "medium"
+
+			[[policies]]
+			id = "second"
+			repositories = ["repo-a"]
+			formats = ["npm"]
+			minimum_blocking_severity = "low"
+			"#,
+		)
+		.unwrap();
+
+		let matching = PolicyContext::new("repo-a", "NPM", None::<String>);
+		let fallback = PolicyContext::new("repo-b", "npm", None::<String>);
+
+		assert_eq!(policy_set.select_policy(&matching).id, "first");
+		assert_eq!(policy_set.select_policy(&fallback).id, "fallback");
+	}
+
+	#[test]
+	fn active_exception_matches_alias_package_and_version() {
+		let target = package_target();
+		let policy_set = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[exceptions]]
+			id = "SEC-001"
+			owner = "security"
+			ticket = "SEC-1"
+			reason = "accepted during rollout"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0001"]
+			packages = ["left-pad"]
+			versions = ["1.0.0"]
+			"#,
+		)
+		.unwrap();
+		let evaluator = PolicyEvaluator::from_policy_set(policy_set);
+		let context = PolicyContext::new("default", "npm", None::<String>);
+
+		let evaluation = evaluator.evaluate_at(
+			&context,
+			&target,
+			vec![vulnerability(
+				"GHSA-0000",
+				Severity::Critical,
+				["cve-2026-0001"],
+			)],
+			at("2026-06-11T00:00:00Z"),
+		);
+
+		assert!(matches!(evaluation.outcome, PolicyOutcome::Allowed));
+		assert_eq!(evaluation.applied_exceptions.len(), 1);
+		assert!(evaluation.expired_exceptions.is_empty());
+	}
+
+	#[test]
+	fn expired_exception_is_reported_but_does_not_suppress() {
+		let target = package_target();
+		let policy_set = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[exceptions]]
+			id = "SEC-001"
+			owner = "security"
+			ticket = "SEC-1"
+			reason = "accepted during rollout"
+			expires_at = "2026-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0001"]
+			packages = ["left-pad"]
+			versions = ["1.0.0"]
+			"#,
+		)
+		.unwrap();
+		let evaluator = PolicyEvaluator::from_policy_set(policy_set);
+		let context = PolicyContext::new("default", "npm", None::<String>);
+
+		let evaluation = evaluator.evaluate_at(
+			&context,
+			&target,
+			vec![vulnerability("CVE-2026-0001", Severity::High, [])],
+			at("2026-06-11T00:00:00Z"),
+		);
+
+		assert!(matches!(evaluation.outcome, PolicyOutcome::Blocked(_)));
+		assert!(evaluation.applied_exceptions.is_empty());
+		assert_eq!(evaluation.expired_exceptions.len(), 1);
+	}
+
+	#[test]
+	fn report_only_policy_returns_report_only_violation() {
+		let target = package_target();
+		let policy_set = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			id = "fallback"
+			minimum_blocking_severity = "HIGH"
+			mode = "report_only"
+			"#,
+		)
+		.unwrap();
+		let evaluator = PolicyEvaluator::from_policy_set(policy_set);
+		let context = PolicyContext::new("default", "npm", None::<String>);
+
+		let evaluation = evaluator.evaluate_at(
+			&context,
+			&target,
+			vec![vulnerability("CVE-2026-0001", Severity::High, [])],
+			at("2026-06-11T00:00:00Z"),
+		);
+
+		match evaluation.outcome {
+			PolicyOutcome::ReportOnly(report) => {
+				assert_eq!(report.policy_id.as_deref(), Some("fallback"));
+				assert!(report.to_plain_text().contains("Policy: fallback"));
+			}
+			other => panic!("unexpected outcome: {other:?}"),
+		}
+	}
+
+	#[test]
 	fn block_report_includes_references() {
 		let report = BlockReport {
 			target: package_target(),
 			reason: "test".to_owned(),
+			policy_id: None,
 			policy_violations: vec![PolicyViolation {
 				reason: "critical limit exceeded".to_owned(),
 			}],
@@ -1410,6 +2517,10 @@ mod tests {
 
 	fn artifact_target() -> ScanTarget {
 		ScanTarget::Artifact(ArtifactTarget::new("raw", "/artifact.tar"))
+	}
+
+	fn at(value: &str) -> OffsetDateTime {
+		OffsetDateTime::parse(value, &Rfc3339).unwrap()
 	}
 
 	fn vulnerability<const N: usize>(

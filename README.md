@@ -40,9 +40,12 @@ Common:
 
 ```bash
 NEXUS_SEC_PROXY_BIND_ADDR=127.0.0.1:3000
+NEXUS_SEC_PROXY_REPOSITORY_NAME=maven-central
 NEXUS_SEC_PROXY_REPOSITORY_FORMAT=maven2
 NEXUS_SEC_PROXY_OSV_ECOSYSTEM=Maven
 NEXUS_SEC_PROXY_OSV_API_URL=https://api.osv.dev/v1/query
+NEXUS_SEC_PROXY_POLICY_FILE=/etc/nexus-sec-proxy/policy.toml
+NEXUS_SEC_PROXY_LOG_JSON=false
 NEXUS_SEC_PROXY_FAIL_OPEN=true
 NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow
 ```
@@ -58,6 +61,46 @@ NEXUS_SEC_PROXY_MAX_MEDIUM_VULNERABILITIES=2
 NEXUS_SEC_PROXY_MAX_HIGH_VULNERABILITIES=0
 NEXUS_SEC_PROXY_MAX_CRITICAL_VULNERABILITIES=0
 ```
+
+The legacy policy env vars above are used only when
+`NEXUS_SEC_PROXY_POLICY_FILE` is unset. A policy file supports repository,
+format, and team scoped rules, report-only mode, and expiring exceptions:
+
+```toml
+[default_policy]
+id = "default"
+minimum_blocking_severity = "HIGH"
+mode = "enforce"
+
+[repositories."npm-internal"]
+team = "web"
+
+[[policies]]
+id = "web-npm"
+repositories = ["npm-internal"]
+formats = ["npm"]
+teams = ["web"]
+minimum_blocking_severity = "MEDIUM"
+mode = "report_only"
+max_critical_vulnerabilities = 0
+
+[[exceptions]]
+id = "SEC-1234"
+owner = "security"
+ticket = "SEC-1234"
+reason = "temporary rollout exception"
+expires_at = "2026-12-31T23:59:59Z"
+vulnerability_ids = ["CVE-2026-0001", "GHSA-xxxx"]
+repositories = ["npm-internal"]
+formats = ["npm"]
+teams = ["web"]
+packages = ["left-pad"]
+versions = ["1.0.0"]
+```
+
+`[[policies]]` entries are checked in file order; the first matching scope
+wins. Omitted scope arrays act as wildcards. `mode = "report_only"` proxies
+the artifact but emits a structured audit event for the violation.
 
 Cache:
 
