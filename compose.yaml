@@ -18,6 +18,13 @@ services:
         VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
         VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
         BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 10s
     init: true
     restart: unless-stopped
     read_only: true
@@ -84,37 +91,40 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # Run before enabling offline Trivy scans:
-  # docker compose run --rm trivy-db-init
-  trivy-db-init:
-    image: aquasec/trivy:${TRIVY_VERSION:-0.71.0}
-    profiles:
-      - scanner-db
+  scanner-db-updater:
+    image: nexus-sec-proxy-scanner-db-updater:${NEXUS_SEC_PROXY_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: scanner-db-updater
+      args:
+        DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
+        TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
+        GRYPE_VERSION: ${GRYPE_VERSION:-0.112.0}
+    deploy:
+      replicas: 1
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     environment:
-      TRIVY_CACHE_DIR: /var/cache/trivy
-    command:
-      - image
-      - --download-db-only
-      - --cache-dir
-      - /var/cache/trivy
+      <<: *scanner-cache-env
+      HOME: /home/nonroot
+      NEXUS_SEC_PROXY_SCANNER_DB_UPDATE_INTERVAL_SECS: ${NEXUS_SEC_PROXY_SCANNER_DB_UPDATE_INTERVAL_SECS:-21600}
+      NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS: ${NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS:-300}
     volumes:
       - trivy-cache:/var/cache/trivy
-    network_mode: bridge
-
-  # Run before enabling offline Grype scans:
-  # docker compose run --rm grype-db-init
-  grype-db-init:
-    image: anchore/grype:v${GRYPE_VERSION:-0.112.0}
-    profiles:
-      - scanner-db
-    environment:
-      GRYPE_DB_CACHE_DIR: /var/cache/grype/db
-    command:
-      - db
-      - update
-    volumes:
       - grype-cache:/var/cache/grype
-    network_mode: bridge
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   artifact-tmp:

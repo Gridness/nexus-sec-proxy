@@ -79,16 +79,31 @@ NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS=300
 NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES=536870912
 NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY=2
 NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy
+NEXUS_SEC_PROXY_SCANNER_DB_UPDATE_INTERVAL_SECS=21600
+NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS=300
+TRIVY_CACHE_DIR=/var/cache/trivy
+GRYPE_DB_CACHE_DIR=/var/cache/grype/db
 ```
 
 `NEXUS_SEC_PROXY_ARTIFACT_SCANNER` supports `disabled`, `trivy`, and
 `grype`. The scanner executable must exist in the runtime image or host PATH.
-For production, prewarm and persist scanner vulnerability databases out of band
-and keep `NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE=true` on request
-paths. With Trivy this service invokes filesystem scans with JSON output,
-vulnerability scanning only, quiet mode, optional offline mode, and optional DB
-update skipping. With Grype this service invokes JSON output against the
-prefetched artifact path.
+In Docker Compose, the `scanner-db-updater` sidecar refreshes the Trivy and
+Grype vulnerability databases on startup and every 6 hours by default. The
+proxy still keeps request-path scans offline with
+`NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE=true` and
+`NEXUS_SEC_PROXY_ARTIFACT_SCANNER_OFFLINE=true`, so stale or missing scanner
+databases are logged by the scanner path but do not make `/healthz` fail.
+
+To explicitly prewarm scanner databases, run:
+
+```bash
+docker compose run --rm scanner-db-updater once
+```
+
+With Trivy this service invokes filesystem scans with JSON output,
+vulnerability scanning only, quiet mode, offline mode, and DB update skipping.
+With Grype this service invokes JSON output against the prefetched artifact
+path.
 
 ## Current Format Handling
 
