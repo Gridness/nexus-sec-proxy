@@ -979,6 +979,7 @@ mod tests {
 			osv_ecosystem: ecosystem.map(str::to_owned),
 			osv_api_url: "https://api.osv.dev/v1/query".to_owned(),
 			policy_file: None,
+			admin_token: None,
 			log_json: false,
 			fail_open: true,
 			unsupported_target_policy: UnsupportedTargetPolicy::Allow,

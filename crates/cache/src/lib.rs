@@ -67,6 +67,13 @@ impl CachedScan {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStats {
+	pub clean_entry_count: u64,
+	pub vulnerable_entry_count: u64,
+	pub total_entry_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct MokaScanCache {
 	clean: Cache<CacheKey, CachedScan>,
@@ -98,6 +105,21 @@ impl MokaScanCache {
 	}
 
 	#[must_use]
+	pub async fn stats(&self) -> CacheStats {
+		self.clean.run_pending_tasks().await;
+		self.vulnerable.run_pending_tasks().await;
+
+		let clean_entry_count = self.clean.entry_count();
+		let vulnerable_entry_count = self.vulnerable.entry_count();
+
+		CacheStats {
+			clean_entry_count,
+			vulnerable_entry_count,
+			total_entry_count: clean_entry_count + vulnerable_entry_count,
+		}
+	}
+
+	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
@@ -117,6 +139,8 @@ pub trait ScanCache: Send + Sync {
 	) -> Result<(), CacheError>;
 
 	async fn invalidate(&self, key: &CacheKey) -> Result<(), CacheError>;
+
+	async fn stats(&self) -> Result<CacheStats, CacheError>;
 }
 
 #[async_trait]
@@ -151,6 +175,10 @@ impl ScanCache for MokaScanCache {
 		self.clean.invalidate(key).await;
 		self.vulnerable.invalidate(key).await;
 		Ok(())
+	}
+
+	async fn stats(&self) -> Result<CacheStats, CacheError> {
+		Ok(MokaScanCache::stats(self).await)
 	}
 }
 
@@ -190,6 +218,52 @@ mod tests {
 		cache.invalidate(&key).await.unwrap();
 
 		assert_eq!(cache.get(&key).await.unwrap(), None);
+	}
+
+	#[tokio::test]
+	async fn reports_clean_vulnerable_and_total_entry_counts() {
+		let cache = MokaScanCache::new(
+			100,
+			Duration::from_secs(60),
+			Duration::from_secs(60),
+		);
+		let safe_key = CacheKey::new("npm", "npm/safe", "1.0.0");
+		let vulnerable_key = CacheKey::new("npm", "npm/vulnerable", "1.0.0");
+
+		cache
+			.put(safe_key.clone(), CachedScan::empty())
+			.await
+			.unwrap();
+		cache
+			.put(
+				vulnerable_key.clone(),
+				CachedScan::new(vec![vulnerability("CVE-1")]),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			cache.stats().await,
+			CacheStats {
+				clean_entry_count: 1,
+				vulnerable_entry_count: 1,
+				total_entry_count: 2,
+			}
+		);
+
+		cache
+			.put(safe_key, CachedScan::new(vec![vulnerability("CVE-2")]))
+			.await
+			.unwrap();
+
+		assert_eq!(
+			cache.stats().await,
+			CacheStats {
+				clean_entry_count: 0,
+				vulnerable_entry_count: 2,
+				total_entry_count: 2,
+			}
+		);
 	}
 
 	#[tokio::test]

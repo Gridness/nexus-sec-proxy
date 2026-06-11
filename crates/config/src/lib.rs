@@ -129,6 +129,8 @@ pub struct AppConfig {
 	pub osv_ecosystem: Option<String>,
 	pub osv_api_url: String,
 	pub policy_file: Option<String>,
+	#[serde(skip_serializing)]
+	pub admin_token: Option<String>,
 	pub log_json: bool,
 	pub fail_open: bool,
 	pub unsupported_target_policy: UnsupportedTargetPolicy,
@@ -189,6 +191,8 @@ impl AppConfig {
 		);
 		let policy_file =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_POLICY_FILE");
+		let admin_token =
+			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_ADMIN_TOKEN");
 		let log_json =
 			bool_env(&mut lookup, "NEXUS_SEC_PROXY_LOG_JSON", false)?;
 		let fail_open =
@@ -268,6 +272,7 @@ impl AppConfig {
 			osv_ecosystem,
 			osv_api_url,
 			policy_file,
+			admin_token,
 			log_json,
 			fail_open,
 			unsupported_target_policy,
@@ -289,24 +294,30 @@ impl AppConfig {
 	}
 }
 
+pub fn load_policy_file(path: &str) -> Result<PolicySet, ConfigError> {
+	let content = fs::read_to_string(path).map_err(|source| {
+		ConfigError::PolicyFileRead {
+			path: path.to_owned(),
+			source,
+		}
+	})?;
+
+	parse_policy_toml(&content).map_err(|source| ConfigError::PolicyFileParse {
+		path: path.to_owned(),
+		source,
+	})
+}
+
+pub fn parse_policy_toml(input: &str) -> Result<PolicySet, PolicySetError> {
+	PolicySet::from_toml_str(input)
+}
+
 fn load_policy(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 	policy_file: Option<&str>,
 ) -> Result<(SecurityPolicy, PolicySet), ConfigError> {
 	if let Some(path) = policy_file {
-		let content = fs::read_to_string(path).map_err(|source| {
-			ConfigError::PolicyFileRead {
-				path: path.to_owned(),
-				source,
-			}
-		})?;
-		let policy_set =
-			PolicySet::from_toml_str(&content).map_err(|source| {
-				ConfigError::PolicyFileParse {
-					path: path.to_owned(),
-					source,
-				}
-			})?;
+		let policy_set = load_policy_file(path)?;
 		let security_policy = policy_set.default_policy.policy.clone();
 
 		Ok((security_policy, policy_set))
@@ -566,6 +577,7 @@ mod tests {
 		);
 		assert_eq!(config.repository_name, "default");
 		assert_eq!(config.policy_file, None);
+		assert_eq!(config.admin_token, None);
 		assert!(!config.log_json);
 		assert_eq!(config.policy_set.default_policy.id, "default");
 		assert_eq!(
@@ -633,6 +645,39 @@ mod tests {
 				.minimum_blocking_severity,
 			Severity::Medium
 		);
+	}
+
+	#[test]
+	fn parses_admin_token_and_treats_empty_as_disabled() {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_ADMIN_TOKEN", " secret-token "),
+		]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(config.admin_token.as_deref(), Some("secret-token"));
+
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_ADMIN_TOKEN", "   "),
+		]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(config.admin_token, None);
 	}
 
 	#[test]
