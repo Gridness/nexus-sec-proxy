@@ -49,6 +49,7 @@ NEXUS_SEC_PROXY_REPOSITORY_FORMAT=maven2
 NEXUS_SEC_PROXY_OSV_ECOSYSTEM=Maven
 NEXUS_SEC_PROXY_OSV_API_URL=https://api.osv.dev/v1/query
 NEXUS_SEC_PROXY_POLICY_FILE=/etc/nexus-sec-proxy/policy.toml
+NEXUS_SEC_PROXY_ADMIN_TOKEN=
 NEXUS_SEC_PROXY_LOG_JSON=false
 NEXUS_SEC_PROXY_FAIL_OPEN=true
 NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow
@@ -65,6 +66,10 @@ Configuration notes:
 - `NEXUS_SEC_PROXY_OSV_ECOSYSTEM` overrides the ecosystem sent to OSV. If it
   is unset, known repository formats such as `maven2`, `npm`, and `pypi` are
   mapped automatically.
+- `NEXUS_SEC_PROXY_ADMIN_TOKEN` enables `/admin` and `/admin/api/*` when set
+  to a non-empty value. Admin API requests must include
+  `Authorization: Bearer <token>`. When it is unset or empty, admin routes are
+  disabled and `/admin*` paths are not proxied upstream.
 - `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV or the configured
   artifact scanner fails. Set it to `false` to return `503 Service Unavailable`
   on scanner failures.
@@ -101,8 +106,9 @@ applied after allowlisted IDs are removed.
 
 ### TOML Policy File
 
-When `NEXUS_SEC_PROXY_POLICY_FILE` is set, the policy file is loaded once at
-startup and the legacy policy env vars above are ignored. Policy files support:
+When `NEXUS_SEC_PROXY_POLICY_FILE` is set, the policy file is loaded at
+startup and the legacy policy env vars above are ignored. The active policy can
+also be reloaded through the admin API. Policy files support:
 
 - repository, format, and team scoped policies
 - first-match policy selection
@@ -165,6 +171,9 @@ Policy file rules:
 - `mode = "enforce"` blocks violations with `403 Forbidden`.
 - `mode = "report_only"` logs the would-block report and proxies the request.
 - Unknown TOML fields are rejected at startup.
+- Invalid reload attempts are rejected and leave the active policy unchanged.
+- Only the policy file is live-reloadable. Network, scanner, cache sizing, and
+  upstream settings require a restart.
 
 Exception rules:
 
@@ -188,6 +197,72 @@ Target: npm:left-pad@1.0.0
 Reason: vulnerability policy was violated
 Policy: web-npm
 ```
+
+## Admin API and UI
+
+The admin surface is disabled by default. Set a non-empty
+`NEXUS_SEC_PROXY_ADMIN_TOKEN` to enable it:
+
+```bash
+NEXUS_SEC_PROXY_ADMIN_TOKEN=change-me
+```
+
+All admin API requests require:
+
+```text
+Authorization: Bearer <token>
+```
+
+`GET /admin` serves a small built-in HTML dashboard. The page contains no
+embedded operational data; it prompts for the token and then calls the JSON
+API from the browser.
+
+Read-only endpoints:
+
+- `GET /admin/api/status` returns uptime, immutable config, active policy
+  generation/source, cache summary, and scanner summary.
+- `GET /admin/api/policy` returns the active policy set, current policy
+  context, and selected policy ID.
+- `GET /admin/api/cache` returns clean, vulnerable, and total cache entry
+  counts plus configured TTLs and capacity.
+- `GET /admin/api/scanner` returns scanner config, available scanner permits,
+  and best-effort Trivy/Grype DB file age from `TRIVY_CACHE_DIR` and
+  `GRYPE_DB_CACHE_DIR`.
+- `GET /admin/api/decisions?limit=N` returns recent blocked and report-only
+  decisions, newest first. `limit` is clamped to `1..=100`.
+
+Policy operations:
+
+- `POST /admin/api/policy/reload` reloads `NEXUS_SEC_PROXY_POLICY_FILE`,
+  validates it, and atomically swaps the active policy only on success. It
+  returns `409 Conflict` when no policy file is configured and `422
+  Unprocessable Entity` when the file is invalid.
+- `POST /admin/api/policy/validate` validates TOML supplied in the request body
+  without reading from disk:
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer ${NEXUS_SEC_PROXY_ADMIN_TOKEN}" \
+  http://127.0.0.1:3000/admin/api/status
+
+curl -sS -X POST \
+  -H "Authorization: Bearer ${NEXUS_SEC_PROXY_ADMIN_TOKEN}" \
+  http://127.0.0.1:3000/admin/api/policy/reload
+
+curl -sS -X POST \
+  -H "Authorization: Bearer ${NEXUS_SEC_PROXY_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"policy_toml":"[default_policy]\nid=\"default\"\nminimum_blocking_severity=\"HIGH\"\n","repository_name":"npm-internal","repository_format":"npm"}' \
+  http://127.0.0.1:3000/admin/api/policy/validate
+```
+
+No cache flush is needed after policy reloads. The cache stores raw
+vulnerability lists and every request evaluates those raw results against the
+current active policy snapshot.
+
+In Docker Compose, `NEXUS_SEC_PROXY_ADMIN_TOKEN` is wired with an empty default,
+so existing deployments keep the admin surface disabled until the variable is
+set explicitly.
 
 ## Audit Logging
 
