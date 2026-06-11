@@ -18,6 +18,13 @@ services:
         VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
         VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
         BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 10s
     init: true
     restart: unless-stopped
     read_only: true
