@@ -9,10 +9,14 @@ Request flow:
 1. Nexus requests metadata or an artifact from this service.
 2. Metadata and sidecar files are proxied through.
 3. Artifact downloads are classified into a scan target.
-4. Supported package targets are checked through OSV and the local policy.
-5. Blocked packages return `403 Forbidden` with plain-text details and
+4. Supported package targets are checked through OSV and the active policy.
+5. Artifact targets can be prefetched and scanned by Trivy or Grype.
+6. Vulnerability results are cached, then re-evaluated against the active
+   policy for each request.
+7. Blocked packages return `403 Forbidden` with plain-text details and
    vulnerability references.
-6. Allowed packages are streamed from upstream to Nexus.
+8. Report-only violations are logged but streamed from upstream to Nexus.
+9. Allowed packages are streamed from upstream to Nexus.
 
 ## Run
 
@@ -50,7 +54,33 @@ NEXUS_SEC_PROXY_FAIL_OPEN=true
 NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow
 ```
 
-Policy:
+Configuration notes:
+
+- `NEXUS_SEC_PROXY_UPSTREAM_BASE_URL` is required. The legacy name
+  `NEXUS_SEC_PROXY_UPSTREAM_REGISTRY` is still accepted as a fallback.
+- `NEXUS_SEC_PROXY_REPOSITORY_NAME` identifies this Nexus repository for
+  policy matching. The default is `default`.
+- `NEXUS_SEC_PROXY_REPOSITORY_FORMAT` drives request classification. The
+  default is `generic`.
+- `NEXUS_SEC_PROXY_OSV_ECOSYSTEM` overrides the ecosystem sent to OSV. If it
+  is unset, known repository formats such as `maven2`, `npm`, and `pypi` are
+  mapped automatically.
+- `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV or the configured
+  artifact scanner fails. Set it to `false` to return `503 Service Unavailable`
+  on scanner failures.
+- `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
+  be scanned. Set it to `block` to deny unsupported targets.
+- `NEXUS_SEC_PROXY_LOG_JSON=true` enables JSON tracing output for machine
+  parsing and audit ingestion.
+
+## Policy Configuration
+
+There are two policy configuration modes.
+
+### Legacy Env Policy
+
+When `NEXUS_SEC_PROXY_POLICY_FILE` is unset, the proxy builds a single default
+policy from environment variables:
 
 ```bash
 NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY=HIGH
@@ -62,9 +92,28 @@ NEXUS_SEC_PROXY_MAX_HIGH_VULNERABILITIES=0
 NEXUS_SEC_PROXY_MAX_CRITICAL_VULNERABILITIES=0
 ```
 
-The legacy policy env vars above are used only when
-`NEXUS_SEC_PROXY_POLICY_FILE` is unset. A policy file supports repository,
-format, and team scoped rules, report-only mode, and expiring exceptions:
+`NEXUS_SEC_PROXY_MINIMUM_SEVERITY` is still accepted as a legacy fallback for
+`NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY`.
+
+`NEXUS_SEC_PROXY_ALLOWED_VULNERABILITY_IDS` is a comma-separated allowlist. It
+matches the primary vulnerability ID and aliases case-insensitively. Limits are
+applied after allowlisted IDs are removed.
+
+### TOML Policy File
+
+When `NEXUS_SEC_PROXY_POLICY_FILE` is set, the policy file is loaded once at
+startup and the legacy policy env vars above are ignored. Policy files support:
+
+- repository, format, and team scoped policies
+- first-match policy selection
+- `enforce` and `report_only` modes
+- structured exceptions with owners, tickets, reasons, expiry timestamps, and
+  optional target scopes
+- case-insensitive matching for repositories, formats, teams, and
+  vulnerability IDs
+- exact normalized package and version matching for exception target scopes
+
+Example:
 
 ```toml
 [default_policy]
@@ -98,11 +147,66 @@ packages = ["left-pad"]
 versions = ["1.0.0"]
 ```
 
-`[[policies]]` entries are checked in file order; the first matching scope
-wins. Omitted scope arrays act as wildcards. `mode = "report_only"` proxies
-the artifact but emits a structured audit event for the violation.
+Policy file rules:
 
-Cache:
+- `[default_policy]` is required and is used when no `[[policies]]` scope
+  matches.
+- `[repositories."<repo-name>"] team = "<team>"` maps a repository to one team.
+  The current repository comes from `NEXUS_SEC_PROXY_REPOSITORY_NAME`.
+- `[[policies]]` entries are checked in file order. The first matching scope
+  wins.
+- Omitted scope arrays are wildcards.
+- Policy scope fields are `repositories`, `formats`, and `teams`.
+- Policy threshold fields match the legacy env names without the
+  `NEXUS_SEC_PROXY_` prefix: `minimum_blocking_severity`,
+  `allowed_vulnerability_ids`, `max_total_vulnerabilities`,
+  `max_low_vulnerabilities`, `max_medium_vulnerabilities`,
+  `max_high_vulnerabilities`, and `max_critical_vulnerabilities`.
+- `mode = "enforce"` blocks violations with `403 Forbidden`.
+- `mode = "report_only"` logs the would-block report and proxies the request.
+- Unknown TOML fields are rejected at startup.
+
+Exception rules:
+
+- Each `[[exceptions]]` entry requires `id`, `owner`, `ticket`, `reason`,
+  `expires_at`, and `vulnerability_ids`.
+- `expires_at` must be RFC3339, for example `2026-12-31T23:59:59Z`.
+- `vulnerability_ids` match primary IDs and aliases.
+- Optional exception scopes are `repositories`, `formats`, `teams`,
+  `packages`, and `versions`.
+- Active matching exceptions suppress matching vulnerabilities before severity
+  and count limits are evaluated.
+- Expired matching exceptions are ignored for enforcement but logged as audit
+  events.
+
+Blocked responses include the selected policy ID:
+
+```text
+Package blocked by nexus-sec-proxy
+
+Target: npm:left-pad@1.0.0
+Reason: vulnerability policy was violated
+Policy: web-npm
+```
+
+## Audit Logging
+
+The proxy emits structured `tracing` events for policy outcomes. Use
+`NEXUS_SEC_PROXY_LOG_JSON=true` when these logs need to be consumed by SIEM or
+log pipelines.
+
+Audit event names:
+
+- `policy_blocked`
+- `policy_report_only_violation`
+- `policy_exception_applied`
+- `policy_exception_expired_match`
+
+Each event includes repository, format, team, policy ID, mode, target display
+name, vulnerability IDs, and exception metadata when present: exception ID,
+owner, ticket, reason, and expiry.
+
+## Cache
 
 ```bash
 NEXUS_SEC_PROXY_CACHE_ALLOWED_TTL_SECS=86400
@@ -111,7 +215,13 @@ NEXUS_SEC_PROXY_CACHE_MAX_CAPACITY=100000
 NEXUS_SEC_PROXY_REQUEST_TIMEOUT_SECS=30
 ```
 
-Artifact scanning:
+The cache stores raw vulnerability lists, not final allow/block decisions. Empty
+scan results use `NEXUS_SEC_PROXY_CACHE_ALLOWED_TTL_SECS`; non-empty scan
+results use `NEXUS_SEC_PROXY_CACHE_BLOCKED_TTL_SECS`. Cached vulnerability
+lists are re-evaluated on every request so policy modes, scoped rules, and
+exception expiry do not leak across repositories or teams.
+
+## Artifact Scanning
 
 ```bash
 NEXUS_SEC_PROXY_ARTIFACT_SCANNER=trivy
