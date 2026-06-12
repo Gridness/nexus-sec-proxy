@@ -1,6 +1,6 @@
 mod classifier;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,7 @@ use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use classifier::{RequestClassification, classify_request};
-use futures_util::StreamExt;
+use classifier::{ClassificationContext, RequestClassification, classify_path};
 use nexus_sec_proxy_cache::{
 	CacheKey, CacheStats, CachedScan, MokaScanCache, ScanCache,
 };
@@ -31,25 +30,25 @@ use nexus_sec_proxy_security::{
 	OsvClient, PolicyContext, PolicyEvaluation, PolicyEvaluator, PolicyOutcome,
 	PolicySet, ScanTarget, SecurityError, VulnerabilitySource,
 };
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 use url::Url;
 
 #[derive(Clone)]
 struct AppState {
 	config: Arc<AppConfig>,
-	upstream_base_url: Url,
+	nexus_base_url: Url,
 	http_client: reqwest::Client,
 	cache: MokaScanCache,
 	osv: OsvClient,
 	artifact_scanner: Option<ExternalScanner>,
 	artifact_scanner_semaphore: Arc<Semaphore>,
 	active_policy: Arc<RwLock<Arc<ActivePolicy>>>,
+	repository_catalog: Arc<RwLock<Arc<RepositoryCatalog>>>,
 	decision_log: DecisionLog,
 	started_at: Instant,
 	started_at_rfc3339: String,
@@ -67,6 +66,17 @@ impl AppState {
 		}
 	}
 
+	fn repository_catalog(&self) -> Arc<RepositoryCatalog> {
+		match self.repository_catalog.read() {
+			Ok(catalog) => Arc::clone(&catalog),
+			Err(error) => {
+				error!("repository catalog lock was poisoned");
+				let catalog = error.into_inner();
+				Arc::clone(&catalog)
+			}
+		}
+	}
+
 	fn reload_active_policy(
 		&self,
 		policy_set: PolicySet,
@@ -77,8 +87,6 @@ impl AppState {
 				let generation = active_policy.generation + 1;
 				let next = Arc::new(ActivePolicy::new(
 					policy_set,
-					&self.config.repository_name,
-					&self.config.repository_format,
 					source_path,
 					generation,
 				));
@@ -91,8 +99,6 @@ impl AppState {
 				let generation = active_policy.generation + 1;
 				let next = Arc::new(ActivePolicy::new(
 					policy_set,
-					&self.config.repository_name,
-					&self.config.repository_format,
 					source_path,
 					generation,
 				));
@@ -101,44 +107,60 @@ impl AppState {
 			}
 		}
 	}
+
+	fn replace_repository_catalog(
+		&self,
+		catalog: RepositoryCatalog,
+	) -> Arc<RepositoryCatalog> {
+		let catalog = Arc::new(catalog);
+
+		match self.repository_catalog.write() {
+			Ok(mut current) => {
+				*current = Arc::clone(&catalog);
+			}
+			Err(error) => {
+				error!("repository catalog lock was poisoned while reloading");
+				let mut current = error.into_inner();
+				*current = Arc::clone(&catalog);
+			}
+		}
+
+		catalog
+	}
 }
 
 #[derive(Debug, Clone)]
 struct ActivePolicy {
 	policy_set: PolicySet,
 	evaluator: PolicyEvaluator,
-	context: PolicyContext,
 	source_path: Option<String>,
 	loaded_at: String,
 	generation: u64,
-	selected_policy_id: String,
-	selected_policy_mode: EnforcementMode,
 }
 
 impl ActivePolicy {
 	fn new(
 		policy_set: PolicySet,
-		repository_name: &str,
-		repository_format: &str,
 		source_path: Option<String>,
 		generation: u64,
 	) -> Self {
-		let context = policy_set.context(repository_name, repository_format);
-		let selected_policy = policy_set.select_policy(&context);
-		let selected_policy_id = selected_policy.id.clone();
-		let selected_policy_mode = selected_policy.mode;
 		let evaluator = PolicyEvaluator::from_policy_set(policy_set.clone());
 
 		Self {
 			policy_set,
 			evaluator,
-			context,
 			source_path,
 			loaded_at: now_rfc3339(),
 			generation,
-			selected_policy_id,
-			selected_policy_mode,
 		}
+	}
+
+	fn context_for(
+		&self,
+		repository_name: &str,
+		repository_format: &str,
+	) -> PolicyContext {
+		self.policy_set.context(repository_name, repository_format)
 	}
 
 	fn summary(&self) -> ActivePolicySummary {
@@ -146,9 +168,6 @@ impl ActivePolicy {
 			generation: self.generation,
 			source_path: self.source_path.clone(),
 			loaded_at: self.loaded_at.clone(),
-			context: self.context.clone(),
-			selected_policy_id: self.selected_policy_id.clone(),
-			selected_policy_mode: self.selected_policy_mode,
 		}
 	}
 }
@@ -222,24 +241,101 @@ struct ActivePolicySummary {
 	generation: u64,
 	source_path: Option<String>,
 	loaded_at: String,
-	context: PolicyContext,
-	selected_policy_id: String,
-	selected_policy_mode: EnforcementMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct ImmutableConfigSummary {
 	bind_addr: String,
-	upstream_base_url: String,
-	repository_name: String,
-	repository_format: String,
-	osv_ecosystem: Option<String>,
+	nexus_base_url: String,
+	nexus_username_configured: bool,
+	legacy_repository_name: String,
+	legacy_repository_format: String,
+	legacy_osv_ecosystem: Option<String>,
+	osv_ecosystem_overrides: BTreeMap<String, String>,
 	osv_api_url: String,
 	policy_file: Option<String>,
 	fail_open: bool,
 	unsupported_target_policy: UnsupportedTargetPolicy,
 	request_timeout_secs: u64,
 	artifact_tmp_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct NexusRepository {
+	name: String,
+	format: String,
+	#[serde(rename = "type")]
+	repository_type: Option<String>,
+	url: Option<String>,
+	online: Option<bool>,
+	osv_ecosystem: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryCatalog {
+	repositories: BTreeMap<String, NexusRepository>,
+	loaded_at: String,
+	generation: u64,
+}
+
+impl RepositoryCatalog {
+	fn new(
+		repositories: Vec<NexusRepository>,
+		generation: u64,
+	) -> anyhow::Result<Self> {
+		if repositories.is_empty() {
+			anyhow::bail!("Nexus repository catalog is empty");
+		}
+
+		let mut by_name = BTreeMap::new();
+		for repository in repositories {
+			if repository.name.trim().is_empty() {
+				anyhow::bail!(
+					"Nexus repository catalog contains an empty repository name"
+				);
+			}
+			if repository.format.trim().is_empty() {
+				anyhow::bail!(
+					"Nexus repository catalog contains an empty format for repository {}",
+					repository.name
+				);
+			}
+			by_name.insert(repository.name.clone(), repository);
+		}
+
+		Ok(Self {
+			repositories: by_name,
+			loaded_at: now_rfc3339(),
+			generation,
+		})
+	}
+
+	fn get(&self, name: &str) -> Option<NexusRepository> {
+		self.repositories.get(name).cloned()
+	}
+
+	fn summary(&self) -> RepositoryCatalogSummary {
+		RepositoryCatalogSummary {
+			generation: self.generation,
+			loaded_at: self.loaded_at.clone(),
+			repository_count: self.repositories.len(),
+		}
+	}
+
+	fn response(&self) -> RepositoriesResponse {
+		RepositoriesResponse {
+			generation: self.generation,
+			loaded_at: self.loaded_at.clone(),
+			repositories: self.repositories.values().cloned().collect(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepositoryCatalogSummary {
+	generation: u64,
+	loaded_at: String,
+	repository_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -294,6 +390,7 @@ struct StatusResponse {
 	uptime_seconds: u64,
 	immutable_config: ImmutableConfigSummary,
 	active_policy: ActivePolicySummary,
+	repositories: RepositoryCatalogSummary,
 	cache: CacheSummary,
 	scanner: ScannerSummary,
 }
@@ -308,6 +405,20 @@ struct PolicyResponse {
 struct ReloadPolicyResponse {
 	reloaded: bool,
 	active_policy: ActivePolicySummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepositoriesResponse {
+	generation: u64,
+	loaded_at: String,
+	repositories: Vec<NexusRepository>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReloadRepositoriesResponse {
+	reloaded: bool,
+	catalog: RepositoryCatalogSummary,
+	repositories: Vec<NexusRepository>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -457,6 +568,7 @@ pre {
 <div class="grid">
 <section><h2>Status</h2><pre id="status">No data loaded.</pre></section>
 <section><h2>Policy</h2><pre id="policy">No data loaded.</pre></section>
+<section><h2>Repositories</h2><pre id="repositories">No data loaded.</pre></section>
 <section><h2>Cache</h2><pre id="cache">No data loaded.</pre></section>
 <section><h2>Scanner</h2><pre id="scanner">No data loaded.</pre></section>
 <section><h2>Recent Decisions</h2><pre id="decisions">No data loaded.</pre></section>
@@ -469,6 +581,7 @@ const refreshButton = document.querySelector("#refresh");
 const endpoints = [
 	["status", "/admin/api/status"],
 	["policy", "/admin/api/policy"],
+	["repositories", "/admin/api/repositories"],
 	["cache", "/admin/api/cache"],
 	["scanner", "/admin/api/scanner"],
 	["decisions", "/admin/api/decisions?limit=25"],
@@ -522,18 +635,6 @@ async function refresh() {
 </html>
 "##;
 
-struct PrefetchedArtifact {
-	status: StatusCode,
-	headers: HeaderMap,
-	temp_file: tempfile::NamedTempFile,
-	bytes_written: u64,
-}
-
-enum ArtifactFetch {
-	Prefetched(PrefetchedArtifact),
-	Upstream(Response<Body>),
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	init_tracing(env_log_json());
@@ -543,14 +644,18 @@ async fn main() -> anyhow::Result<()> {
 		anyhow::Error::new(error).context("failed to load configuration")
 	})?;
 	let bind_addr = config.bind_addr;
-	let upstream_base_url = Url::parse(&config.upstream_base_url)
-		.with_context(|| {
-			format!("invalid upstream base URL: {}", config.upstream_base_url)
+	let nexus_base_url =
+		Url::parse(&config.nexus_base_url).with_context(|| {
+			format!("invalid Nexus base URL: {}", config.nexus_base_url)
 		})?;
 	let http_client = reqwest::Client::builder()
 		.timeout(Duration::from_secs(config.request_timeout_secs))
 		.build()
 		.context("failed to build HTTP client")?;
+	let repository_catalog =
+		load_repository_catalog(&http_client, &nexus_base_url, &config, 1)
+			.await
+			.context("failed to load Nexus repository catalog")?;
 	let cache = MokaScanCache::new(
 		config.cache_max_capacity,
 		Duration::from_secs(config.cache_allowed_ttl_secs),
@@ -563,8 +668,6 @@ async fn main() -> anyhow::Result<()> {
 	));
 	let active_policy = Arc::new(RwLock::new(Arc::new(ActivePolicy::new(
 		config.policy_set.clone(),
-		&config.repository_name,
-		&config.repository_format,
 		config.policy_file.clone(),
 		1,
 	))));
@@ -572,26 +675,27 @@ async fn main() -> anyhow::Result<()> {
 	let started_at_rfc3339 = now_rfc3339();
 	let state = Arc::new(AppState {
 		config: Arc::new(config),
-		upstream_base_url,
+		nexus_base_url,
 		http_client,
 		cache,
 		osv,
 		artifact_scanner,
 		artifact_scanner_semaphore,
 		active_policy,
+		repository_catalog: Arc::new(RwLock::new(Arc::new(repository_catalog))),
 		decision_log: DecisionLog::new(100),
 		started_at,
 		started_at_rfc3339,
 	});
-	let active_policy = state.active_policy();
+	let repository_catalog = state.repository_catalog();
 
 	info!(
 		bind_addr = %bind_addr,
-		upstream_base_url = %state.config.upstream_base_url,
-		repository_name = %state.config.repository_name,
-		repository_format = %state.config.repository_format,
-		team = active_policy.context.team.as_deref().unwrap_or(""),
+		nexus_base_url = %state.config.nexus_base_url,
+		repository_count = repository_catalog.repositories.len(),
+		repository_catalog_generation = repository_catalog.generation,
 		osv_ecosystem = ?state.config.osv_ecosystem,
+		osv_ecosystem_overrides = ?state.config.osv_ecosystem_overrides,
 		osv_api_url = %state.config.osv_api_url,
 		policy_file = ?state.config.policy_file,
 		admin_enabled = state.config.admin_token.is_some(),
@@ -624,6 +728,11 @@ fn build_app(state: Arc<AppState>) -> Router {
 			.route("/admin/api/policy", get(admin_policy))
 			.route("/admin/api/policy/reload", post(admin_reload_policy))
 			.route("/admin/api/policy/validate", post(admin_validate_policy))
+			.route("/admin/api/repositories", get(admin_repositories))
+			.route(
+				"/admin/api/repositories/reload",
+				post(admin_reload_repositories),
+			)
 			.route("/admin/api/cache", get(admin_cache))
 			.route("/admin/api/scanner", get(admin_scanner))
 			.route("/admin/api/decisions", get(admin_decisions))
@@ -687,6 +796,7 @@ async fn admin_status(
 		uptime_seconds: state.started_at.elapsed().as_secs(),
 		immutable_config: immutable_config_summary(&state.config),
 		active_policy: active_policy.summary(),
+		repositories: state.repository_catalog().summary(),
 		cache: cache_summary(&state).await,
 		scanner: scanner_summary(&state),
 	})
@@ -733,7 +843,6 @@ async fn admin_reload_policy(
 			info!(
 				policy_file = %path,
 				generation = active_policy.generation,
-				selected_policy_id = %active_policy.selected_policy_id,
 				"policy reloaded"
 			);
 
@@ -765,14 +874,10 @@ async fn admin_validate_policy(
 
 	match parse_policy_toml(&request.policy_toml) {
 		Ok(policy_set) => {
-			let repository_name = request
-				.repository_name
-				.as_deref()
-				.unwrap_or(&state.config.repository_name);
-			let repository_format = request
-				.repository_format
-				.as_deref()
-				.unwrap_or(&state.config.repository_format);
+			let repository_name =
+				request.repository_name.as_deref().unwrap_or("default");
+			let repository_format =
+				request.repository_format.as_deref().unwrap_or("generic");
 			let context =
 				policy_set.context(repository_name, repository_format);
 			let selected_policy = policy_set.select_policy(&context);
@@ -790,6 +895,60 @@ async fn admin_validate_policy(
 			json_error(
 				StatusCode::UNPROCESSABLE_ENTITY,
 				"invalid policy TOML",
+				Some(error.to_string()),
+			)
+		}
+	}
+}
+
+async fn admin_repositories(
+	State(state): State<Arc<AppState>>,
+	headers: HeaderMap,
+) -> Response<Body> {
+	if let Err(response) = authorize_admin(&state, &headers) {
+		return response;
+	}
+
+	Json(state.repository_catalog().response()).into_response()
+}
+
+async fn admin_reload_repositories(
+	State(state): State<Arc<AppState>>,
+	headers: HeaderMap,
+) -> Response<Body> {
+	if let Err(response) = authorize_admin(&state, &headers) {
+		return response;
+	}
+
+	let generation = state.repository_catalog().generation + 1;
+	match load_repository_catalog(
+		&state.http_client,
+		&state.nexus_base_url,
+		&state.config,
+		generation,
+	)
+	.await
+	{
+		Ok(catalog) => {
+			let catalog = state.replace_repository_catalog(catalog);
+			info!(
+				generation = catalog.generation,
+				repository_count = catalog.repositories.len(),
+				"repository catalog reloaded"
+			);
+
+			Json(ReloadRepositoriesResponse {
+				reloaded: true,
+				catalog: catalog.summary(),
+				repositories: catalog.response().repositories,
+			})
+			.into_response()
+		}
+		Err(error) => {
+			error!(%error, "repository catalog reload failed");
+			json_error(
+				StatusCode::BAD_GATEWAY,
+				"repository catalog reload failed",
 				Some(error.to_string()),
 			)
 		}
@@ -889,10 +1048,12 @@ fn authorize_admin(
 fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 	ImmutableConfigSummary {
 		bind_addr: config.bind_addr.to_string(),
-		upstream_base_url: config.upstream_base_url.clone(),
-		repository_name: config.repository_name.clone(),
-		repository_format: config.repository_format.clone(),
-		osv_ecosystem: config.osv_ecosystem.clone(),
+		nexus_base_url: config.nexus_base_url.clone(),
+		nexus_username_configured: config.nexus_username.is_some(),
+		legacy_repository_name: config.repository_name.clone(),
+		legacy_repository_format: config.repository_format.clone(),
+		legacy_osv_ecosystem: config.osv_ecosystem.clone(),
+		osv_ecosystem_overrides: config.osv_ecosystem_overrides.clone(),
 		osv_api_url: config.osv_api_url.clone(),
 		policy_file: config.policy_file.clone(),
 		fail_open: config.fail_open,
@@ -1169,12 +1330,109 @@ fn system_time_age_seconds(time: SystemTime) -> u64 {
 		.as_secs()
 }
 
+#[derive(Debug, Deserialize)]
+struct NexusRepositoryResponseItem {
+	name: String,
+	format: String,
+	#[serde(rename = "type")]
+	repository_type: Option<String>,
+	url: Option<String>,
+	online: Option<bool>,
+}
+
+async fn load_repository_catalog(
+	client: &reqwest::Client,
+	nexus_base_url: &Url,
+	config: &AppConfig,
+	generation: u64,
+) -> anyhow::Result<RepositoryCatalog> {
+	let mut repositories_url = nexus_base_url.clone();
+	let base_path = nexus_base_url.path().trim_end_matches('/');
+	let path = if base_path.is_empty() || base_path == "/" {
+		"/service/rest/v1/repositories".to_owned()
+	} else {
+		format!("{base_path}/service/rest/v1/repositories")
+	};
+	repositories_url.set_path(&path);
+	repositories_url.set_query(None);
+
+	let mut request = client.get(repositories_url);
+	if let Some(username) = config.nexus_username.as_deref() {
+		request = request.basic_auth(username, config.nexus_password.clone());
+	}
+
+	let response = request
+		.send()
+		.await
+		.context("Nexus repository catalog request failed")?;
+	let status = response.status();
+	if !status.is_success() {
+		let body = response.text().await.unwrap_or_else(|error| {
+			format!(
+				"failed to read Nexus repository catalog error body: {error}"
+			)
+		});
+		anyhow::bail!("Nexus repository catalog returned {status}: {body}");
+	}
+
+	let items = response
+		.json::<Vec<NexusRepositoryResponseItem>>()
+		.await
+		.context("invalid Nexus repository catalog response")?;
+	let repositories = items
+		.into_iter()
+		.map(|item| NexusRepository {
+			osv_ecosystem: config
+				.osv_ecosystem_overrides
+				.get(&item.name)
+				.cloned(),
+			name: item.name,
+			format: item.format,
+			repository_type: item.repository_type,
+			url: item.url,
+			online: item.online,
+		})
+		.collect();
+
+	RepositoryCatalog::new(repositories, generation)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryPath {
+	repository: String,
+	stripped_path: String,
+}
+
+fn parse_repository_path(path: &str) -> Option<RepositoryPath> {
+	let rest = path.strip_prefix("/repository/")?;
+	let (repository, remainder) = rest.split_once('/').unwrap_or((rest, ""));
+	if repository.is_empty() {
+		return None;
+	}
+
+	let repository = percent_decode_str(repository)
+		.decode_utf8_lossy()
+		.into_owned();
+	let stripped_path = if remainder.is_empty() {
+		"/".to_owned()
+	} else {
+		format!("/{remainder}")
+	};
+
+	Some(RepositoryPath {
+		repository,
+		stripped_path,
+	})
+}
+
 async fn proxy_handler(
 	State(state): State<Arc<AppState>>,
 	request: Request<Body>,
 ) -> Response<Body> {
-	let method = request.method().clone();
-	let uri = request.uri().clone();
+	let (parts, body) = request.into_parts();
+	let method = parts.method;
+	let uri = parts.uri;
+	let headers = parts.headers;
 
 	if uri.path().starts_with("/admin") {
 		return if state.config.admin_token.is_some() {
@@ -1184,44 +1442,60 @@ async fn proxy_handler(
 		};
 	}
 
-	if method != Method::GET && method != Method::HEAD {
-		return response_with_text(
-			StatusCode::METHOD_NOT_ALLOWED,
-			"Only GET and HEAD are supported by this upstream proxy\n",
-		);
-	}
+	if let Some(repository_path) = parse_repository_path(uri.path()) {
+		let catalog = state.repository_catalog();
+		let Some(repository) = catalog.get(&repository_path.repository) else {
+			return unknown_repository_response(&repository_path.repository);
+		};
 
-	let classification = classify_request(&state.config, &method, &uri);
+		if method == Method::GET || method == Method::HEAD {
+			let classification_context = ClassificationContext::new(
+				repository.format.clone(),
+				repository.osv_ecosystem.clone(),
+			);
+			let classification = classify_path(
+				&classification_context,
+				&method,
+				&repository_path.stripped_path,
+			);
 
-	match classification {
-		RequestClassification::ProxyOnly => {}
-		RequestClassification::Scan(ScanTarget::Package(package)) => {
-			if let Err(response) =
-				authorize_package_target(&state, ScanTarget::Package(package))
+			match classification {
+				RequestClassification::ProxyOnly => {}
+				RequestClassification::Scan(ScanTarget::Package(package)) => {
+					if let Err(response) = authorize_package_target(
+						&state,
+						&repository,
+						ScanTarget::Package(package),
+					)
 					.await
-			{
-				return *response;
+					{
+						return *response;
+					}
+				}
+				RequestClassification::Scan(target @ ScanTarget::Artifact(_)) => {
+					if let Err(response) = handle_unsupported_target(
+						&state,
+						&repository,
+						target,
+						"artifact targets cannot be scanned before contacting Nexus"
+							.to_owned(),
+					)
+					.await
+					{
+						return *response;
+					}
+				}
 			}
 		}
-		RequestClassification::Scan(target @ ScanTarget::Artifact(_)) => {
-			return handle_artifact_request(
-				&state,
-				method,
-				uri,
-				request.headers(),
-				target,
-			)
-			.await;
-		}
 	}
 
-	match forward_request(&state, method, uri, request.headers()).await {
+	match forward_request(&state, method, uri, &headers, body).await {
 		Ok(response) => response,
 		Err(error) => {
-			error!(%error, "failed to proxy upstream request");
+			error!(%error, "failed to proxy Nexus request");
 			response_with_text(
 				StatusCode::BAD_GATEWAY,
-				format!("failed to proxy upstream request: {error}\n"),
+				format!("failed to proxy Nexus request: {error}\n"),
 			)
 		}
 	}
@@ -1229,6 +1503,7 @@ async fn proxy_handler(
 
 async fn authorize_package_target(
 	state: &AppState,
+	repository: &NexusRepository,
 	target: ScanTarget,
 ) -> Result<(), Box<Response<Body>>> {
 	let cache_key = cache_key_for_target(&target);
@@ -1236,12 +1511,14 @@ async fn authorize_package_target(
 	match state.cache.get(&cache_key).await {
 		Ok(Some(scan)) => {
 			let active_policy = state.active_policy();
+			let context =
+				active_policy.context_for(&repository.name, &repository.format);
 			return handle_policy_evaluation(
 				state,
-				&active_policy,
+				&context,
 				&target,
 				active_policy.evaluator.evaluate_with_context(
-					&active_policy.context,
+					&context,
 					&target,
 					scan.vulnerabilities,
 				),
@@ -1253,11 +1530,7 @@ async fn authorize_package_target(
 		}
 	}
 
-	let (active_policy, decision) = match state
-		.osv
-		.vulnerabilities(&target)
-		.await
-	{
+	let (context, decision) = match state.osv.vulnerabilities(&target).await {
 		Ok(vulnerabilities) => {
 			put_cache(
 				state,
@@ -1267,15 +1540,20 @@ async fn authorize_package_target(
 			)
 			.await;
 			let active_policy = state.active_policy();
+			let context =
+				active_policy.context_for(&repository.name, &repository.format);
 			let decision = active_policy.evaluator.evaluate_with_context(
-				&active_policy.context,
+				&context,
 				&target,
 				vulnerabilities,
 			);
-			(active_policy, decision)
+			(context, decision)
 		}
 		Err(SecurityError::UnsupportedTarget(reason)) => {
-			return handle_unsupported_target(state, target, reason).await;
+			return handle_unsupported_target(
+				state, repository, target, reason,
+			)
+			.await;
 		}
 		Err(error) => {
 			error!(%error, target = %target.display_name(), "scanner failed");
@@ -1298,158 +1576,12 @@ async fn authorize_package_target(
 		}
 	};
 
-	handle_policy_evaluation(state, &active_policy, &target, decision)
-}
-
-async fn handle_artifact_request(
-	state: &AppState,
-	method: Method,
-	uri: Uri,
-	headers: &HeaderMap,
-	target: ScanTarget,
-) -> Response<Body> {
-	if method == Method::HEAD {
-		return forward_or_bad_gateway(state, method, uri, headers).await;
-	}
-
-	let cache_key = cache_key_for_target(&target);
-	match state.cache.get(&cache_key).await {
-		Ok(Some(scan)) => {
-			let active_policy = state.active_policy();
-			let evaluation = active_policy.evaluator.evaluate_with_context(
-				&active_policy.context,
-				&target,
-				scan.vulnerabilities,
-			);
-
-			match handle_policy_evaluation(
-				state,
-				&active_policy,
-				&target,
-				evaluation,
-			) {
-				Ok(()) => {
-					return forward_or_bad_gateway(state, method, uri, headers)
-						.await;
-				}
-				Err(response) => return *response,
-			}
-		}
-		Ok(None) => {}
-		Err(error) => {
-			error!(%error, target = %target.display_name(), "cache lookup failed");
-		}
-	}
-
-	let Some(scanner) = state.artifact_scanner.as_ref() else {
-		return match handle_unsupported_target(
-			state,
-			target,
-			"artifact scanner is disabled".to_owned(),
-		)
-		.await
-		{
-			Ok(()) => forward_or_bad_gateway(state, method, uri, headers).await,
-			Err(response) => *response,
-		};
-	};
-
-	let prefetched = match prefetch_artifact(
-		state,
-		method.clone(),
-		&uri,
-		headers,
-	)
-	.await
-	{
-		Ok(ArtifactFetch::Prefetched(prefetched)) => prefetched,
-		Ok(ArtifactFetch::Upstream(response)) => return response,
-		Err(error) => {
-			error!(
-				%error,
-				target = %target.display_name(),
-				"failed to prefetch artifact for scanning"
-			);
-
-			if state.config.fail_open {
-				warn!(
-					target = %target.display_name(),
-					"allowing request because artifact prefetch failed and fail_open=true"
-				);
-				return forward_or_bad_gateway(state, method, uri, headers)
-					.await;
-			}
-
-			return response_with_text(
-				StatusCode::SERVICE_UNAVAILABLE,
-				format!(
-					"Artifact scan failed and fail_open=false\n\nTarget: {}\nReason: {error}\n",
-					target.display_name()
-				),
-			);
-		}
-	};
-
-	let _permit = match state.artifact_scanner_semaphore.acquire().await {
-		Ok(permit) => permit,
-		Err(error) => {
-			error!(%error, "artifact scanner semaphore was closed");
-			return response_with_text(
-				StatusCode::SERVICE_UNAVAILABLE,
-				"artifact scanner is unavailable\n",
-			);
-		}
-	};
-
-	let (active_policy, decision) = match scanner
-		.scan_path(&target, prefetched.temp_file.path())
-		.await
-	{
-		Ok(vulnerabilities) => {
-			put_cache(
-				state,
-				cache_key,
-				CachedScan::new(vulnerabilities.clone()),
-				&target,
-			)
-			.await;
-			let active_policy = state.active_policy();
-			let decision = active_policy.evaluator.evaluate_with_context(
-				&active_policy.context,
-				&target,
-				vulnerabilities,
-			);
-			(active_policy, decision)
-		}
-		Err(error) => {
-			error!(%error, target = %target.display_name(), "artifact scanner failed");
-
-			if state.config.fail_open {
-				warn!(
-					target = %target.display_name(),
-					"allowing request because artifact scanner failed and fail_open=true"
-				);
-				return prefetched_or_bad_gateway(prefetched).await;
-			}
-
-			return response_with_text(
-				StatusCode::SERVICE_UNAVAILABLE,
-				format!(
-					"Artifact scan failed and fail_open=false\n\nTarget: {}\nReason: {error}\n",
-					target.display_name()
-				),
-			);
-		}
-	};
-
-	match handle_policy_evaluation(state, &active_policy, &target, decision) {
-		Ok(()) => prefetched_or_bad_gateway(prefetched).await,
-		Err(response) => *response,
-	}
+	handle_policy_evaluation(state, &context, &target, decision)
 }
 
 async fn handle_unsupported_target(
 	state: &AppState,
+	repository: &NexusRepository,
 	target: ScanTarget,
 	reason: String,
 ) -> Result<(), Box<Response<Body>>> {
@@ -1465,12 +1597,9 @@ async fn handle_unsupported_target(
 		UnsupportedTargetPolicy::Block => {
 			let report = BlockReport::unsupported(target, reason);
 			let active_policy = state.active_policy();
-			record_decision(
-				state,
-				&active_policy,
-				DecisionOutcome::Blocked,
-				&report,
-			);
+			let context =
+				active_policy.context_for(&repository.name, &repository.format);
+			record_decision(state, &context, DecisionOutcome::Blocked, &report);
 			Err(Box::new(response_with_text(
 				StatusCode::FORBIDDEN,
 				report.to_plain_text(),
@@ -1481,29 +1610,24 @@ async fn handle_unsupported_target(
 
 fn handle_policy_evaluation(
 	state: &AppState,
-	active_policy: &ActivePolicy,
+	context: &PolicyContext,
 	target: &ScanTarget,
 	evaluation: PolicyEvaluation,
 ) -> Result<(), Box<Response<Body>>> {
-	audit_policy_evaluation(active_policy, target, &evaluation);
+	audit_policy_evaluation(context, target, &evaluation);
 
 	match &evaluation.outcome {
 		PolicyOutcome::Allowed => {}
 		PolicyOutcome::ReportOnly(report) => {
 			record_decision(
 				state,
-				active_policy,
+				context,
 				DecisionOutcome::ReportOnly,
 				report,
 			);
 		}
 		PolicyOutcome::Blocked(report) => {
-			record_decision(
-				state,
-				active_policy,
-				DecisionOutcome::Blocked,
-				report,
-			);
+			record_decision(state, context, DecisionOutcome::Blocked, report);
 		}
 	}
 
@@ -1517,11 +1641,10 @@ fn handle_policy_evaluation(
 }
 
 fn audit_policy_evaluation(
-	active_policy: &ActivePolicy,
+	context: &PolicyContext,
 	target: &ScanTarget,
 	evaluation: &PolicyEvaluation,
 ) {
-	let context = &active_policy.context;
 	let target_display = target.display_name();
 	let team = context.team.as_deref().unwrap_or("");
 
@@ -1604,15 +1727,15 @@ fn vulnerability_ids(report: &BlockReport) -> Vec<String> {
 
 fn record_decision(
 	state: &AppState,
-	active_policy: &ActivePolicy,
+	context: &PolicyContext,
 	outcome: DecisionOutcome,
 	report: &BlockReport,
 ) {
 	state.decision_log.push(RecentDecision {
 		timestamp: now_rfc3339(),
-		repository: active_policy.context.repository.clone(),
-		format: active_policy.context.format.clone(),
-		team: active_policy.context.team.clone(),
+		repository: context.repository.clone(),
+		format: context.format.clone(),
+		team: context.team.clone(),
 		target: report.target.display_name(),
 		outcome,
 		policy_id: report.policy_id.clone(),
@@ -1648,96 +1771,18 @@ fn external_scanner_from_config(config: &AppConfig) -> Option<ExternalScanner> {
 	))
 }
 
-async fn prefetch_artifact(
-	state: &AppState,
-	method: Method,
-	uri: &Uri,
-	headers: &HeaderMap,
-) -> anyhow::Result<ArtifactFetch> {
-	let upstream_url = build_upstream_url(&state.upstream_base_url, uri);
-	let reqwest_method =
-		reqwest::Method::from_bytes(method.as_str().as_bytes())
-			.context("invalid request method")?;
-	let mut request = state.http_client.request(reqwest_method, upstream_url);
-
-	for (name, value) in headers {
-		if is_hop_by_hop_header(name.as_str()) {
-			continue;
-		}
-
-		request = request.header(name, value);
-	}
-
-	let response = request.send().await.context("upstream request failed")?;
-	let status = StatusCode::from_u16(response.status().as_u16())
-		.context("invalid upstream status code")?;
-
-	if !status.is_success() {
-		return Ok(ArtifactFetch::Upstream(response_from_upstream(response)?));
-	}
-
-	let response_headers = response_headers(response.headers());
-	let temp_file =
-		if let Some(tmp_dir) = state.config.artifact_tmp_dir.as_deref() {
-			tempfile::Builder::new()
-				.prefix("nexus-sec-proxy-")
-				.tempfile_in(tmp_dir)
-				.with_context(|| {
-					format!("failed to create temp file in {tmp_dir}")
-				})?
-		} else {
-			tempfile::Builder::new()
-				.prefix("nexus-sec-proxy-")
-				.tempfile()
-				.context("failed to create temp file")?
-		};
-	let mut file = tokio::fs::File::from_std(
-		temp_file
-			.reopen()
-			.context("failed to reopen temp file for writing")?,
-	);
-	let mut bytes_written = 0_u64;
-
-	let mut stream = response.bytes_stream();
-	while let Some(chunk) = stream.next().await {
-		let chunk = chunk.context("failed to read upstream artifact chunk")?;
-		bytes_written += chunk.len() as u64;
-
-		if bytes_written > state.config.artifact_scan_max_bytes {
-			return Err(anyhow::anyhow!(
-				"artifact size {bytes_written} exceeds scan limit {}",
-				state.config.artifact_scan_max_bytes
-			));
-		}
-
-		file.write_all(&chunk)
-			.await
-			.context("failed to write artifact temp file")?;
-	}
-
-	file.flush()
-		.await
-		.context("failed to flush artifact temp file")?;
-
-	Ok(ArtifactFetch::Prefetched(PrefetchedArtifact {
-		status,
-		headers: response_headers,
-		temp_file,
-		bytes_written,
-	}))
-}
-
 async fn forward_request(
 	state: &AppState,
 	method: Method,
 	uri: Uri,
 	headers: &HeaderMap,
+	body: Body,
 ) -> anyhow::Result<Response<Body>> {
-	let upstream_url = build_upstream_url(&state.upstream_base_url, &uri);
+	let nexus_url = build_nexus_url(&state.nexus_base_url, &uri);
 	let reqwest_method =
 		reqwest::Method::from_bytes(method.as_str().as_bytes())
 			.context("invalid request method")?;
-	let mut request = state.http_client.request(reqwest_method, upstream_url);
+	let mut request = state.http_client.request(reqwest_method, nexus_url);
 
 	for (name, value) in headers {
 		if is_hop_by_hop_header(name.as_str()) {
@@ -1747,8 +1792,12 @@ async fn forward_request(
 		request = request.header(name, value);
 	}
 
-	let response = request.send().await.context("upstream request failed")?;
-	response_from_upstream(response)
+	let response = request
+		.body(reqwest::Body::wrap_stream(body.into_data_stream()))
+		.send()
+		.await
+		.context("Nexus request failed")?;
+	response_from_nexus(response)
 }
 
 fn response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
@@ -1765,11 +1814,11 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
 	response_headers
 }
 
-fn response_from_upstream(
+fn response_from_nexus(
 	response: reqwest::Response,
 ) -> anyhow::Result<Response<Body>> {
 	let status = StatusCode::from_u16(response.status().as_u16())
-		.context("invalid upstream status code")?;
+		.context("invalid Nexus status code")?;
 	let mut builder = Response::builder().status(status);
 
 	let headers = response_headers(response.headers());
@@ -1779,70 +1828,11 @@ fn response_from_upstream(
 
 	builder
 		.body(Body::from_stream(response.bytes_stream()))
-		.context("failed to build upstream response")
+		.context("failed to build Nexus response")
 }
 
-async fn prefetched_or_bad_gateway(
-	prefetched: PrefetchedArtifact,
-) -> Response<Body> {
-	match response_from_prefetched(prefetched).await {
-		Ok(response) => response,
-		Err(error) => {
-			error!(%error, "failed to stream prefetched artifact");
-			response_with_text(
-				StatusCode::BAD_GATEWAY,
-				format!("failed to stream prefetched artifact: {error}\n"),
-			)
-		}
-	}
-}
-
-async fn response_from_prefetched(
-	prefetched: PrefetchedArtifact,
-) -> anyhow::Result<Response<Body>> {
-	let file = tokio::fs::File::open(prefetched.temp_file.path())
-		.await
-		.context("failed to open scanned artifact temp file")?;
-	let mut builder = Response::builder().status(prefetched.status);
-	let mut has_content_length = false;
-
-	for (name, value) in &prefetched.headers {
-		if name.as_str().eq_ignore_ascii_case("content-length") {
-			has_content_length = true;
-		}
-
-		builder = builder.header(name, value);
-	}
-
-	if !has_content_length {
-		builder = builder.header("content-length", prefetched.bytes_written);
-	}
-
-	builder
-		.body(Body::from_stream(ReaderStream::new(file)))
-		.context("failed to build scanned artifact response")
-}
-
-async fn forward_or_bad_gateway(
-	state: &AppState,
-	method: Method,
-	uri: Uri,
-	headers: &HeaderMap,
-) -> Response<Body> {
-	match forward_request(state, method, uri, headers).await {
-		Ok(response) => response,
-		Err(error) => {
-			error!(%error, "failed to proxy upstream request");
-			response_with_text(
-				StatusCode::BAD_GATEWAY,
-				format!("failed to proxy upstream request: {error}\n"),
-			)
-		}
-	}
-}
-
-fn build_upstream_url(base: &Url, uri: &Uri) -> Url {
-	let mut upstream_url = base.clone();
+fn build_nexus_url(base: &Url, uri: &Uri) -> Url {
+	let mut nexus_url = base.clone();
 	let base_path = base.path().trim_end_matches('/');
 	let request_path = uri.path();
 	let path = if base_path.is_empty() || base_path == "/" {
@@ -1853,9 +1843,9 @@ fn build_upstream_url(base: &Url, uri: &Uri) -> Url {
 		format!("{base_path}{request_path}")
 	};
 
-	upstream_url.set_path(&path);
-	upstream_url.set_query(uri.query());
-	upstream_url
+	nexus_url.set_path(&path);
+	nexus_url.set_query(uri.query());
+	nexus_url
 }
 
 fn cache_key_for_target(target: &ScanTarget) -> CacheKey {
@@ -1876,6 +1866,15 @@ fn response_with_text(
 		body.into(),
 	)
 		.into_response()
+}
+
+fn unknown_repository_response(repository: &str) -> Response<Body> {
+	response_with_text(
+		StatusCode::FORBIDDEN,
+		format!(
+			"Repository blocked by nexus-sec-proxy\n\nRepository: {repository}\nReason: repository is not present in the Nexus catalog\n"
+		),
+	)
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {
@@ -1923,6 +1922,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use axum::body::to_bytes;
 	use nexus_sec_proxy_security::{
 		PackageCoordinate, Severity, Vulnerability,
@@ -1932,12 +1933,69 @@ mod tests {
 
 	use super::*;
 
+	#[derive(Debug, Clone)]
+	struct RecordedRequest {
+		method: Method,
+		path_and_query: String,
+		headers: HeaderMap,
+		body: Vec<u8>,
+	}
+
+	#[derive(Clone)]
+	struct OsvMockState {
+		request_count: Arc<AtomicUsize>,
+		response: Value,
+		status: StatusCode,
+	}
+
+	async fn spawn_server(app: Router) -> Url {
+		let listener =
+			tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			axum::serve(listener, app).await.unwrap();
+		});
+
+		Url::parse(&format!("http://{addr}")).unwrap()
+	}
+
+	async fn record_nexus_request(
+		State(records): State<Arc<Mutex<Vec<RecordedRequest>>>>,
+		method: Method,
+		uri: Uri,
+		headers: HeaderMap,
+		body: Body,
+	) -> Response<Body> {
+		let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+		records.lock().unwrap().push(RecordedRequest {
+			method,
+			path_and_query: uri
+				.path_and_query()
+				.map(|value| value.as_str().to_owned())
+				.unwrap_or_else(|| uri.path().to_owned()),
+			headers,
+			body,
+		});
+
+		response_with_text(StatusCode::OK, "nexus\n")
+	}
+
+	async fn mock_osv(
+		State(state): State<OsvMockState>,
+		body: Body,
+	) -> Response<Body> {
+		let _ = to_bytes(body, usize::MAX).await.unwrap();
+		state.request_count.fetch_add(1, Ordering::SeqCst);
+
+		(state.status, Json(state.response)).into_response()
+	}
+
 	#[test]
-	fn joins_upstream_base_path_and_request_path() {
+	fn joins_nexus_base_path_and_request_path() {
 		let base = Url::parse("https://repo.example.invalid/root").unwrap();
 		let uri: Uri = "/nested/pkg.tgz?download=1".parse().unwrap();
 
-		let joined = build_upstream_url(&base, &uri);
+		let joined = build_nexus_url(&base, &uri);
 
 		assert_eq!(
 			joined.as_str(),
@@ -1950,13 +2008,144 @@ mod tests {
 		let base = Url::parse("https://repo.example.invalid/").unwrap();
 		let uri: Uri = "/pkg.tgz".parse().unwrap();
 
-		let joined = build_upstream_url(&base, &uri);
+		let joined = build_nexus_url(&base, &uri);
 
 		assert_eq!(joined.as_str(), "https://repo.example.invalid/pkg.tgz");
 	}
 
 	#[tokio::test]
-	async fn disabled_admin_routes_do_not_proxy_upstream() {
+	async fn repository_catalog_loads_repositories_and_overrides() {
+		let app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get(|| async {
+				Json(json!([
+					{
+						"name": "npm-proxy",
+						"format": "npm",
+						"type": "proxy",
+						"url": "http://nexus/repository/npm-proxy",
+						"online": true
+					},
+					{
+						"name": "apt-proxy",
+						"format": "apt",
+						"type": "proxy"
+					}
+				]))
+			}),
+		);
+		let nexus_base_url = spawn_server(app).await;
+		let mut config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			nexus_base_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		config
+			.osv_ecosystem_overrides
+			.insert("apt-proxy".to_owned(), "Ubuntu OS".to_owned());
+		let client = reqwest::Client::new();
+
+		let catalog =
+			load_repository_catalog(&client, &nexus_base_url, &config, 7)
+				.await
+				.unwrap();
+
+		assert_eq!(catalog.generation, 7);
+		assert_eq!(catalog.repositories.len(), 2);
+		assert_eq!(catalog.get("npm-proxy").unwrap().format, "npm".to_owned());
+		assert_eq!(
+			catalog.get("apt-proxy").unwrap().osv_ecosystem.as_deref(),
+			Some("Ubuntu OS")
+		);
+	}
+
+	#[tokio::test]
+	async fn repository_catalog_reports_auth_malformed_and_empty_failures() {
+		let client = reqwest::Client::new();
+
+		let auth_app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get(|| async { (StatusCode::UNAUTHORIZED, "no") }),
+		);
+		let auth_url = spawn_server(auth_app).await;
+		let config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			auth_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		let error = load_repository_catalog(&client, &auth_url, &config, 1)
+			.await
+			.unwrap_err();
+		assert!(error.to_string().contains("returned 401"));
+
+		let malformed_app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get(|| async { (StatusCode::OK, "not json") }),
+		);
+		let malformed_url = spawn_server(malformed_app).await;
+		let config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			malformed_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		let error =
+			load_repository_catalog(&client, &malformed_url, &config, 1)
+				.await
+				.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("invalid Nexus repository catalog")
+		);
+
+		let empty_app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get(|| async { Json(json!([])) }),
+		);
+		let empty_url = spawn_server(empty_app).await;
+		let config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			empty_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		let error = load_repository_catalog(&client, &empty_url, &config, 1)
+			.await
+			.unwrap_err();
+		assert!(error.to_string().contains("catalog is empty"));
+	}
+
+	#[test]
+	fn parses_repository_path_and_strips_prefix() {
+		let parsed = parse_repository_path(
+			"/repository/maven-central/com/example/demo/1.0/demo-1.0.jar",
+		)
+		.unwrap();
+
+		assert_eq!(parsed.repository, "maven-central");
+		assert_eq!(parsed.stripped_path, "/com/example/demo/1.0/demo-1.0.jar");
+
+		let parsed = parse_repository_path("/repository/npm%2Dproxy").unwrap();
+
+		assert_eq!(parsed.repository, "npm-proxy");
+		assert_eq!(parsed.stripped_path, "/");
+		assert_eq!(parse_repository_path("/service/rest/v1/status"), None);
+		assert_eq!(parse_repository_path("/repository/"), None);
+	}
+
+	#[tokio::test]
+	async fn disabled_admin_routes_do_not_proxy_to_nexus() {
 		let app = build_app(test_state(None, None, PolicySet::default()));
 
 		let response = app
@@ -1989,6 +2178,269 @@ mod tests {
 
 		assert_eq!(status, StatusCode::NOT_FOUND);
 		assert_eq!(body, "admin API is disabled\n");
+	}
+
+	#[tokio::test]
+	async fn blocked_package_returns_403_before_nexus() {
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let osv_count = Arc::new(AtomicUsize::new(0));
+		let osv_url = spawn_server(
+			Router::new().route("/osv", post(mock_osv)).with_state(
+				OsvMockState {
+					request_count: Arc::clone(&osv_count),
+					response: blocking_osv_response(),
+					status: StatusCode::OK,
+				},
+			),
+		)
+		.await;
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			&format!("{osv_url}osv"),
+			PolicySet::default(),
+			UnsupportedTargetPolicy::Allow,
+			vec![test_repository("maven-central", "maven2", None)],
+		);
+		let app = build_app(state);
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri(
+						"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+					)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+		assert_eq!(nexus_records.lock().unwrap().len(), 0);
+		assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn report_only_package_forwards_to_nexus_once() {
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let osv_count = Arc::new(AtomicUsize::new(0));
+		let osv_url = spawn_server(
+			Router::new().route("/osv", post(mock_osv)).with_state(
+				OsvMockState {
+					request_count: Arc::clone(&osv_count),
+					response: blocking_osv_response(),
+					status: StatusCode::OK,
+				},
+			),
+		)
+		.await;
+		let report_only_policy = PolicySet::from_toml_str(
+			r#"
+			[default_policy]
+			id = "audit"
+			mode = "report_only"
+			minimum_blocking_severity = "high"
+			"#,
+		)
+		.unwrap();
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			&format!("{osv_url}osv"),
+			report_only_policy,
+			UnsupportedTargetPolicy::Allow,
+			vec![test_repository("npm-proxy", "npm", Some("npm"))],
+		);
+		let app = build_app(state.clone());
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/repository/npm-proxy/left-pad/-/left-pad-1.0.0.tgz")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(nexus_records.lock().unwrap().len(), 1);
+		assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+		assert_eq!(
+			state.decision_log.list(10)[0].outcome,
+			DecisionOutcome::ReportOnly
+		);
+	}
+
+	#[tokio::test]
+	async fn metadata_and_sidecar_requests_forward_without_osv() {
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let osv_count = Arc::new(AtomicUsize::new(0));
+		let osv_url = spawn_server(
+			Router::new().route("/osv", post(mock_osv)).with_state(
+				OsvMockState {
+					request_count: Arc::clone(&osv_count),
+					response: blocking_osv_response(),
+					status: StatusCode::OK,
+				},
+			),
+		)
+		.await;
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			&format!("{osv_url}osv"),
+			PolicySet::default(),
+			UnsupportedTargetPolicy::Allow,
+			vec![test_repository("maven-central", "maven2", None)],
+		);
+		let app = build_app(state);
+
+		for uri in [
+			"/repository/maven-central/com/example/demo/maven-metadata.xml",
+			"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar.sha1",
+		] {
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder().uri(uri).body(Body::empty()).unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK);
+		}
+
+		assert_eq!(nexus_records.lock().unwrap().len(), 2);
+		assert_eq!(osv_count.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn non_get_repository_request_forwards_method_headers_query_and_body()
+	{
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			PolicySet::default(),
+			UnsupportedTargetPolicy::Allow,
+			vec![test_repository("npm-proxy", "npm", Some("npm"))],
+		);
+		let app = build_app(state);
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.method(Method::PUT)
+					.uri("/repository/npm-proxy/upload/path?checksum=1")
+					.header("x-custom", "kept")
+					.body(Body::from("request body"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::OK);
+		let records = nexus_records.lock().unwrap();
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].method, Method::PUT);
+		assert_eq!(
+			records[0].path_and_query,
+			"/repository/npm-proxy/upload/path?checksum=1"
+		);
+		assert_eq!(records[0].headers["x-custom"], "kept");
+		assert_eq!(records[0].body, b"request body");
+	}
+
+	#[tokio::test]
+	async fn unknown_repository_fails_closed_before_nexus() {
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			PolicySet::default(),
+			UnsupportedTargetPolicy::Allow,
+			vec![test_repository("known", "npm", Some("npm"))],
+		);
+		let app = build_app(state);
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/repository/unknown/left-pad/-/left-pad-1.0.0.tgz")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+		assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	}
+
+	#[tokio::test]
+	async fn artifact_target_with_block_policy_returns_403_before_nexus() {
+		let nexus_records = Arc::new(Mutex::new(Vec::new()));
+		let nexus_url = spawn_server(
+			Router::new()
+				.fallback(any(record_nexus_request))
+				.with_state(Arc::clone(&nexus_records)),
+		)
+		.await;
+		let state = proxy_test_state(
+			nexus_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			PolicySet::default(),
+			UnsupportedTargetPolicy::Block,
+			vec![test_repository("docker-proxy", "docker", None)],
+		);
+		let app = build_app(state.clone());
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri(
+						"/repository/docker-proxy/v2/library/alpine/blobs/sha256:abc123",
+					)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+		assert_eq!(nexus_records.lock().unwrap().len(), 0);
+		assert_eq!(
+			state.decision_log.list(10)[0].repository,
+			"docker-proxy".to_owned()
+		);
 	}
 
 	#[tokio::test]
@@ -2084,6 +2536,72 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn admin_repositories_lists_and_reloads_catalog() {
+		let nexus_app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get(|| async {
+				Json(json!([
+					{
+						"name": "pypi-proxy",
+						"format": "pypi",
+						"type": "proxy"
+					}
+				]))
+			}),
+		);
+		let nexus_url = spawn_server(nexus_app).await;
+		let policy_set = PolicySet::default();
+		let config = test_config(
+			Some("secret"),
+			None,
+			policy_set.clone(),
+			nexus_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		let state = test_state_from_config(
+			config,
+			policy_set,
+			None,
+			vec![test_repository("npm-proxy", "npm", Some("npm"))],
+		);
+		let app = build_app(state.clone());
+
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.uri("/admin/api/repositories")
+					.header(AUTHORIZATION, "Bearer secret")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body = response_json(response).await;
+		assert_eq!(body["repositories"][0]["name"], "npm-proxy");
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.method(Method::POST)
+					.uri("/admin/api/repositories/reload")
+					.header(AUTHORIZATION, "Bearer secret")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(
+			state.repository_catalog().get("pypi-proxy").unwrap().format,
+			"pypi"
+		);
+		assert_eq!(state.repository_catalog().generation, 2);
+	}
+
+	#[tokio::test]
 	async fn policy_reload_swaps_only_on_success_and_requires_policy_file() {
 		let policy_file = tempfile::NamedTempFile::new().unwrap();
 		let policy_path = policy_file.path().to_string_lossy().into_owned();
@@ -2116,7 +2634,10 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(response.status(), StatusCode::OK);
-		assert_eq!(state.active_policy().selected_policy_id, "reloaded");
+		assert_eq!(
+			state.active_policy().policy_set.default_policy.id,
+			"reloaded"
+		);
 		assert_eq!(state.active_policy().generation, 2);
 
 		std::fs::write(
@@ -2136,7 +2657,10 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-		assert_eq!(state.active_policy().selected_policy_id, "reloaded");
+		assert_eq!(
+			state.active_policy().policy_set.default_policy.id,
+			"reloaded"
+		);
 		assert_eq!(state.active_policy().generation, 2);
 
 		let app =
@@ -2179,14 +2703,15 @@ mod tests {
 		let blocked_state =
 			test_state(Some("secret"), None, PolicySet::default());
 		let active_policy = blocked_state.active_policy();
+		let context = active_policy.context_for("default", "npm");
 		let evaluation = active_policy.evaluator.evaluate_with_context(
-			&active_policy.context,
+			&context,
 			&target,
 			vec![vulnerability.clone()],
 		);
 		let response = handle_policy_evaluation(
 			&blocked_state,
-			&active_policy,
+			&context,
 			&target,
 			evaluation,
 		)
@@ -2213,14 +2738,15 @@ mod tests {
 		let report_only_state =
 			test_state(Some("secret"), None, report_only_policy);
 		let active_policy = report_only_state.active_policy();
+		let context = active_policy.context_for("default", "npm");
 		let evaluation = active_policy.evaluator.evaluate_with_context(
-			&active_policy.context,
+			&context,
 			&target,
 			vec![vulnerability],
 		);
 		handle_policy_evaluation(
 			&report_only_state,
-			&active_policy,
+			&context,
 			&target,
 			evaluation,
 		)
@@ -2314,24 +2840,85 @@ mod tests {
 		}
 	}
 
-	fn test_state(
+	fn test_repository_catalog(
+		repositories: Vec<NexusRepository>,
+	) -> RepositoryCatalog {
+		RepositoryCatalog::new(repositories, 1).unwrap()
+	}
+
+	fn test_repository(
+		name: &str,
+		format: &str,
+		osv_ecosystem: Option<&str>,
+	) -> NexusRepository {
+		NexusRepository {
+			name: name.to_owned(),
+			format: format.to_owned(),
+			repository_type: Some("proxy".to_owned()),
+			url: None,
+			online: Some(true),
+			osv_ecosystem: osv_ecosystem.map(str::to_owned),
+		}
+	}
+
+	fn blocking_osv_response() -> Value {
+		json!({
+			"vulns": [
+				{
+					"id": "CVE-2026-0001",
+					"database_specific": {
+						"severity": "HIGH"
+					}
+				}
+			]
+		})
+	}
+
+	fn proxy_test_state(
+		nexus_base_url: &str,
+		osv_api_url: &str,
+		policy_set: PolicySet,
+		unsupported_target_policy: UnsupportedTargetPolicy,
+		repositories: Vec<NexusRepository>,
+	) -> Arc<AppState> {
+		let config = test_config(
+			None,
+			None,
+			policy_set.clone(),
+			nexus_base_url,
+			osv_api_url,
+			unsupported_target_policy,
+		);
+
+		test_state_from_config(config, policy_set, None, repositories)
+	}
+
+	fn test_config(
 		admin_token: Option<&str>,
 		policy_file: Option<String>,
 		policy_set: PolicySet,
-	) -> Arc<AppState> {
+		nexus_base_url: &str,
+		osv_api_url: &str,
+		unsupported_target_policy: UnsupportedTargetPolicy,
+	) -> AppConfig {
 		let security_policy = policy_set.default_policy.policy.clone();
-		let config = AppConfig {
+
+		AppConfig {
 			bind_addr: "127.0.0.1:3000".parse().unwrap(),
-			upstream_base_url: "http://127.0.0.1:9".to_owned(),
+			nexus_base_url: nexus_base_url.to_owned(),
+			upstream_base_url: nexus_base_url.to_owned(),
 			repository_name: "default".to_owned(),
 			repository_format: "npm".to_owned(),
-			osv_ecosystem: Some("npm".to_owned()),
-			osv_api_url: "http://127.0.0.1:9/osv".to_owned(),
-			policy_file: policy_file.clone(),
+			osv_ecosystem: None,
+			osv_ecosystem_overrides: Default::default(),
+			nexus_username: None,
+			nexus_password: None,
+			osv_api_url: osv_api_url.to_owned(),
+			policy_file,
 			admin_token: admin_token.map(str::to_owned),
 			log_json: false,
 			fail_open: true,
-			unsupported_target_policy: UnsupportedTargetPolicy::Allow,
+			unsupported_target_policy,
 			cache_allowed_ttl_secs: 86_400,
 			cache_blocked_ttl_secs: 3_600,
 			cache_max_capacity: 100,
@@ -2345,32 +2932,71 @@ mod tests {
 			artifact_scanner_concurrency: 2,
 			artifact_tmp_dir: None,
 			security_policy,
-			policy_set: policy_set.clone(),
-		};
+			policy_set,
+		}
+	}
+
+	fn test_state(
+		admin_token: Option<&str>,
+		policy_file: Option<String>,
+		policy_set: PolicySet,
+	) -> Arc<AppState> {
+		let config = test_config(
+			admin_token,
+			policy_file.clone(),
+			policy_set.clone(),
+			"http://127.0.0.1:9",
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		test_state_from_config(
+			config,
+			policy_set,
+			policy_file,
+			vec![NexusRepository {
+				name: "default".to_owned(),
+				format: "npm".to_owned(),
+				repository_type: Some("proxy".to_owned()),
+				url: None,
+				online: Some(true),
+				osv_ecosystem: Some("npm".to_owned()),
+			}],
+		)
+	}
+
+	fn test_state_from_config(
+		config: AppConfig,
+		policy_set: PolicySet,
+		policy_file: Option<String>,
+		repositories: Vec<NexusRepository>,
+	) -> Arc<AppState> {
 		let http_client = reqwest::Client::builder()
 			.timeout(Duration::from_secs(1))
 			.build()
 			.unwrap();
+		let nexus_base_url = Url::parse(&config.nexus_base_url).unwrap();
+		let osv_api_url = config.osv_api_url.clone();
 
 		Arc::new(AppState {
 			config: Arc::new(config),
-			upstream_base_url: Url::parse("http://127.0.0.1:9").unwrap(),
+			nexus_base_url,
 			http_client: http_client.clone(),
 			cache: MokaScanCache::new(
 				100,
 				Duration::from_secs(60),
 				Duration::from_secs(60),
 			),
-			osv: OsvClient::new(http_client, "http://127.0.0.1:9/osv"),
+			osv: OsvClient::new(http_client, osv_api_url),
 			artifact_scanner: None,
 			artifact_scanner_semaphore: Arc::new(Semaphore::new(2)),
 			active_policy: Arc::new(RwLock::new(Arc::new(ActivePolicy::new(
 				policy_set,
-				"default",
-				"npm",
 				policy_file,
 				1,
 			)))),
+			repository_catalog: Arc::new(RwLock::new(Arc::new(
+				test_repository_catalog(repositories),
+			))),
 			decision_log: DecisionLog::new(100),
 			started_at: Instant::now(),
 			started_at_rfc3339: now_rfc3339(),

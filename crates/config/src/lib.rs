@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -56,6 +57,8 @@ pub enum ConfigError {
 	InvalidUnsupportedTargetPolicy { name: &'static str, value: String },
 	#[error("invalid artifact scanner in {name}: {value}")]
 	InvalidArtifactScanner { name: &'static str, value: String },
+	#[error("invalid OSV ecosystem override in {name}: {value}")]
+	InvalidOsvEcosystemOverride { name: &'static str, value: String },
 	#[error("missing required environment variable: {name}")]
 	MissingRequired { name: &'static str },
 	#[error("failed to read policy file {path}")]
@@ -123,10 +126,15 @@ impl FromStr for ArtifactScannerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppConfig {
 	pub bind_addr: SocketAddr,
+	pub nexus_base_url: String,
 	pub upstream_base_url: String,
 	pub repository_name: String,
 	pub repository_format: String,
 	pub osv_ecosystem: Option<String>,
+	pub osv_ecosystem_overrides: BTreeMap<String, String>,
+	pub nexus_username: Option<String>,
+	#[serde(skip_serializing)]
+	pub nexus_password: Option<String>,
 	pub osv_api_url: String,
 	pub policy_file: Option<String>,
 	#[serde(skip_serializing)]
@@ -163,11 +171,15 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_BIND_ADDR",
 			DEFAULT_BIND_ADDR,
 		)?;
-		let upstream_base_url = required_string_env_with_fallback(
+		let nexus_base_url = required_string_env_with_fallbacks(
 			&mut lookup,
-			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
-			Some("NEXUS_SEC_PROXY_UPSTREAM_REGISTRY"),
+			"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+			&[
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"NEXUS_SEC_PROXY_UPSTREAM_REGISTRY",
+			],
 		)?;
+		let upstream_base_url = nexus_base_url.clone();
 		let repository_name = string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_REPOSITORY_NAME",
@@ -184,6 +196,14 @@ impl AppConfig {
 					default_osv_ecosystem_for_format(&repository_format)
 						.map(str::to_owned)
 				});
+		let osv_ecosystem_overrides = osv_ecosystem_overrides_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES",
+		)?;
+		let nexus_username =
+			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_USERNAME");
+		let nexus_password =
+			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_PASSWORD");
 		let osv_api_url = string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_OSV_API_URL",
@@ -266,10 +286,14 @@ impl AppConfig {
 
 		Ok(Self {
 			bind_addr,
+			nexus_base_url,
 			upstream_base_url,
 			repository_name,
 			repository_format,
 			osv_ecosystem,
+			osv_ecosystem_overrides,
+			nexus_username,
+			nexus_password,
 			osv_api_url,
 			policy_file,
 			admin_token,
@@ -378,14 +402,16 @@ fn string_env(
 	optional_string_env(lookup, name).unwrap_or_else(|| default.to_owned())
 }
 
-fn required_string_env_with_fallback(
+fn required_string_env_with_fallbacks(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 	name: &'static str,
-	legacy_name: Option<&'static str>,
+	legacy_names: &[&'static str],
 ) -> Result<String, ConfigError> {
 	optional_string_env(lookup, name)
 		.or_else(|| {
-			legacy_name.and_then(|name| optional_string_env(lookup, name))
+			legacy_names.iter().find_map(|legacy_name| {
+				optional_string_env(lookup, legacy_name)
+			})
 		})
 		.ok_or(ConfigError::MissingRequired { name })
 }
@@ -552,6 +578,43 @@ fn list_env(
 		.unwrap_or_default()
 }
 
+fn osv_ecosystem_overrides_env(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+	let Some(value) = optional_string_env(lookup, name) else {
+		return Ok(BTreeMap::new());
+	};
+	let mut overrides = BTreeMap::new();
+
+	for item in value.split(',') {
+		let trimmed = item.trim();
+		if trimmed.is_empty() {
+			continue;
+		}
+
+		let Some((repository, ecosystem)) = trimmed.split_once('=') else {
+			return Err(ConfigError::InvalidOsvEcosystemOverride {
+				name,
+				value: trimmed.to_owned(),
+			});
+		};
+		let repository = repository.trim();
+		let ecosystem = ecosystem.trim();
+
+		if repository.is_empty() || ecosystem.is_empty() {
+			return Err(ConfigError::InvalidOsvEcosystemOverride {
+				name,
+				value: trimmed.to_owned(),
+			});
+		}
+
+		overrides.insert(repository.to_owned(), ecosystem.to_owned());
+	}
+
+	Ok(overrides)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeMap;
@@ -575,6 +638,8 @@ mod tests {
 			config.security_policy.minimum_blocking_severity,
 			Severity::High
 		);
+		assert_eq!(config.nexus_base_url, "https://repo.example.invalid");
+		assert_eq!(config.upstream_base_url, config.nexus_base_url);
 		assert_eq!(config.repository_name, "default");
 		assert_eq!(config.policy_file, None);
 		assert_eq!(config.admin_token, None);
@@ -775,6 +840,93 @@ mod tests {
 		let error = AppConfig::from_env_vars(|_| None).unwrap_err();
 
 		assert!(matches!(error, ConfigError::MissingRequired { .. }));
+	}
+
+	#[test]
+	fn prefers_nexus_base_url_and_accepts_legacy_upstream_fallbacks() {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+				"https://nexus.example.invalid",
+			),
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://legacy.example.invalid",
+			),
+		]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(config.nexus_base_url, "https://nexus.example.invalid");
+		assert_eq!(config.upstream_base_url, config.nexus_base_url);
+
+		let env = BTreeMap::from([(
+			"NEXUS_SEC_PROXY_UPSTREAM_REGISTRY",
+			"https://oldest.example.invalid",
+		)]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(config.nexus_base_url, "https://oldest.example.invalid");
+	}
+
+	#[test]
+	fn parses_repository_osv_ecosystem_overrides_and_nexus_auth() {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+				"https://nexus.example.invalid",
+			),
+			(
+				"NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES",
+				" apt-proxy=Ubuntu OS, yum-proxy=Rocky Linux ,,",
+			),
+			("NEXUS_SEC_PROXY_NEXUS_USERNAME", " admin "),
+			("NEXUS_SEC_PROXY_NEXUS_PASSWORD", " secret "),
+		]);
+
+		let config = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap();
+
+		assert_eq!(
+			config.osv_ecosystem_overrides.get("apt-proxy"),
+			Some(&"Ubuntu OS".to_owned())
+		);
+		assert_eq!(
+			config.osv_ecosystem_overrides.get("yum-proxy"),
+			Some(&"Rocky Linux".to_owned())
+		);
+		assert_eq!(config.nexus_username.as_deref(), Some("admin"));
+		assert_eq!(config.nexus_password.as_deref(), Some("secret"));
+	}
+
+	#[test]
+	fn rejects_malformed_repository_osv_ecosystem_override() {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+				"https://nexus.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES", " apt-proxy "),
+		]);
+
+		let error = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap_err();
+
+		assert!(matches!(
+			error,
+			ConfigError::InvalidOsvEcosystemOverride { .. }
+		));
 	}
 
 	#[test]
