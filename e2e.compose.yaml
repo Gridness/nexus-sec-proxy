@@ -27,6 +27,9 @@ services:
         delay: 10s
     init: true
     restart: unless-stopped
+    depends_on:
+      nexus:
+        condition: service_healthy
     read_only: true
     cap_drop:
       - ALL
@@ -39,10 +42,10 @@ services:
       HOME: /home/nonroot
       RUST_LOG: ${RUST_LOG:-nexus_sec_proxy=info}
       NEXUS_SEC_PROXY_BIND_ADDR: 0.0.0.0:3000
-      NEXUS_SEC_PROXY_UPSTREAM_BASE_URL: ${NEXUS_SEC_PROXY_UPSTREAM_BASE_URL:-https://repo1.maven.org/maven2}
-      NEXUS_SEC_PROXY_REPOSITORY_NAME: ${NEXUS_SEC_PROXY_REPOSITORY_NAME:-e2e-maven-central}
-      NEXUS_SEC_PROXY_REPOSITORY_FORMAT: ${NEXUS_SEC_PROXY_REPOSITORY_FORMAT:-maven2}
-      NEXUS_SEC_PROXY_OSV_ECOSYSTEM: ${NEXUS_SEC_PROXY_OSV_ECOSYSTEM:-}
+      NEXUS_SEC_PROXY_NEXUS_BASE_URL: ${NEXUS_SEC_PROXY_NEXUS_BASE_URL:-http://nexus:8081}
+      NEXUS_SEC_PROXY_NEXUS_USERNAME: ${NEXUS_SEC_PROXY_NEXUS_USERNAME:-}
+      NEXUS_SEC_PROXY_NEXUS_PASSWORD: ${NEXUS_SEC_PROXY_NEXUS_PASSWORD:-}
+      NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES: ${NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES:-}
       NEXUS_SEC_PROXY_OSV_API_URL: ${NEXUS_SEC_PROXY_OSV_API_URL:-https://api.osv.dev/v1/query}
       NEXUS_SEC_PROXY_POLICY_FILE: ${NEXUS_SEC_PROXY_POLICY_FILE:-}
       NEXUS_SEC_PROXY_ADMIN_TOKEN: ${NEXUS_SEC_PROXY_ADMIN_TOKEN:-}
@@ -136,9 +139,6 @@ services:
     image: sonatype/nexus3:${NEXUS_OSS_IMAGE_TAG:-latest}
     init: true
     restart: unless-stopped
-    depends_on:
-      nexus-sec-proxy:
-        condition: service_healthy
     ports:
       - "${NEXUS_OSS_PORT:-8081}:8081"
     volumes:
@@ -149,7 +149,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -fsS http://127.0.0.1:8081/service/rest/v1/status | grep -q STARTED",
+          "wget -q -O /dev/null http://127.0.0.1:8081/",
         ]
       interval: 30s
       timeout: 10s

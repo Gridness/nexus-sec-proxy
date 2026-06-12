@@ -1,4 +1,7 @@
-use axum::http::{Method, Uri};
+use axum::http::Method;
+#[cfg(test)]
+use axum::http::Uri;
+#[cfg(test)]
 use nexus_sec_proxy_config::AppConfig;
 use nexus_sec_proxy_security::{
 	ArtifactTarget, PackageCoordinate, ScanTarget,
@@ -12,82 +15,119 @@ pub enum RequestClassification {
 	Scan(ScanTarget),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationContext {
+	pub repository_format: String,
+	pub osv_ecosystem: Option<String>,
+}
+
+impl ClassificationContext {
+	pub fn new(
+		repository_format: impl Into<String>,
+		osv_ecosystem: Option<String>,
+	) -> Self {
+		Self {
+			repository_format: repository_format.into(),
+			osv_ecosystem,
+		}
+	}
+
+	#[cfg(test)]
+	pub fn from_config(config: &AppConfig) -> Self {
+		Self::new(
+			config.repository_format.clone(),
+			config.osv_ecosystem.clone(),
+		)
+	}
+}
+
+#[cfg(test)]
 pub fn classify_request(
 	config: &AppConfig,
 	method: &Method,
 	uri: &Uri,
 ) -> RequestClassification {
+	classify_path(
+		&ClassificationContext::from_config(config),
+		method,
+		uri.path(),
+	)
+}
+
+pub fn classify_path(
+	context: &ClassificationContext,
+	method: &Method,
+	path: &str,
+) -> RequestClassification {
 	if method != Method::GET && method != Method::HEAD {
 		return RequestClassification::ProxyOnly;
 	}
 
-	let segments = decoded_segments(uri.path());
-	let format = normalize_format(&config.repository_format);
+	let segments = decoded_segments(path);
+	let format = normalize_format(&context.repository_format);
 
 	let target = match format.as_str() {
-		"alpine" => classify_alpine(config, uri.path(), &segments),
+		"alpine" => classify_alpine(context, path, &segments),
 		"ansible" => classify_dash_archive_optional_package(
-			config,
-			uri.path(),
+			context,
+			path,
 			&segments,
 			&[".tar.gz", ".tgz"],
 			None,
 		),
-		"apt" | "debian" | "ubuntu" => {
-			classify_apt(config, uri.path(), &segments)
-		}
+		"apt" | "debian" | "ubuntu" => classify_apt(context, path, &segments),
 		"bower" => classify_dash_archive_optional_package(
-			config,
-			uri.path(),
+			context,
+			path,
 			&segments,
 			&[".zip", ".tar.gz", ".tgz"],
 			None,
 		),
 		"cocoapods" | "pod" | "pods" => classify_dash_archive_optional_package(
-			config,
-			uri.path(),
+			context,
+			path,
 			&segments,
 			&[".zip", ".tar.gz", ".tgz"],
 			None,
 		),
 		"composer" | "phpcomposer" => {
-			classify_composer(config, uri.path(), &segments)
+			classify_composer(context, path, &segments)
 		}
 		"conan" => classify_dash_archive_optional_package(
-			config,
-			uri.path(),
+			context,
+			path,
 			&segments,
 			&[".tgz", ".tar.gz", ".zip"],
 			None,
 		),
-		"conda" => classify_conda(config, uri.path(), &segments),
-		"maven" | "maven2" => classify_maven(config, &segments),
-		"npm" => classify_npm(config, &segments),
-		"pypi" | "python" => classify_pypi(config, &segments),
-		"nuget" => classify_nuget(config, &segments),
-		"cargo" | "rust" | "rustcargo" => classify_cargo(config, &segments),
-		"rubygems" | "gem" | "ruby" => classify_rubygems(config, &segments),
-		"go" | "golang" => classify_go(config, &segments),
-		"docker" => classify_docker(config, uri.path(), &segments),
-		"gitlfs" => classify_git_lfs(config, uri.path(), &segments),
+		"conda" => classify_conda(context, path, &segments),
+		"maven" | "maven2" => classify_maven(context, &segments),
+		"npm" => classify_npm(context, &segments),
+		"pypi" | "python" => classify_pypi(context, &segments),
+		"nuget" => classify_nuget(context, &segments),
+		"cargo" | "rust" | "rustcargo" => classify_cargo(context, &segments),
+		"rubygems" | "gem" | "ruby" => classify_rubygems(context, &segments),
+		"go" | "golang" => classify_go(context, &segments),
+		"docker" => classify_docker(context, path, &segments),
+		"gitlfs" => classify_git_lfs(context, path, &segments),
 		"helm" => classify_dash_archive_optional_package(
-			config,
-			uri.path(),
+			context,
+			path,
 			&segments,
 			&[".tgz", ".tar.gz"],
 			None,
 		),
 		"huggingface" | "huggingfacehub" | "hf" => {
-			classify_generic_artifact(config, uri.path(), &segments)
+			classify_generic_artifact(context, path, &segments)
 		}
-		"p2" | "eclipsep2" => classify_p2(config, uri.path(), &segments),
-		"pub" | "flutter" | "dart" => classify_pub(config, &segments),
-		"r" | "cran" => classify_r(config, &segments),
-		"raw" => classify_generic_artifact(config, uri.path(), &segments),
-		"swift" => classify_swift(config, uri.path(), &segments),
-		"terraform" => classify_terraform(config, uri.path(), &segments),
-		"yum" | "rpm" => classify_yum(config, uri.path(), &segments),
-		_ => classify_generic_artifact(config, uri.path(), &segments),
+		"p2" | "eclipsep2" => classify_p2(context, path, &segments),
+		"pub" | "flutter" | "dart" => classify_pub(context, &segments),
+		"r" | "cran" => classify_r(context, &segments),
+		"raw" => classify_generic_artifact(context, path, &segments),
+		"swift" => classify_swift(context, path, &segments),
+		"terraform" => classify_terraform(context, path, &segments),
+		"yum" | "rpm" => classify_yum(context, path, &segments),
+		_ => classify_generic_artifact(context, path, &segments),
 	};
 
 	target
@@ -96,7 +136,7 @@ pub fn classify_request(
 }
 
 fn classify_alpine(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -110,7 +150,7 @@ fn classify_alpine(
 	let (name, version) = name_and_version.rsplit_once('-')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
 		Some("Alpine"),
 		name.to_owned(),
@@ -119,7 +159,7 @@ fn classify_alpine(
 }
 
 fn classify_apt(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -133,16 +173,16 @@ fn classify_apt(
 	let (name, version) = name_and_version.rsplit_once('_')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
-		default_linux_ecosystem(config),
+		default_linux_ecosystem(context),
 		name.to_owned(),
 		version.to_owned(),
 	))
 }
 
 fn classify_composer(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -154,7 +194,7 @@ fn classify_composer(
 
 	if let Some((name, version)) = package_version_from_path(segments) {
 		return Some(package_or_artifact_target(
-			config,
+			context,
 			path,
 			Some("Packagist"),
 			name,
@@ -163,7 +203,7 @@ fn classify_composer(
 	}
 
 	classify_dash_archive_optional_package(
-		config,
+		context,
 		path,
 		segments,
 		&[".zip", ".tar.gz", ".tgz"],
@@ -172,7 +212,7 @@ fn classify_composer(
 }
 
 fn classify_conda(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -184,7 +224,7 @@ fn classify_conda(
 	let (name, version) = name_and_version.rsplit_once('-')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
 		None,
 		name.to_owned(),
@@ -193,7 +233,7 @@ fn classify_conda(
 }
 
 fn classify_maven(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	if segments.len() < 4 {
@@ -214,14 +254,17 @@ fn classify_maven(
 	}
 
 	Some(package_target(
-		config,
+		context,
 		"Maven",
 		format!("{group}:{artifact_id}"),
 		version.clone(),
 	))
 }
 
-fn classify_npm(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
+fn classify_npm(
+	context: &ClassificationContext,
+	segments: &[String],
+) -> Option<ScanTarget> {
 	let file = segments.last()?;
 
 	if !file.ends_with(".tgz") {
@@ -255,7 +298,7 @@ fn classify_npm(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
 		})?;
 
 	Some(package_target(
-		config,
+		context,
 		"npm",
 		package_name,
 		version.to_owned(),
@@ -263,7 +306,7 @@ fn classify_npm(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
 }
 
 fn classify_pypi(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	let file = segments.last()?;
@@ -273,14 +316,14 @@ fn classify_pypi(
 		let name = normalize_pypi_name(parts.next()?);
 		let version = parts.next()?.to_owned();
 
-		return Some(package_target(config, "PyPI", name, version));
+		return Some(package_target(context, "PyPI", name, version));
 	}
 
 	let stem = strip_archive_suffix(file, &[".tar.gz", ".zip", ".tgz"])?;
 	let (name, version) = stem.rsplit_once('-')?;
 
 	Some(package_target(
-		config,
+		context,
 		"PyPI",
 		normalize_pypi_name(name),
 		version.to_owned(),
@@ -288,7 +331,7 @@ fn classify_pypi(
 }
 
 fn classify_nuget(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	let container_index = segments
@@ -303,7 +346,7 @@ fn classify_nuget(
 	}
 
 	Some(package_target(
-		config,
+		context,
 		"NuGet",
 		name.clone(),
 		version.clone(),
@@ -311,7 +354,7 @@ fn classify_nuget(
 }
 
 fn classify_cargo(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	let crates_index = segments
@@ -328,7 +371,7 @@ fn classify_cargo(
 	}
 
 	Some(package_target(
-		config,
+		context,
 		"crates.io",
 		name.clone(),
 		version.clone(),
@@ -336,7 +379,7 @@ fn classify_cargo(
 }
 
 fn classify_rubygems(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	if segments.first().is_none_or(|segment| segment != "gems") {
@@ -347,14 +390,17 @@ fn classify_rubygems(
 	let (name, version) = stem.rsplit_once('-')?;
 
 	Some(package_target(
-		config,
+		context,
 		"RubyGems",
 		name.to_owned(),
 		version.to_owned(),
 	))
 }
 
-fn classify_go(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
+fn classify_go(
+	context: &ClassificationContext,
+	segments: &[String],
+) -> Option<ScanTarget> {
 	let version_marker = segments.iter().position(|segment| segment == "@v")?;
 	let module = segments[..version_marker].join("/");
 	let version = segments
@@ -367,11 +413,11 @@ fn classify_go(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
 		return None;
 	}
 
-	Some(package_target(config, "Go", module, version.to_owned()))
+	Some(package_target(context, "Go", module, version.to_owned()))
 }
 
 fn classify_git_lfs(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -380,17 +426,17 @@ fn classify_git_lfs(
 		&& let Some(digest) = segments.get(index + 1)
 	{
 		return Some(ScanTarget::Artifact(ArtifactTarget::with_digest(
-			&config.repository_format,
+			&context.repository_format,
 			path,
 			digest.clone(),
 		)));
 	}
 
-	classify_generic_artifact(config, path, segments)
+	classify_generic_artifact(context, path, segments)
 }
 
 fn classify_docker(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -403,7 +449,7 @@ fn classify_docker(
 		let digest = segments.get(index + 1)?;
 
 		return Some(ScanTarget::Artifact(ArtifactTarget::with_digest(
-			&config.repository_format,
+			&context.repository_format,
 			path,
 			digest.clone(),
 		)));
@@ -411,7 +457,7 @@ fn classify_docker(
 
 	if segments.iter().any(|segment| segment == "manifests") {
 		return Some(ScanTarget::Artifact(ArtifactTarget::new(
-			&config.repository_format,
+			&context.repository_format,
 			path,
 		)));
 	}
@@ -420,7 +466,7 @@ fn classify_docker(
 }
 
 fn classify_p2(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -438,7 +484,7 @@ fn classify_p2(
 	let (name, version) = stem.rsplit_once('_')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
 		None,
 		name.to_owned(),
@@ -446,7 +492,10 @@ fn classify_p2(
 	))
 }
 
-fn classify_pub(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
+fn classify_pub(
+	context: &ClassificationContext,
+	segments: &[String],
+) -> Option<ScanTarget> {
 	let packages_index =
 		segments.iter().position(|segment| segment == "packages")?;
 	let name = segments.get(packages_index + 1)?;
@@ -461,20 +510,23 @@ fn classify_pub(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
 	)?;
 
 	Some(package_target(
-		config,
+		context,
 		"Pub",
 		name.clone(),
 		version.to_owned(),
 	))
 }
 
-fn classify_r(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
+fn classify_r(
+	context: &ClassificationContext,
+	segments: &[String],
+) -> Option<ScanTarget> {
 	let file = segments.last()?;
 	let stem = strip_archive_suffix(file, &[".tar.gz", ".tgz", ".zip"])?;
 	let (name, version) = stem.rsplit_once('_')?;
 
 	Some(package_target(
-		config,
+		context,
 		"R",
 		name.to_owned(),
 		version.to_owned(),
@@ -482,7 +534,7 @@ fn classify_r(config: &AppConfig, segments: &[String]) -> Option<ScanTarget> {
 }
 
 fn classify_swift(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -503,7 +555,7 @@ fn classify_swift(
 	};
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
 		Some("SwiftURL"),
 		name,
@@ -512,7 +564,7 @@ fn classify_swift(
 }
 
 fn classify_terraform(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -525,7 +577,7 @@ fn classify_terraform(
 		let version = segments.get(index + 3)?;
 
 		return Some(package_or_artifact_target(
-			config,
+			context,
 			path,
 			None,
 			format!("{namespace}/{provider_type}"),
@@ -543,7 +595,7 @@ fn classify_terraform(
 		let version = segments.get(index + 4)?;
 
 		return Some(package_or_artifact_target(
-			config,
+			context,
 			path,
 			None,
 			format!("{namespace}/{name}/{provider}"),
@@ -551,11 +603,11 @@ fn classify_terraform(
 		));
 	}
 
-	classify_generic_artifact(config, path, segments)
+	classify_generic_artifact(context, path, segments)
 }
 
 fn classify_yum(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -570,16 +622,16 @@ fn classify_yum(
 	let (name, version) = name_and_version.rsplit_once('-')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
-		default_linux_ecosystem(config),
+		default_linux_ecosystem(context),
 		name.to_owned(),
 		format!("{version}-{release}"),
 	))
 }
 
 fn classify_generic_artifact(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
@@ -587,7 +639,7 @@ fn classify_generic_artifact(
 
 	if is_probable_artifact(file) {
 		Some(ScanTarget::Artifact(ArtifactTarget::new(
-			&config.repository_format,
+			&context.repository_format,
 			path,
 		)))
 	} else {
@@ -596,7 +648,7 @@ fn classify_generic_artifact(
 }
 
 fn classify_dash_archive_optional_package(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 	suffixes: &[&str],
@@ -607,7 +659,7 @@ fn classify_dash_archive_optional_package(
 	let (name, version) = stem.rsplit_once('-')?;
 
 	Some(package_or_artifact_target(
-		config,
+		context,
 		path,
 		default_ecosystem,
 		name.to_owned(),
@@ -616,16 +668,16 @@ fn classify_dash_archive_optional_package(
 }
 
 fn package_target(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	default_ecosystem: &str,
 	name: String,
 	version: String,
 ) -> ScanTarget {
-	let ecosystem = config
+	let ecosystem = context
 		.osv_ecosystem
 		.clone()
 		.or_else(|| {
-			default_osv_ecosystem_for_format(&config.repository_format)
+			default_osv_ecosystem_for_format(&context.repository_format)
 				.map(str::to_owned)
 		})
 		.unwrap_or_else(|| default_ecosystem.to_owned());
@@ -634,17 +686,17 @@ fn package_target(
 }
 
 fn package_or_artifact_target(
-	config: &AppConfig,
+	context: &ClassificationContext,
 	path: &str,
 	default_ecosystem: Option<&str>,
 	name: String,
 	version: String,
 ) -> ScanTarget {
-	let ecosystem = config
+	let ecosystem = context
 		.osv_ecosystem
 		.clone()
 		.or_else(|| {
-			default_osv_ecosystem_for_format(&config.repository_format)
+			default_osv_ecosystem_for_format(&context.repository_format)
 				.map(str::to_owned)
 		})
 		.or_else(|| default_ecosystem.map(str::to_owned));
@@ -655,14 +707,16 @@ fn package_or_artifact_target(
 		))
 	} else {
 		ScanTarget::Artifact(ArtifactTarget::new(
-			&config.repository_format,
+			&context.repository_format,
 			path,
 		))
 	}
 }
 
-fn default_linux_ecosystem(config: &AppConfig) -> Option<&'static str> {
-	match normalize_format(&config.repository_format).as_str() {
+fn default_linux_ecosystem(
+	context: &ClassificationContext,
+) -> Option<&'static str> {
+	match normalize_format(&context.repository_format).as_str() {
 		"debian" => Some("Debian GNU/Linux"),
 		"ubuntu" => Some("Ubuntu OS"),
 		"almalinux" => Some("AlmaLinux"),
@@ -755,6 +809,19 @@ mod tests {
 		let uri = uri("/com/example/demo/1.2.3/demo-1.2.3.jar");
 
 		let classification = classify_request(&config, &Method::GET, &uri);
+
+		assert_package(classification, "Maven", "com.example:demo", "1.2.3");
+	}
+
+	#[test]
+	fn classifies_stripped_nexus_repository_path() {
+		let context = ClassificationContext::new("maven2", None);
+
+		let classification = classify_path(
+			&context,
+			&Method::GET,
+			"/com/example/demo/1.2.3/demo-1.2.3.jar",
+		);
 
 		assert_package(classification, "Maven", "com.example:demo", "1.2.3");
 	}
@@ -973,10 +1040,14 @@ mod tests {
 	fn config(format: &str, ecosystem: Option<&str>) -> AppConfig {
 		AppConfig {
 			bind_addr: "127.0.0.1:3000".parse().unwrap(),
+			nexus_base_url: "https://repo.example.invalid".to_owned(),
 			upstream_base_url: "https://repo.example.invalid".to_owned(),
 			repository_name: "default".to_owned(),
 			repository_format: format.to_owned(),
 			osv_ecosystem: ecosystem.map(str::to_owned),
+			osv_ecosystem_overrides: Default::default(),
+			nexus_username: None,
+			nexus_password: None,
 			osv_api_url: "https://api.osv.dev/v1/query".to_owned(),
 			policy_file: None,
 			admin_token: None,

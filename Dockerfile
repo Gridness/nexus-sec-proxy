@@ -89,7 +89,7 @@ ARG VCS_REF=unknown
 ARG VERSION=0.1.0
 
 LABEL org.opencontainers.image.title="nexus-sec-proxy" \
-	org.opencontainers.image.description="Nexus OSS upstream security proxy for package and artifact vulnerability policy enforcement" \
+	org.opencontainers.image.description="Front-of-Nexus security proxy for package vulnerability policy enforcement" \
 	org.opencontainers.image.version="${VERSION}" \
 	org.opencontainers.image.revision="${VCS_REF}" \
 	org.opencontainers.image.created="${BUILD_DATE}" \
@@ -98,7 +98,6 @@ LABEL org.opencontainers.image.title="nexus-sec-proxy" \
 ENV HOME=/home/nonroot \
 	RUST_LOG=nexus_sec_proxy=info \
 	NEXUS_SEC_PROXY_BIND_ADDR=0.0.0.0:3000 \
-	NEXUS_SEC_PROXY_REPOSITORY_NAME=default \
 	NEXUS_SEC_PROXY_LOG_JSON=false \
 	NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy \
 	TRIVY_CACHE_DIR=/var/cache/trivy \
