@@ -48,4 +48,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh -n scripts/scanner-db-updater.sh
+      - run: sh -n scripts/bootstrap-e2e.sh
       - run: docker compose config
+      - run: docker compose -f e2e.compose.yaml config
