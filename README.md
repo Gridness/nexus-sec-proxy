@@ -35,6 +35,23 @@ Health check:
 curl http://127.0.0.1:3000/healthz
 ```
 
+## E2E Environment
+
+Bootstrap the local Docker-based e2e environment:
+
+```bash
+scripts/bootstrap-e2e.sh
+```
+
+The script uses `e2e.compose.yaml`, starts Nexus first, waits for a non-empty
+Nexus repository catalog, primes scanner database volumes, starts the scanner
+DB updater and proxy, then verifies `http://127.0.0.1:3000/healthz`.
+It enables the proxy admin UI with the default bearer token
+`e2e-admin-token` unless `NEXUS_SEC_PROXY_E2E_ADMIN_TOKEN` or
+`NEXUS_SEC_PROXY_ADMIN_TOKEN` is set. When the environment is ready, the script
+prints the proxy admin URL, bearer token, and any Nexus test credentials it had
+to use or could discover.
+
 ## Core Configuration
 
 Required:
