@@ -29,6 +29,11 @@ pub(crate) struct ImmutableConfigSummary {
 	bind_addr: String,
 	nexus_base_url: String,
 	nexus_username_configured: bool,
+	yandex_messenger_available: bool,
+	yandex_messenger_enabled: bool,
+	yandex_messenger_token_configured: bool,
+	yandex_messenger_template_file: Option<String>,
+	yandex_messenger_api_url: String,
 	legacy_repository_name: String,
 	legacy_repository_format: String,
 	legacy_osv_ecosystem: Option<String>,
@@ -579,6 +584,16 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 		bind_addr: config.bind_addr.to_string(),
 		nexus_base_url: config.nexus_base_url.clone(),
 		nexus_username_configured: config.nexus_username.is_some(),
+		yandex_messenger_available: cfg!(feature = "yandex-messenger"),
+		yandex_messenger_enabled: cfg!(feature = "yandex-messenger")
+			&& config.yandex_messenger_enabled,
+		yandex_messenger_token_configured: config
+			.yandex_messenger_token
+			.is_some(),
+		yandex_messenger_template_file: config
+			.yandex_messenger_template_file
+			.clone(),
+		yandex_messenger_api_url: config.yandex_messenger_api_url.clone(),
 		legacy_repository_name: config.repository_name.clone(),
 		legacy_repository_format: config.repository_format.clone(),
 		legacy_osv_ecosystem: config.osv_ecosystem.clone(),

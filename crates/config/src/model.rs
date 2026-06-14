@@ -13,10 +13,10 @@ use crate::env::{
 	DEFAULT_CACHE_ALLOWED_TTL_SECS, DEFAULT_CACHE_BLOCKED_TTL_SECS,
 	DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_OSV_API_URL, DEFAULT_REPOSITORY_FORMAT,
 	DEFAULT_REPOSITORY_NAME, DEFAULT_REQUEST_TIMEOUT_SECS,
-	artifact_scanner_env, bool_env, default_artifact_scanner_command,
-	optional_string_env, osv_ecosystem_overrides_env,
-	required_string_env_with_fallbacks, socket_addr_env, string_env, u64_env,
-	unsupported_target_policy_env,
+	DEFAULT_YANDEX_MESSENGER_API_URL, artifact_scanner_env, bool_env,
+	default_artifact_scanner_command, optional_bool_env, optional_string_env,
+	osv_ecosystem_overrides_env, required_string_env_with_fallbacks,
+	socket_addr_env, string_env, u64_env, unsupported_target_policy_env,
 };
 use crate::policy_file::load_policy;
 use crate::{ArtifactScannerKind, ConfigError, UnsupportedTargetPolicy};
@@ -37,6 +37,11 @@ pub struct AppConfig {
 	pub policy_file: Option<String>,
 	#[serde(skip_serializing)]
 	pub admin_token: Option<String>,
+	#[serde(skip_serializing)]
+	pub yandex_messenger_token: Option<String>,
+	pub yandex_messenger_template_file: Option<String>,
+	pub yandex_messenger_api_url: String,
+	pub yandex_messenger_enabled: bool,
 	pub log_json: bool,
 	pub fail_open: bool,
 	pub unsupported_target_policy: UnsupportedTargetPolicy,
@@ -111,6 +116,27 @@ impl AppConfig {
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_POLICY_FILE");
 		let admin_token =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_ADMIN_TOKEN");
+		let yandex_messenger_token = optional_string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN",
+		);
+		let yandex_messenger_template_file = optional_string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+		);
+		let yandex_messenger_api_url = string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL",
+			DEFAULT_YANDEX_MESSENGER_API_URL,
+		);
+		let yandex_messenger_configured = yandex_messenger_token.is_some()
+			&& yandex_messenger_template_file.is_some();
+		let yandex_messenger_enabled = optional_bool_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED",
+		)?
+		.unwrap_or(yandex_messenger_configured)
+			&& yandex_messenger_configured;
 		let log_json =
 			bool_env(&mut lookup, "NEXUS_SEC_PROXY_LOG_JSON", false)?;
 		let fail_open =
@@ -195,6 +221,10 @@ impl AppConfig {
 			osv_api_url,
 			policy_file,
 			admin_token,
+			yandex_messenger_token,
+			yandex_messenger_template_file,
+			yandex_messenger_api_url,
+			yandex_messenger_enabled,
 			log_json,
 			fail_open,
 			unsupported_target_policy,
