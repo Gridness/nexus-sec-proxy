@@ -99,7 +99,9 @@ Configuration notes:
 - Yandex Messenger notifications are enabled by default only when both
   `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN` and
   `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE` are set. Set
-  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false` to force them off.
+  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false` to force them off. Binaries
+  built with `--no-default-features` accept these variables but never send
+  Messenger notifications.
 - `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV fails. Set it to
   `false` to return `503 Service Unavailable` on scanner failures.
 - `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
@@ -230,6 +232,16 @@ Each event includes repository, format, team, policy ID, mode, target display
 name, vulnerability IDs, and exception metadata when present.
 
 ## Yandex Messenger Notifications
+
+Default builds include Yandex Messenger support through the
+`yandex-messenger` Cargo feature. To compile the proxy without this integration:
+
+```bash
+cargo build -p nexus-sec-proxy --no-default-features
+```
+
+When the feature is not compiled in, Yandex Messenger environment variables are
+still accepted for configuration compatibility but notifications are ignored.
 
 When configured, enforced `403 Forbidden` block decisions trigger a best-effort
 Yandex Messenger private message. The proxy uses the incoming Basic Auth

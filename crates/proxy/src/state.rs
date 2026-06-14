@@ -6,6 +6,7 @@ use nexus_sec_proxy_config::AppConfig;
 use nexus_sec_proxy_security::{
 	ExternalScanner, OsvClient, PolicyContext, PolicyEvaluator, PolicySet,
 };
+#[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::YandexMessengerNotifier;
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -24,6 +25,7 @@ pub(crate) struct AppState {
 	pub(crate) cache: MokaScanCache,
 	pub(crate) osv: OsvClient,
 	pub(crate) artifact_scanner: Option<ExternalScanner>,
+	#[cfg(feature = "yandex-messenger")]
 	pub(crate) yandex_messenger: Option<YandexMessengerNotifier>,
 	pub(crate) artifact_scanner_semaphore: Arc<Semaphore>,
 	pub(crate) active_policy: Arc<RwLock<Arc<ActivePolicy>>>,

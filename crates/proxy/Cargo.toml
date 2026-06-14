@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["yandex-messenger"]
+yandex-messenger = ["dep:nexus-sec-proxy-yandex-messenger"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -12,7 +16,7 @@ futures-util.workspace = true
 nexus-sec-proxy-cache = { path = "../cache" }
 nexus-sec-proxy-config = { path = "../config" }
 nexus-sec-proxy-security = { path = "../security" }
-nexus-sec-proxy-yandex-messenger = { path = "../yandex-messenger" }
+nexus-sec-proxy-yandex-messenger = { path = "../yandex-messenger", optional = true }
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true

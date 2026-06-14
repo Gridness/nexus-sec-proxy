@@ -11,10 +11,13 @@ use nexus_sec_proxy_security::{
 	PolicyEvaluation, PolicyOutcome, ScanTarget, SecurityError,
 	VulnerabilitySource,
 };
+#[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::BlockNotification;
 use tracing::{error, warn};
 
-use crate::audit::{audit_policy_evaluation, vulnerability_ids};
+use crate::audit::audit_policy_evaluation;
+#[cfg(feature = "yandex-messenger")]
+use crate::audit::vulnerability_ids;
 use crate::catalog::NexusRepository;
 use crate::decisions::{DecisionOutcome, record_decision};
 use crate::responses::response_with_text;
@@ -175,6 +178,7 @@ pub(crate) fn handle_policy_evaluation(
 	}
 }
 
+#[cfg(feature = "yandex-messenger")]
 fn notify_blocked(
 	state: &AppState,
 	requester_login: Option<&str>,
@@ -196,6 +200,15 @@ fn notify_blocked(
 		policy_id: report.policy_id.clone(),
 		vulnerability_ids: vulnerability_ids(report),
 	});
+}
+
+#[cfg(not(feature = "yandex-messenger"))]
+fn notify_blocked(
+	_state: &AppState,
+	_requester_login: Option<&str>,
+	_context: &PolicyContext,
+	_report: &BlockReport,
+) {
 }
 
 async fn put_cache(

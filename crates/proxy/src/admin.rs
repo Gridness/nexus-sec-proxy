@@ -29,6 +29,7 @@ pub(crate) struct ImmutableConfigSummary {
 	bind_addr: String,
 	nexus_base_url: String,
 	nexus_username_configured: bool,
+	yandex_messenger_available: bool,
 	yandex_messenger_enabled: bool,
 	yandex_messenger_token_configured: bool,
 	yandex_messenger_template_file: Option<String>,
@@ -583,7 +584,9 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 		bind_addr: config.bind_addr.to_string(),
 		nexus_base_url: config.nexus_base_url.clone(),
 		nexus_username_configured: config.nexus_username.is_some(),
-		yandex_messenger_enabled: config.yandex_messenger_enabled,
+		yandex_messenger_available: cfg!(feature = "yandex-messenger"),
+		yandex_messenger_enabled: cfg!(feature = "yandex-messenger")
+			&& config.yandex_messenger_enabled,
 		yandex_messenger_token_configured: config
 			.yandex_messenger_token
 			.is_some(),

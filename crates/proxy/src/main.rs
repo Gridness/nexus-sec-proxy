@@ -20,6 +20,7 @@ use axum::routing::{any, get, post};
 use nexus_sec_proxy_cache::MokaScanCache;
 use nexus_sec_proxy_config::AppConfig;
 use nexus_sec_proxy_security::OsvClient;
+#[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::{
 	YandexMessengerConfig, YandexMessengerNotifier,
 };
@@ -86,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
 	);
 	let osv = OsvClient::new(http_client.clone(), config.osv_api_url.clone());
 	let artifact_scanner = external_scanner_from_config(&config);
+	#[cfg(feature = "yandex-messenger")]
 	let yandex_messenger =
 		yandex_messenger_from_config(&config, http_client.clone());
 	let artifact_scanner_semaphore = Arc::new(Semaphore::new(
@@ -105,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
 		cache,
 		osv,
 		artifact_scanner,
+		#[cfg(feature = "yandex-messenger")]
 		yandex_messenger,
 		artifact_scanner_semaphore,
 		active_policy,
@@ -146,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "yandex-messenger")]
 fn yandex_messenger_from_config(
 	config: &AppConfig,
 	http_client: reqwest::Client,
