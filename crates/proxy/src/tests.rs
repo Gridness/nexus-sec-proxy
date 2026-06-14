@@ -39,6 +39,13 @@ struct OsvMockState {
 	status: StatusCode,
 }
 
+#[derive(Clone)]
+struct YandexMockState {
+	records: Arc<Mutex<Vec<RecordedRequest>>>,
+	response: Value,
+	status: StatusCode,
+}
+
 async fn spawn_server(app: Router) -> Url {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
@@ -80,6 +87,27 @@ async fn mock_osv(
 	(state.status, Json(state.response)).into_response()
 }
 
+async fn mock_yandex_messenger(
+	State(state): State<YandexMockState>,
+	method: Method,
+	uri: Uri,
+	headers: HeaderMap,
+	body: Body,
+) -> Response<Body> {
+	let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+	state.records.lock().unwrap().push(RecordedRequest {
+		method,
+		path_and_query: uri
+			.path_and_query()
+			.map(|value| value.as_str().to_owned())
+			.unwrap_or_else(|| uri.path().to_owned()),
+		headers,
+		body,
+	});
+
+	(state.status, Json(state.response)).into_response()
+}
+
 #[test]
 fn joins_nexus_base_path_and_request_path() {
 	let base = Url::parse("https://repo.example.invalid/root").unwrap();
@@ -101,6 +129,33 @@ fn root_base_preserves_request_path() {
 	let joined = build_nexus_url(&base, &uri);
 
 	assert_eq!(joined.as_str(), "https://repo.example.invalid/pkg.tgz");
+}
+
+#[test]
+fn extracts_basic_auth_username_only_from_valid_basic_headers() {
+	let mut headers = HeaderMap::new();
+	assert_eq!(basic_auth_username(&headers), None);
+
+	headers.insert(AUTHORIZATION, "Bearer token".parse().unwrap());
+	assert_eq!(basic_auth_username(&headers), None);
+
+	headers.insert(AUTHORIZATION, "Basic !!!".parse().unwrap());
+	assert_eq!(basic_auth_username(&headers), None);
+
+	headers.insert(AUTHORIZATION, "Basic bm9jb2xvbg==".parse().unwrap());
+	assert_eq!(basic_auth_username(&headers), None);
+
+	headers.insert(AUTHORIZATION, "Basic OnNlY3JldA==".parse().unwrap());
+	assert_eq!(basic_auth_username(&headers), None);
+
+	headers.insert(
+		AUTHORIZATION,
+		"Basic YWxpY2U6c2VjcmV0OnRhaWw=".parse().unwrap(),
+	);
+	assert_eq!(basic_auth_username(&headers).as_deref(), Some("alice"));
+
+	headers.insert(AUTHORIZATION, "basic Ym9iOnNlY3JldA==".parse().unwrap());
+	assert_eq!(basic_auth_username(&headers).as_deref(), Some("bob"));
 }
 
 #[tokio::test]
@@ -308,9 +363,278 @@ async fn blocked_package_returns_403_before_nexus() {
 		.await
 		.unwrap();
 
-	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	let status = response.status();
+	let body = response_text(response).await;
+
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body, expected_maven_block_body());
 	assert_eq!(nexus_records.lock().unwrap().len(), 0);
 	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let osv_count = Arc::new(AtomicUsize::new(0));
+	let osv_url =
+		spawn_server(Router::new().route("/osv", post(mock_osv)).with_state(
+			OsvMockState {
+				request_count: Arc::clone(&osv_count),
+				response: blocking_osv_response(),
+				status: StatusCode::OK,
+			},
+		))
+		.await;
+	let yandex_records = Arc::new(Mutex::new(Vec::new()));
+	let yandex_url = spawn_server(
+		Router::new()
+			.route("/bot/v1/messages/sendText/", post(mock_yandex_messenger))
+			.with_state(YandexMockState {
+				records: Arc::clone(&yandex_records),
+				response: json!({ "ok": true }),
+				status: StatusCode::OK,
+			}),
+	)
+	.await;
+	let template_file = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(
+		template_file.path(),
+		"User={user}; repo={repository}; format={format}; target={target}; reason={reason}; policy={policy_id}; vulns={vulnerability_ids}; at={timestamp}; {kept}",
+	)
+	.unwrap();
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		&format!("{osv_url}osv"),
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.yandex_messenger_token = Some("bot-token".to_owned());
+	config.yandex_messenger_template_file =
+		Some(template_file.path().to_string_lossy().into_owned());
+	config.yandex_messenger_api_url = yandex_url.to_string();
+	config.yandex_messenger_enabled = true;
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("maven-central", "maven2", None)],
+	);
+	let app = build_app(state);
+
+	let response = app
+		.clone()
+		.oneshot(
+			Request::builder()
+				.uri(
+					"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+				)
+				.header(AUTHORIZATION, "Basic YWxpY2U6c2VjcmV0")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let status = response.status();
+	let body = response_text(response).await;
+
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body, expected_maven_block_body());
+	wait_for_record_count(&yandex_records, 1).await;
+	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+
+	{
+		let records = yandex_records.lock().unwrap();
+		assert_eq!(records[0].method, Method::POST);
+		assert_eq!(records[0].path_and_query, "/bot/v1/messages/sendText/");
+		assert_eq!(records[0].headers[AUTHORIZATION], "OAuth bot-token");
+		let body: Value = serde_json::from_slice(&records[0].body).unwrap();
+		assert_eq!(body["login"], "alice");
+		assert!(
+			body["payload_id"]
+				.as_str()
+				.unwrap()
+				.starts_with("nexus-sec-proxy-")
+		);
+		let text = body["text"].as_str().unwrap();
+		assert!(text.contains("User=alice"));
+		assert!(text.contains("repo=maven-central"));
+		assert!(text.contains("format=maven2"));
+		assert!(text.contains("target=Maven:com.example:demo@1.2.3"));
+		assert!(text.contains("reason=vulnerability policy was violated"));
+		assert!(text.contains("policy=default"));
+		assert!(text.contains("vulns=CVE-2026-0001"));
+		assert!(text.contains("{kept}"));
+	}
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri(
+					"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+				)
+				.header(AUTHORIZATION, "Basic YWxpY2U6c2VjcmV0")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	wait_for_record_count(&yandex_records, 2).await;
+	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn blocked_package_without_basic_auth_skips_yandex_notification() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let osv_count = Arc::new(AtomicUsize::new(0));
+	let osv_url =
+		spawn_server(Router::new().route("/osv", post(mock_osv)).with_state(
+			OsvMockState {
+				request_count: Arc::clone(&osv_count),
+				response: blocking_osv_response(),
+				status: StatusCode::OK,
+			},
+		))
+		.await;
+	let yandex_records = Arc::new(Mutex::new(Vec::new()));
+	let yandex_url = spawn_server(
+		Router::new()
+			.route("/bot/v1/messages/sendText/", post(mock_yandex_messenger))
+			.with_state(YandexMockState {
+				records: Arc::clone(&yandex_records),
+				response: json!({ "ok": true }),
+				status: StatusCode::OK,
+			}),
+	)
+	.await;
+	let template_file = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(template_file.path(), "blocked {user}").unwrap();
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		&format!("{osv_url}osv"),
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.yandex_messenger_token = Some("bot-token".to_owned());
+	config.yandex_messenger_template_file =
+		Some(template_file.path().to_string_lossy().into_owned());
+	config.yandex_messenger_api_url = yandex_url.to_string();
+	config.yandex_messenger_enabled = true;
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("maven-central", "maven2", None)],
+	);
+	let app = build_app(state);
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri(
+					"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+				)
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	assert_eq!(yandex_records.lock().unwrap().len(), 0);
+	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn yandex_failure_does_not_change_block_response() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let osv_url =
+		spawn_server(Router::new().route("/osv", post(mock_osv)).with_state(
+			OsvMockState {
+				request_count: Arc::new(AtomicUsize::new(0)),
+				response: blocking_osv_response(),
+				status: StatusCode::OK,
+			},
+		))
+		.await;
+	let yandex_records = Arc::new(Mutex::new(Vec::new()));
+	let yandex_url = spawn_server(
+		Router::new()
+			.route("/bot/v1/messages/sendText/", post(mock_yandex_messenger))
+			.with_state(YandexMockState {
+				records: Arc::clone(&yandex_records),
+				response: json!({ "ok": false }),
+				status: StatusCode::OK,
+			}),
+	)
+	.await;
+	let template_file = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(template_file.path(), "blocked {user}").unwrap();
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		&format!("{osv_url}osv"),
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.yandex_messenger_token = Some("bot-token".to_owned());
+	config.yandex_messenger_template_file =
+		Some(template_file.path().to_string_lossy().into_owned());
+	config.yandex_messenger_api_url = yandex_url.to_string();
+	config.yandex_messenger_enabled = true;
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("maven-central", "maven2", None)],
+	);
+	let app = build_app(state);
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri(
+					"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+				)
+				.header(AUTHORIZATION, "Basic YWxpY2U6c2VjcmV0")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let status = response.status();
+	let body = response_text(response).await;
+
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body, expected_maven_block_body());
+	wait_for_record_count(&yandex_records, 1).await;
+	assert_eq!(nexus_records.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -568,6 +892,56 @@ async fn admin_api_rejects_missing_or_wrong_token_and_accepts_correct_token() {
 }
 
 #[tokio::test]
+async fn admin_status_reports_yandex_config_without_token() {
+	let mut config = test_config(
+		Some("secret"),
+		None,
+		PolicySet::default(),
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.yandex_messenger_token = Some("bot-secret".to_owned());
+	config.yandex_messenger_template_file =
+		Some("/etc/nsp/yandex-message.txt".to_owned());
+	config.yandex_messenger_api_url =
+		"https://messenger.example.invalid".to_owned();
+	config.yandex_messenger_enabled = true;
+	let app = build_app(test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("default", "npm", Some("npm"))],
+	));
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri("/admin/api/status")
+				.header(AUTHORIZATION, "Bearer secret")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let body = response_json(response).await;
+	let immutable_config = &body["immutable_config"];
+	assert_eq!(immutable_config["yandex_messenger_enabled"], true);
+	assert_eq!(immutable_config["yandex_messenger_token_configured"], true);
+	assert_eq!(
+		immutable_config["yandex_messenger_template_file"],
+		"/etc/nsp/yandex-message.txt"
+	);
+	assert_eq!(
+		immutable_config["yandex_messenger_api_url"],
+		"https://messenger.example.invalid"
+	);
+	assert!(!body.to_string().contains("bot-secret"));
+}
+
+#[tokio::test]
 async fn policy_validate_returns_selected_policy_or_422() {
 	let app = build_app(test_state(Some("secret"), None, PolicySet::default()));
 	let valid_policy = r#"
@@ -785,9 +1159,14 @@ fn policy_evaluation_records_blocked_and_report_only_decisions() {
 		&target,
 		vec![vulnerability.clone()],
 	);
-	let response =
-		handle_policy_evaluation(&blocked_state, &context, &target, evaluation)
-			.unwrap_err();
+	let response = handle_policy_evaluation(
+		&blocked_state,
+		&context,
+		&target,
+		evaluation,
+		None,
+	)
+	.unwrap_err();
 
 	assert_eq!(response.status(), StatusCode::FORBIDDEN);
 	let decisions = blocked_state.decision_log.list(10);
@@ -816,8 +1195,14 @@ fn policy_evaluation_records_blocked_and_report_only_decisions() {
 		&target,
 		vec![vulnerability],
 	);
-	handle_policy_evaluation(&report_only_state, &context, &target, evaluation)
-		.unwrap();
+	handle_policy_evaluation(
+		&report_only_state,
+		&context,
+		&target,
+		evaluation,
+		None,
+	)
+	.unwrap();
 
 	let decisions = report_only_state.decision_log.list(10);
 	assert_eq!(decisions.len(), 1);
@@ -873,6 +1258,40 @@ async fn response_text(response: Response<Body>) -> String {
 	let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
 	String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+async fn wait_for_record_count(
+	records: &Arc<Mutex<Vec<RecordedRequest>>>,
+	expected: usize,
+) {
+	for _ in 0..100 {
+		if records.lock().unwrap().len() >= expected {
+			return;
+		}
+
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+
+	panic!(
+		"timed out waiting for {expected} records, got {}",
+		records.lock().unwrap().len()
+	);
+}
+
+fn expected_maven_block_body() -> &'static str {
+	concat!(
+		"Package blocked by nexus-sec-proxy\n",
+		"\n",
+		"Target: Maven:com.example:demo@1.2.3\n",
+		"Reason: vulnerability policy was violated\n",
+		"Policy: default\n",
+		"\n",
+		"Policy violations:\n",
+		"- 1 HIGH vulnerabilities exceeds limit of 0\n",
+		"\n",
+		"Vulnerabilities:\n",
+		"- CVE-2026-0001 [HIGH]\n",
+	)
 }
 
 async fn response_json(response: Response<Body>) -> Value {
@@ -981,6 +1400,11 @@ fn test_config(
 		osv_api_url: osv_api_url.to_owned(),
 		policy_file,
 		admin_token: admin_token.map(str::to_owned),
+		yandex_messenger_token: None,
+		yandex_messenger_template_file: None,
+		yandex_messenger_api_url: "https://botapi.messenger.yandex.net"
+			.to_owned(),
+		yandex_messenger_enabled: false,
 		log_json: false,
 		fail_open: true,
 		unsupported_target_policy,
@@ -1041,6 +1465,8 @@ fn test_state_from_config(
 		.unwrap();
 	let nexus_base_url = Url::parse(&config.nexus_base_url).unwrap();
 	let osv_api_url = config.osv_api_url.clone();
+	let yandex_messenger =
+		yandex_messenger_from_config(&config, http_client.clone());
 
 	Arc::new(AppState {
 		config: Arc::new(config),
@@ -1051,8 +1477,9 @@ fn test_state_from_config(
 			Duration::from_secs(60),
 			Duration::from_secs(60),
 		),
-		osv: OsvClient::new(http_client, osv_api_url),
+		osv: OsvClient::new(http_client.clone(), osv_api_url),
 		artifact_scanner: None,
+		yandex_messenger,
 		artifact_scanner_semaphore: Arc::new(Semaphore::new(2)),
 		active_policy: Arc::new(RwLock::new(Arc::new(ActivePolicy::new(
 			policy_set,

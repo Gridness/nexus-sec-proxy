@@ -4,6 +4,7 @@ members = [
 	"crates/config",
 	"crates/proxy",
 	"crates/security",
+	"crates/yandex-messenger",
 ]
 resolver = "3"
 
@@ -16,6 +17,7 @@ rust-version = "1.95.0"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 axum = "0.8.4"
+base64 = "0.22.1"
 futures-util = "0.3.31"
 moka = { version = "0.12.10", features = ["future"] }
 percent-encoding = "2.3.1"
@@ -42,6 +44,7 @@ tokio = { version = "1.45.1", features = [
 	"rt-multi-thread",
 	"signal",
 	"sync",
+	"time",
 ] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 toml = "0.9.8"

@@ -3,8 +3,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{CONNECTION, HOST, TRANSFER_ENCODING};
+use axum::http::header::{AUTHORIZATION, CONNECTION, HOST, TRANSFER_ENCODING};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use nexus_sec_proxy_security::ScanTarget;
 use tracing::error;
 use url::Url;
@@ -26,6 +28,7 @@ pub(crate) async fn proxy_handler(
 	let method = parts.method;
 	let uri = parts.uri;
 	let headers = parts.headers;
+	let requester_login = basic_auth_username(&headers);
 
 	if uri.path().starts_with("/admin") {
 		return if state.config.admin_token.is_some() {
@@ -59,6 +62,7 @@ pub(crate) async fn proxy_handler(
 						&state,
 						&repository,
 						ScanTarget::Package(package),
+						requester_login.as_deref(),
 					)
 					.await
 					{
@@ -72,6 +76,7 @@ pub(crate) async fn proxy_handler(
 						target,
 						"artifact targets cannot be scanned before contacting Nexus"
 							.to_owned(),
+						requester_login.as_deref(),
 					)
 					.await
 					{
@@ -179,4 +184,26 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 		|| name.eq_ignore_ascii_case("te")
 		|| name.eq_ignore_ascii_case("trailer")
 		|| name.eq_ignore_ascii_case("upgrade")
+}
+
+pub(crate) fn basic_auth_username(headers: &HeaderMap) -> Option<String> {
+	let header = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+	let mut parts = header.split_ascii_whitespace();
+	let scheme = parts.next()?;
+	let credentials = parts.next()?;
+	if parts.next().is_some() {
+		return None;
+	}
+	if !scheme.eq_ignore_ascii_case("Basic") {
+		return None;
+	}
+
+	let decoded = STANDARD.decode(credentials).ok()?;
+	let decoded = String::from_utf8(decoded).ok()?;
+	let (username, _) = decoded.split_once(':')?;
+	if username.is_empty() {
+		return None;
+	}
+
+	Some(username.to_owned())
 }

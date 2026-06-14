@@ -523,6 +523,11 @@ mod tests {
 			osv_api_url: "https://api.osv.dev/v1/query".to_owned(),
 			policy_file: None,
 			admin_token: None,
+			yandex_messenger_token: None,
+			yandex_messenger_template_file: None,
+			yandex_messenger_api_url: "https://botapi.messenger.yandex.net"
+				.to_owned(),
+			yandex_messenger_enabled: false,
 			log_json: false,
 			fail_open: true,
 			unsupported_target_policy: UnsupportedTargetPolicy::Allow,
