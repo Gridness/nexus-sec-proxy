@@ -11,4 +11,6 @@ pub use model::{
 	PolicyViolation, RepositoryPolicy, ScanDecision, SecurityPolicy,
 	VulnerabilityLimits,
 };
+#[cfg(feature = "policy-schema")]
+pub use parse::policy_toml_schema;
 pub use traits::{VulnerabilityEvaluator, VulnerabilitySource};

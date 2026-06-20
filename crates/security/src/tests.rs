@@ -174,6 +174,30 @@ fn rejects_exception_without_required_metadata() {
 }
 
 #[test]
+fn rejects_exception_with_only_blank_vulnerability_ids() {
+	let error = PolicySet::from_toml_str(
+		r#"
+		[default_policy]
+		minimum_blocking_severity = "HIGH"
+
+		[[exceptions]]
+		id = "SEC-001"
+		owner = "security"
+		ticket = "SEC-1"
+		reason = "accepted during rollout"
+		expires_at = "2099-01-01T00:00:00Z"
+		vulnerability_ids = ["  "]
+		"#,
+	)
+	.unwrap_err();
+
+	assert!(matches!(
+		error,
+		PolicySetError::EmptyExceptionVulnerabilityIds { .. }
+	));
+}
+
+#[test]
 fn rejects_duplicate_policy_and_exception_ids() {
 	let duplicate_policy = PolicySet::from_toml_str(
 		r#"
@@ -479,6 +503,163 @@ fn parses_grype_json_output() {
 			.aliases
 			.contains(&"CVE-2026-0003".to_owned())
 	);
+}
+
+#[cfg(feature = "policy-schema")]
+mod policy_schema_tests {
+	use serde_json::Value;
+	use std::fs;
+
+	use crate::policy_toml_schema;
+
+	#[test]
+	fn policy_schema_matches_checked_in_file() {
+		let generated =
+			serde_json::to_string_pretty(&policy_toml_schema()).unwrap();
+		let generated = format!("{generated}\n");
+		let checked_in = fs::read_to_string(concat!(
+			env!("CARGO_MANIFEST_DIR"),
+			"/../../schemas/policy.schema.json"
+		))
+		.unwrap();
+
+		assert_eq!(
+			generated, checked_in,
+			"regenerate with: cargo run -p nexus-sec-proxy-security --features policy-schema --example policy_schema > schemas/policy.schema.json"
+		);
+	}
+
+	#[test]
+	fn policy_schema_accepts_readme_style_policy() {
+		assert_schema_accepts(
+			r#"
+			[default_policy]
+			id = "default"
+			minimum_blocking_severity = "HIGH"
+			mode = "enforce"
+
+			[repositories."npm-internal"]
+			team = "web"
+
+			[[policies]]
+			id = "web-npm"
+			repositories = ["npm-internal"]
+			formats = ["npm"]
+			teams = ["web"]
+			minimum_blocking_severity = "MEDIUM"
+			mode = "report_only"
+			max_critical_vulnerabilities = 0
+
+			[[exceptions]]
+			id = "SEC-1234"
+			owner = "security"
+			ticket = "SEC-1234"
+			reason = "temporary rollout exception"
+			expires_at = "2026-12-31T23:59:59Z"
+			vulnerability_ids = ["CVE-2026-0001", "GHSA-xxxx"]
+			repositories = ["npm-internal"]
+			formats = ["npm"]
+			teams = ["web"]
+			packages = ["left-pad"]
+			versions = ["1.0.0"]
+			"#,
+		);
+	}
+
+	#[test]
+	fn policy_schema_rejects_unknown_fields() {
+		assert_schema_rejects(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+			unexpected = true
+			"#,
+		);
+	}
+
+	#[test]
+	fn policy_schema_rejects_missing_default_policy() {
+		assert_schema_rejects(
+			r#"
+			[[policies]]
+			id = "web-npm"
+			repositories = ["npm-internal"]
+			"#,
+		);
+	}
+
+	#[test]
+	fn policy_schema_rejects_missing_policy_id() {
+		assert_schema_rejects(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[policies]]
+			repositories = ["npm-internal"]
+			"#,
+		);
+	}
+
+	#[test]
+	fn policy_schema_rejects_exception_missing_required_metadata() {
+		assert_schema_rejects(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = "HIGH"
+
+			[[exceptions]]
+			id = "SEC-001"
+			ticket = "SEC-1"
+			reason = "accepted during rollout"
+			expires_at = "2099-01-01T00:00:00Z"
+			vulnerability_ids = ["CVE-2026-0001"]
+			"#,
+		);
+	}
+
+	#[test]
+	fn policy_schema_rejects_invalid_scalar_types() {
+		assert_schema_rejects(
+			r#"
+			[default_policy]
+			minimum_blocking_severity = 5
+			"#,
+		);
+	}
+
+	fn assert_schema_accepts(input: &str) {
+		let errors = schema_validation_errors(input);
+		assert!(errors.is_empty(), "schema rejected policy: {errors:?}");
+	}
+
+	fn assert_schema_rejects(input: &str) {
+		let errors = schema_validation_errors(input);
+		assert!(
+			!errors.is_empty(),
+			"schema unexpectedly accepted policy:\n{input}"
+		);
+	}
+
+	fn schema_validation_errors(input: &str) -> Vec<String> {
+		let schema = policy_toml_schema();
+		assert!(jsonschema::draft202012::meta::is_valid(&schema));
+		let validator = jsonschema::draft202012::options()
+			.should_validate_formats(true)
+			.build(&schema)
+			.unwrap();
+		let value = policy_toml_to_json(input);
+
+		validator
+			.iter_errors(&value)
+			.map(|error| error.to_string())
+			.collect()
+	}
+
+	fn policy_toml_to_json(input: &str) -> Value {
+		let value = toml::from_str::<toml::Value>(input).unwrap();
+		serde_json::to_value(value).unwrap()
+	}
 }
 
 fn package_target() -> ScanTarget {

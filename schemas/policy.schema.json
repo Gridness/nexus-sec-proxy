@@ -1,0 +1,228 @@
+{
+  "$defs": {
+    "EnforcementMode": {
+      "description": "Case-insensitive enforcement mode accepted by the TOML parser.",
+      "pattern": "^\\s*([Ee][Nn][Ff][Oo][Rr][Cc][Ee]|[Ee][Nn][Ff][Oo][Rr][Cc][Ee][Dd]|[Bb][Ll][Oo][Cc][Kk]|[Bb][Ll][Oo][Cc][Kk][Ii][Nn][Gg]|[Rr][Ee][Pp][Oo][Rr][Tt]_[Oo][Nn][Ll][Yy]|[Rr][Ee][Pp][Oo][Rr][Tt]-[Oo][Nn][Ll][Yy]|[Rr][Ee][Pp][Oo][Rr][Tt][Oo][Nn][Ll][Yy]|[Aa][Uu][Dd][Ii][Tt])\\s*$",
+      "type": "string"
+    },
+    "RawPolicyException": {
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "formats": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "owner": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "packages": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "repositories": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "teams": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ticket": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "versions": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "vulnerability_ids": {
+          "items": {
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "owner",
+        "ticket",
+        "reason",
+        "expires_at",
+        "vulnerability_ids"
+      ],
+      "type": "object"
+    },
+    "RawPolicyRule": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_vulnerability_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "formats": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "max_critical_vulnerabilities": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_high_vulnerabilities": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_low_vulnerabilities": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_medium_vulnerabilities": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_total_vulnerabilities": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "minimum_blocking_severity": {
+          "$ref": "#/$defs/Severity",
+          "default": "HIGH"
+        },
+        "mode": {
+          "$ref": "#/$defs/EnforcementMode",
+          "default": "enforce"
+        },
+        "repositories": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "teams": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RawRepositoryPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "team": {
+          "pattern": "\\S",
+          "type": "string"
+        }
+      },
+      "required": [
+        "team"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Case-insensitive severity accepted by the TOML parser: LOW, MEDIUM/MODERATE, HIGH, or CRITICAL.",
+      "pattern": "^\\s*([Ll][Oo][Ww]|[Mm][Ee][Dd][Ii][Uu][Mm]|[Mm][Oo][Dd][Ee][Rr][Aa][Tt][Ee]|[Hh][Ii][Gg][Hh]|[Cc][Rr][Ii][Tt][Ii][Cc][Aa][Ll])\\s*$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "default_policy": {
+      "$ref": "#/$defs/RawPolicyRule"
+    },
+    "exceptions": {
+      "items": {
+        "$ref": "#/$defs/RawPolicyException"
+      },
+      "type": "array"
+    },
+    "policies": {
+      "items": {
+        "$ref": "#/$defs/RawPolicyRule",
+        "required": [
+          "id"
+        ]
+      },
+      "type": "array"
+    },
+    "repositories": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RawRepositoryPolicy"
+      },
+      "propertyNames": {
+        "pattern": "\\S",
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "default_policy"
+  ],
+  "title": "RawPolicySet",
+  "type": "object"
+}
