@@ -11,9 +11,13 @@ use nexus_sec_proxy_security::{
 	PolicyEvaluation, PolicyOutcome, ScanTarget, SecurityError,
 	VulnerabilitySource,
 };
+#[cfg(feature = "yandex-messenger")]
+use nexus_sec_proxy_yandex_messenger::BlockNotification;
 use tracing::{error, warn};
 
 use crate::audit::audit_policy_evaluation;
+#[cfg(feature = "yandex-messenger")]
+use crate::audit::vulnerability_ids;
 use crate::catalog::NexusRepository;
 use crate::decisions::{DecisionOutcome, record_decision};
 use crate::responses::response_with_text;
@@ -23,6 +27,7 @@ pub(crate) async fn authorize_package_target(
 	state: &AppState,
 	repository: &NexusRepository,
 	target: ScanTarget,
+	requester_login: Option<&str>,
 ) -> Result<(), Box<Response<Body>>> {
 	let cache_key = cache_key_for_target(&target);
 
@@ -40,6 +45,7 @@ pub(crate) async fn authorize_package_target(
 					&target,
 					scan.vulnerabilities,
 				),
+				requester_login,
 			);
 		}
 		Ok(None) => {}
@@ -69,7 +75,11 @@ pub(crate) async fn authorize_package_target(
 		}
 		Err(SecurityError::UnsupportedTarget(reason)) => {
 			return handle_unsupported_target(
-				state, repository, target, reason,
+				state,
+				repository,
+				target,
+				reason,
+				requester_login,
 			)
 			.await;
 		}
@@ -94,7 +104,13 @@ pub(crate) async fn authorize_package_target(
 		}
 	};
 
-	handle_policy_evaluation(state, &context, &target, decision)
+	handle_policy_evaluation(
+		state,
+		&context,
+		&target,
+		decision,
+		requester_login,
+	)
 }
 
 pub(crate) async fn handle_unsupported_target(
@@ -102,6 +118,7 @@ pub(crate) async fn handle_unsupported_target(
 	repository: &NexusRepository,
 	target: ScanTarget,
 	reason: String,
+	requester_login: Option<&str>,
 ) -> Result<(), Box<Response<Body>>> {
 	match state.config.unsupported_target_policy {
 		UnsupportedTargetPolicy::Allow => {
@@ -118,6 +135,7 @@ pub(crate) async fn handle_unsupported_target(
 			let context =
 				active_policy.context_for(&repository.name, &repository.format);
 			record_decision(state, &context, DecisionOutcome::Blocked, &report);
+			notify_blocked(state, requester_login, &context, &report);
 			Err(Box::new(response_with_text(
 				StatusCode::FORBIDDEN,
 				report.to_plain_text(),
@@ -131,6 +149,7 @@ pub(crate) fn handle_policy_evaluation(
 	context: &PolicyContext,
 	target: &ScanTarget,
 	evaluation: PolicyEvaluation,
+	requester_login: Option<&str>,
 ) -> Result<(), Box<Response<Body>>> {
 	audit_policy_evaluation(context, target, &evaluation);
 
@@ -146,6 +165,7 @@ pub(crate) fn handle_policy_evaluation(
 		}
 		PolicyOutcome::Blocked(report) => {
 			record_decision(state, context, DecisionOutcome::Blocked, report);
+			notify_blocked(state, requester_login, context, report);
 		}
 	}
 
@@ -157,6 +177,40 @@ pub(crate) fn handle_policy_evaluation(
 		))),
 	}
 }
+
+#[cfg(feature = "yandex-messenger")]
+fn notify_blocked(
+	state: &AppState,
+	requester_login: Option<&str>,
+	context: &PolicyContext,
+	report: &BlockReport,
+) {
+	let (Some(login), Some(notifier)) =
+		(requester_login, state.yandex_messenger.as_ref())
+	else {
+		return;
+	};
+
+	notifier.notify_blocked(BlockNotification {
+		login: login.to_owned(),
+		repository: context.repository.clone(),
+		format: context.format.clone(),
+		target: report.target.display_name(),
+		reason: report.reason.clone(),
+		policy_id: report.policy_id.clone(),
+		vulnerability_ids: vulnerability_ids(report),
+	});
+}
+
+#[cfg(not(feature = "yandex-messenger"))]
+fn notify_blocked(
+	_state: &AppState,
+	_requester_login: Option<&str>,
+	_context: &PolicyContext,
+	_report: &BlockReport,
+) {
+}
+
 async fn put_cache(
 	state: &AppState,
 	key: CacheKey,

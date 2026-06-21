@@ -24,6 +24,13 @@ fn default_config_uses_strict_high_and_critical_policy() {
 	assert_eq!(config.repository_name, "default");
 	assert_eq!(config.policy_file, None);
 	assert_eq!(config.admin_token, None);
+	assert_eq!(config.yandex_messenger_token, None);
+	assert_eq!(config.yandex_messenger_template_file, None);
+	assert_eq!(
+		config.yandex_messenger_api_url,
+		"https://botapi.messenger.yandex.net"
+	);
+	assert!(!config.yandex_messenger_enabled);
 	assert!(!config.log_json);
 	assert_eq!(config.policy_set.default_policy.id, "default");
 	assert_eq!(
@@ -38,6 +45,104 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		config.security_policy.effective_limit(Severity::Critical),
 		Some(0)
 	);
+}
+
+#[test]
+fn parses_yandex_messenger_config_and_effective_enabled_state() {
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN", " token "),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+			" /etc/nsp/yandex-message.txt ",
+		),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL",
+			" https://messenger.example.invalid ",
+		),
+	]);
+
+	let config =
+		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
+			.unwrap();
+
+	assert_eq!(config.yandex_messenger_token.as_deref(), Some("token"));
+	assert_eq!(
+		config.yandex_messenger_template_file.as_deref(),
+		Some("/etc/nsp/yandex-message.txt")
+	);
+	assert_eq!(
+		config.yandex_messenger_api_url,
+		"https://messenger.example.invalid"
+	);
+	assert!(config.yandex_messenger_enabled);
+
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN", "token"),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+			"/etc/nsp/yandex-message.txt",
+		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "false"),
+	]);
+
+	let config =
+		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
+			.unwrap();
+
+	assert!(!config.yandex_messenger_enabled);
+
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
+	]);
+
+	let config =
+		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
+			.unwrap();
+
+	assert!(!config.yandex_messenger_enabled);
+}
+
+#[test]
+fn yandex_messenger_token_is_redacted_from_serialized_config() {
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_ADMIN_TOKEN", "admin-secret"),
+		("NEXUS_SEC_PROXY_NEXUS_PASSWORD", "nexus-secret"),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN", "bot-secret"),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+			"/etc/nsp/yandex-message.txt",
+		),
+	]);
+
+	let config =
+		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
+			.unwrap();
+	let value = serde_json::to_value(config).unwrap();
+
+	assert!(value.get("admin_token").is_none());
+	assert!(value.get("nexus_password").is_none());
+	assert!(value.get("yandex_messenger_token").is_none());
+	assert_eq!(
+		value["yandex_messenger_template_file"],
+		"/etc/nsp/yandex-message.txt"
+	);
+	assert_eq!(value["yandex_messenger_enabled"], true);
 }
 
 #[test]

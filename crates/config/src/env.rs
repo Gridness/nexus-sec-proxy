@@ -7,6 +7,8 @@ use crate::{ArtifactScannerKind, ConfigError, UnsupportedTargetPolicy};
 
 pub(crate) const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 pub(crate) const DEFAULT_OSV_API_URL: &str = "https://api.osv.dev/v1/query";
+pub(crate) const DEFAULT_YANDEX_MESSENGER_API_URL: &str =
+	"https://botapi.messenger.yandex.net";
 pub(crate) const DEFAULT_REPOSITORY_NAME: &str = "default";
 pub(crate) const DEFAULT_REPOSITORY_FORMAT: &str = "generic";
 pub(crate) const DEFAULT_CACHE_ALLOWED_TTL_SECS: u64 = 24 * 60 * 60;
@@ -94,16 +96,25 @@ pub(crate) fn bool_env(
 	name: &'static str,
 	default: bool,
 ) -> Result<bool, ConfigError> {
-	match optional_string_env(lookup, name) {
-		Some(value) => {
-			value.parse().map_err(|source| ConfigError::InvalidBool {
-				name,
-				value,
-				source,
-			})
-		}
-		None => Ok(default),
-	}
+	Ok(optional_bool_env(lookup, name)?.unwrap_or(default))
+}
+
+pub(crate) fn optional_bool_env(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<Option<bool>, ConfigError> {
+	optional_string_env(lookup, name)
+		.map(|value| {
+			value
+				.parse()
+				.map(Some)
+				.map_err(|source| ConfigError::InvalidBool {
+					name,
+					value,
+					source,
+				})
+		})
+		.unwrap_or(Ok(None))
 }
 
 pub(crate) fn socket_addr_env(

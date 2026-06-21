@@ -746,10 +746,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "futures-util",
  "nexus-sec-proxy-cache",
  "nexus-sec-proxy-config",
  "nexus-sec-proxy-security",
+ "nexus-sec-proxy-yandex-messenger",
  "percent-encoding",
  "reqwest",
  "serde",
@@ -782,6 +784,7 @@ version = "0.1.0"
 dependencies = [
  "nexus-sec-proxy-security",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -798,6 +801,20 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "nexus-sec-proxy-yandex-messenger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
  "tracing",
 ]
 

@@ -20,6 +20,10 @@ use axum::routing::{any, get, post};
 use nexus_sec_proxy_cache::MokaScanCache;
 use nexus_sec_proxy_config::AppConfig;
 use nexus_sec_proxy_security::OsvClient;
+#[cfg(feature = "yandex-messenger")]
+use nexus_sec_proxy_yandex_messenger::{
+	YandexMessengerConfig, YandexMessengerNotifier,
+};
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 use url::Url;
@@ -45,7 +49,7 @@ pub(crate) use crate::catalog::{
 #[cfg(test)]
 pub(crate) use crate::decisions::{DecisionOutcome, RecentDecision};
 #[cfg(test)]
-pub(crate) use crate::gateway::build_nexus_url;
+pub(crate) use crate::gateway::{basic_auth_username, build_nexus_url};
 #[cfg(test)]
 pub(crate) use crate::responses::response_with_text;
 #[cfg(test)]
@@ -83,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
 	);
 	let osv = OsvClient::new(http_client.clone(), config.osv_api_url.clone());
 	let artifact_scanner = external_scanner_from_config(&config);
+	#[cfg(feature = "yandex-messenger")]
+	let yandex_messenger =
+		yandex_messenger_from_config(&config, http_client.clone());
 	let artifact_scanner_semaphore = Arc::new(Semaphore::new(
 		config.artifact_scanner_concurrency.max(1) as usize,
 	));
@@ -100,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
 		cache,
 		osv,
 		artifact_scanner,
+		#[cfg(feature = "yandex-messenger")]
+		yandex_messenger,
 		artifact_scanner_semaphore,
 		active_policy,
 		repository_catalog: Arc::new(RwLock::new(Arc::new(repository_catalog))),
@@ -138,6 +147,26 @@ async fn main() -> anyhow::Result<()> {
 		.context("server failed")?;
 
 	Ok(())
+}
+
+#[cfg(feature = "yandex-messenger")]
+fn yandex_messenger_from_config(
+	config: &AppConfig,
+	http_client: reqwest::Client,
+) -> Option<YandexMessengerNotifier> {
+	if !config.yandex_messenger_enabled {
+		return None;
+	}
+
+	let token = config.yandex_messenger_token.as_deref()?;
+	let template_file = config.yandex_messenger_template_file.as_deref()?;
+	let yandex_config = YandexMessengerConfig::new(
+		token,
+		template_file,
+		config.yandex_messenger_api_url.clone(),
+	);
+
+	Some(YandexMessengerNotifier::new(yandex_config, http_client))
 }
 
 fn build_app(state: Arc<AppState>) -> Router {
