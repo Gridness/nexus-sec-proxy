@@ -117,6 +117,7 @@ pub enum PolicySetError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[cfg_attr(feature = "policy-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementMode {
 	#[default]

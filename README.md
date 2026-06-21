@@ -175,6 +175,13 @@ Policy notes:
 - Unknown TOML fields are rejected.
 - Policy reload swaps the active policy only after successful validation.
 
+The policy TOML JSON Schema for editor and tooling support is checked in at
+`schemas/policy.schema.json`. Regenerate it after policy input changes with:
+
+```bash
+cargo run -p nexus-sec-proxy-security --features policy-schema --example policy_schema > schemas/policy.schema.json
+```
+
 ## Admin API and UI
 
 Set a non-empty `NEXUS_SEC_PROXY_ADMIN_TOKEN` to enable the admin surface:

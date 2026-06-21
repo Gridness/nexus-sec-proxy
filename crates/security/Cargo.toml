@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+policy-schema = ["dep:schemars"]
+
 [dependencies]
 async-trait.workspace = true
 reqwest.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -14,3 +18,10 @@ time.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+
+[[example]]
+name = "policy_schema"
+required-features = ["policy-schema"]

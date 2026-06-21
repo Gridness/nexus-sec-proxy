@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
+#[cfg(feature = "policy-schema")]
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -14,6 +16,7 @@ use super::model::{
 };
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "policy-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawPolicySet {
 	default_policy: RawPolicyRule,
@@ -26,12 +29,14 @@ struct RawPolicySet {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "policy-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawRepositoryPolicy {
 	team: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "policy-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawPolicyRule {
 	id: Option<String>,
@@ -55,6 +60,7 @@ struct RawPolicyRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "policy-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawPolicyException {
 	id: String,
@@ -73,6 +79,135 @@ struct RawPolicyException {
 	packages: Vec<String>,
 	#[serde(default)]
 	versions: Vec<String>,
+}
+
+#[cfg(feature = "policy-schema")]
+pub fn policy_toml_schema() -> Value {
+	let mut schema = serde_json::to_value(schemars::schema_for!(RawPolicySet))
+		.expect("policy schema should serialize to JSON");
+	refine_policy_toml_schema(&mut schema);
+	schema
+}
+
+#[cfg(feature = "policy-schema")]
+fn refine_policy_toml_schema(schema: &mut Value) {
+	schema
+		.as_object_mut()
+		.expect("root schema should be an object")
+		.insert("required".to_owned(), json!(["default_policy"]));
+
+	replace_def(
+		schema,
+		"Severity",
+		json!({
+			"type": "string",
+			"pattern": r"^\s*([Ll][Oo][Ww]|[Mm][Ee][Dd][Ii][Uu][Mm]|[Mm][Oo][Dd][Ee][Rr][Aa][Tt][Ee]|[Hh][Ii][Gg][Hh]|[Cc][Rr][Ii][Tt][Ii][Cc][Aa][Ll])\s*$",
+			"description": "Case-insensitive severity accepted by the TOML parser: LOW, MEDIUM/MODERATE, HIGH, or CRITICAL."
+		}),
+	);
+	replace_def(
+		schema,
+		"EnforcementMode",
+		json!({
+			"type": "string",
+			"pattern": r"^\s*([Ee][Nn][Ff][Oo][Rr][Cc][Ee]|[Ee][Nn][Ff][Oo][Rr][Cc][Ee][Dd]|[Bb][Ll][Oo][Cc][Kk]|[Bb][Ll][Oo][Cc][Kk][Ii][Nn][Gg]|[Rr][Ee][Pp][Oo][Rr][Tt]_[Oo][Nn][Ll][Yy]|[Rr][Ee][Pp][Oo][Rr][Tt]-[Oo][Nn][Ll][Yy]|[Rr][Ee][Pp][Oo][Rr][Tt][Oo][Nn][Ll][Yy]|[Aa][Uu][Dd][Ii][Tt])\s*$",
+			"description": "Case-insensitive enforcement mode accepted by the TOML parser."
+		}),
+	);
+
+	set_property_schema(schema, "RawPolicyRule", "id", non_blank_string());
+	set_property_schema(
+		schema,
+		"RawRepositoryPolicy",
+		"team",
+		non_blank_string(),
+	);
+	for property in ["id", "owner", "ticket", "reason"] {
+		set_property_schema(
+			schema,
+			"RawPolicyException",
+			property,
+			non_blank_string(),
+		);
+	}
+	set_property_schema(
+		schema,
+		"RawPolicyException",
+		"expires_at",
+		json!({
+			"type": "string",
+			"format": "date-time",
+			"pattern": r"\S"
+		}),
+	);
+	set_array_items_schema(
+		schema,
+		"RawPolicyException",
+		"vulnerability_ids",
+		non_blank_string(),
+	);
+	schema
+		.pointer_mut("/$defs/RawPolicyException/properties/vulnerability_ids")
+		.and_then(Value::as_object_mut)
+		.expect(
+			"RawPolicyException.vulnerability_ids schema should be an object",
+		)
+		.insert("minItems".to_owned(), json!(1));
+
+	schema
+		.pointer_mut("/properties/policies/items")
+		.and_then(Value::as_object_mut)
+		.expect("policies items schema should be an object")
+		.insert("required".to_owned(), json!(["id"]));
+
+	schema
+		.pointer_mut("/properties/repositories")
+		.and_then(Value::as_object_mut)
+		.expect("repositories schema should be an object")
+		.insert("propertyNames".to_owned(), non_blank_string());
+}
+
+#[cfg(feature = "policy-schema")]
+fn replace_def(schema: &mut Value, name: &str, value: Value) {
+	schema
+		.pointer_mut("/$defs")
+		.and_then(Value::as_object_mut)
+		.expect("schema should include $defs")
+		.insert(name.to_owned(), value);
+}
+
+#[cfg(feature = "policy-schema")]
+fn set_property_schema(
+	schema: &mut Value,
+	definition: &str,
+	property: &str,
+	value: Value,
+) {
+	*schema
+		.pointer_mut(&format!("/$defs/{definition}/properties/{property}"))
+		.expect("property schema should exist") = value;
+}
+
+#[cfg(feature = "policy-schema")]
+fn set_array_items_schema(
+	schema: &mut Value,
+	definition: &str,
+	property: &str,
+	value: Value,
+) {
+	*schema
+		.pointer_mut(&format!(
+			"/$defs/{definition}/properties/{property}/items"
+		))
+		.expect("array items schema should exist") = value;
+}
+
+#[cfg(feature = "policy-schema")]
+fn non_blank_string() -> Value {
+	json!({
+		"type": "string",
+		"pattern": r"\S"
+	})
 }
 
 impl PolicySet {
