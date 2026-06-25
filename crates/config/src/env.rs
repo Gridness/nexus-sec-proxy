@@ -18,6 +18,9 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_TIMEOUT_SECS: u64 = 5 * 60;
 pub(crate) const DEFAULT_ARTIFACT_SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_CONCURRENCY: u64 = 2;
+pub(crate) const DEFAULT_TRUST_REPORT_DIR: &str =
+	"/var/lib/nexus-sec-proxy/trust-reports";
+pub(crate) const DEFAULT_TRUST_REPORT_RETENTION_DAYS: u64 = 30;
 pub(crate) fn security_policy_env(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 ) -> Result<SecurityPolicy, ConfigError> {

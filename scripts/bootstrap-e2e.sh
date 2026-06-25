@@ -11,6 +11,8 @@ START_SCANNER_DB_UPDATER=1
 NEXUS_BASE_URL=
 PROXY_BASE_URL=
 NEXUS_CATALOG_FILE=
+TRUST_BLOCK_BODY_FILE=
+TRUST_REPORT_FILE=
 PROXY_ADMIN_TOKEN_SOURCE=
 NEXUS_CREDENTIALS_SOURCE=none
 NEXUS_ADMIN_USERNAME=
@@ -19,6 +21,12 @@ NEXUS_ADMIN_PASSWORD=
 cleanup() {
 	if [ -n "${NEXUS_CATALOG_FILE:-}" ]; then
 		rm -f "$NEXUS_CATALOG_FILE"
+	fi
+	if [ -n "${TRUST_BLOCK_BODY_FILE:-}" ]; then
+		rm -f "$TRUST_BLOCK_BODY_FILE"
+	fi
+	if [ -n "${TRUST_REPORT_FILE:-}" ]; then
+		rm -f "$TRUST_REPORT_FILE"
 	fi
 }
 
@@ -417,6 +425,38 @@ wait_for_proxy_healthz() {
 	done
 }
 
+verify_trust_report_block() {
+	TRUST_BLOCK_BODY_FILE=$(mktemp)
+	TRUST_REPORT_FILE=$(mktemp)
+	target_path="/repository/maven-central/org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.jar"
+
+	log "verifying enforced block and Trust report"
+	status=$(curl -sS \
+		-o "$TRUST_BLOCK_BODY_FILE" \
+		-w '%{http_code}' \
+		"${PROXY_BASE_URL}${target_path}")
+	if [ "$status" != "403" ]; then
+		cat "$TRUST_BLOCK_BODY_FILE" >&2
+		print_service_debug nexus-sec-proxy
+		die "expected vulnerable package request to return 403, got ${status}"
+	fi
+
+	report_url=$(sed -n 's/^Full report: //p' "$TRUST_BLOCK_BODY_FILE" \
+		| tr -d '\r' \
+		| sed -n '1p')
+	if [ -z "$report_url" ]; then
+		cat "$TRUST_BLOCK_BODY_FILE" >&2
+		die "blocked response did not include a Trust report URL"
+	fi
+
+	curl -fsS -o "$TRUST_REPORT_FILE" "$report_url"
+	grep -Fq '<span>Trust</span>' "$TRUST_REPORT_FILE" \
+		|| die "Trust report page does not contain the Trust header"
+	grep -Fq 'log4j-core@2.14.1' "$TRUST_REPORT_FILE" \
+		|| die "Trust report page does not contain the blocked target"
+	log "Trust report is reachable at ${report_url}"
+}
+
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		--no-build)
@@ -493,6 +533,7 @@ compose up -d nexus-sec-proxy
 wait_for_healthy nexus-sec-proxy "$PROXY_TIMEOUT_SECS"
 refresh_proxy_base_url
 wait_for_proxy_healthz
+verify_trust_report_block
 capture_generated_nexus_admin_password
 
 log "e2e environment is ready"

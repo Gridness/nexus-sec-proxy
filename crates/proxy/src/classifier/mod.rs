@@ -528,6 +528,9 @@ mod tests {
 			yandex_messenger_api_url: "https://botapi.messenger.yandex.net"
 				.to_owned(),
 			yandex_messenger_enabled: false,
+			trust_base_url: "https://proxy.example.invalid".to_owned(),
+			trust_report_dir: "/tmp/nexus-sec-proxy-test-reports".to_owned(),
+			trust_report_retention_days: 30,
 			log_json: false,
 			fail_open: true,
 			unsupported_target_policy: UnsupportedTargetPolicy::Allow,

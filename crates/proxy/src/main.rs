@@ -10,6 +10,7 @@ mod scanner_db;
 mod state;
 mod time_utils;
 mod tracing_setup;
+mod trust_reports;
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -41,6 +42,7 @@ use crate::scan::external_scanner_from_config;
 use crate::state::{ActivePolicy, AppState};
 use crate::time_utils::now_rfc3339;
 use crate::tracing_setup::{env_log_json, init_tracing};
+use crate::trust_reports::{ReportStore, serve_report};
 
 #[cfg(test)]
 pub(crate) use crate::catalog::{
@@ -68,6 +70,18 @@ async fn main() -> anyhow::Result<()> {
 		anyhow::Error::new(error).context("failed to load configuration")
 	})?;
 	let bind_addr = config.bind_addr;
+	let report_store = ReportStore::initialize(
+		&config.trust_report_dir,
+		&config.trust_base_url,
+		config.trust_report_retention_days,
+	)
+	.await
+	.with_context(|| {
+		format!(
+			"failed to initialize Trust report directory {}",
+			config.trust_report_dir
+		)
+	})?;
 	let nexus_base_url =
 		Url::parse(&config.nexus_base_url).with_context(|| {
 			format!("invalid Nexus base URL: {}", config.nexus_base_url)
@@ -113,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
 		active_policy,
 		repository_catalog: Arc::new(RwLock::new(Arc::new(repository_catalog))),
 		decision_log: DecisionLog::new(100),
+		report_store,
 		started_at,
 		started_at_rfc3339,
 	});
@@ -133,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
 		artifact_scanner = ?state.config.artifact_scanner,
 		artifact_scanner_command = %state.config.artifact_scanner_command,
 		cache_max_capacity = state.config.cache_max_capacity,
+		trust_base_url = %state.config.trust_base_url,
+		trust_report_dir = %state.config.trust_report_dir,
+		trust_report_retention_days = state.config.trust_report_retention_days,
 		"starting nexus security proxy"
 	);
 
@@ -170,7 +188,9 @@ fn yandex_messenger_from_config(
 }
 
 fn build_app(state: Arc<AppState>) -> Router {
-	let app = Router::new().route("/healthz", get(healthz));
+	let app = Router::new()
+		.route("/healthz", get(healthz))
+		.route("/trust/reports/{id}", get(serve_report));
 	let app = if state.config.admin_token.is_some() {
 		app.route("/admin", get(admin_ui))
 			.route("/admin/api/status", get(admin_status))

@@ -16,6 +16,7 @@ use url::Url;
 use crate::catalog::RepositoryCatalog;
 use crate::decisions::DecisionLog;
 use crate::time_utils::now_rfc3339;
+use crate::trust_reports::ReportStore;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -31,6 +32,7 @@ pub(crate) struct AppState {
 	pub(crate) active_policy: Arc<RwLock<Arc<ActivePolicy>>>,
 	pub(crate) repository_catalog: Arc<RwLock<Arc<RepositoryCatalog>>>,
 	pub(crate) decision_log: DecisionLog,
+	pub(crate) report_store: ReportStore,
 	pub(crate) started_at: Instant,
 	pub(crate) started_at_rfc3339: String,
 }

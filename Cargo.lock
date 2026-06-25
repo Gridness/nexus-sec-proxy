@@ -764,6 +764,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -787,6 +788,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "url",
 ]
 
 [[package]]

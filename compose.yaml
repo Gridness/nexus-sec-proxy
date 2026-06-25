@@ -50,6 +50,9 @@ services:
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL:-https://botapi.messenger.yandex.net}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED:-}
+      NEXUS_SEC_PROXY_TRUST_BASE_URL: ${NEXUS_SEC_PROXY_TRUST_BASE_URL:-http://localhost:${NEXUS_SEC_PROXY_PORT:-3000}}
+      NEXUS_SEC_PROXY_TRUST_REPORT_DIR: /var/lib/nexus-sec-proxy/trust-reports
+      NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS: ${NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS:-30}
       NEXUS_SEC_PROXY_LOG_JSON: ${NEXUS_SEC_PROXY_LOG_JSON:-false}
       NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY: ${NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY:-HIGH}
       NEXUS_SEC_PROXY_ALLOWED_VULNERABILITY_IDS: ${NEXUS_SEC_PROXY_ALLOWED_VULNERABILITY_IDS:-}
@@ -78,6 +81,7 @@ services:
       - ${NEXUS_SEC_PROXY_POLICY_DIR:-./policy}:/etc/nexus-sec-proxy:ro
       - artifact-tmp:/var/tmp/nexus-sec-proxy
       - grype-cache:/var/cache/grype
+      - trust-reports:/var/lib/nexus-sec-proxy/trust-reports
       - trivy-cache:/var/cache/trivy
     healthcheck:
       test:
@@ -139,4 +143,5 @@ services:
 volumes:
   artifact-tmp:
   grype-cache:
+  trust-reports:
   trivy-cache:

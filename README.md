@@ -16,7 +16,8 @@ Request flow:
    through.
 5. `GET` and `HEAD` package downloads are classified from the stripped
    repository path and checked through OSV plus the active policy.
-6. Enforced blocks return `403 Forbidden` before Nexus receives the request.
+6. Enforced blocks create a self-contained Trust report and return
+   `403 Forbidden` with its secret URL before Nexus receives the request.
 7. Report-only and allowed package requests are forwarded to Nexus.
 8. Artifact-only targets are not prefetched from Nexus. They are controlled by
    `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`: `block` denies them before
@@ -26,6 +27,7 @@ Request flow:
 
 ```bash
 NEXUS_SEC_PROXY_NEXUS_BASE_URL=http://127.0.0.1:8081 \
+NEXUS_SEC_PROXY_TRUST_BASE_URL=http://127.0.0.1:3000 \
 cargo run -p nexus-sec-proxy
 ```
 
@@ -45,7 +47,9 @@ scripts/bootstrap-e2e.sh
 
 The script uses `e2e.compose.yaml`, starts Nexus first, waits for a non-empty
 Nexus repository catalog, primes scanner database volumes, starts the scanner
-DB updater and proxy, then verifies `http://127.0.0.1:3000/healthz`.
+DB updater and proxy, verifies `http://127.0.0.1:3000/healthz`, requests a
+known vulnerable Maven package, and fetches the Trust page linked by its 403
+response.
 It enables the proxy admin UI with the default bearer token
 `e2e-admin-token` unless `NEXUS_SEC_PROXY_E2E_ADMIN_TOKEN` or
 `NEXUS_SEC_PROXY_ADMIN_TOKEN` is set. When the environment is ready, the script
@@ -58,6 +62,7 @@ Required:
 
 ```bash
 NEXUS_SEC_PROXY_NEXUS_BASE_URL=http://nexus:8081
+NEXUS_SEC_PROXY_TRUST_BASE_URL=https://proxy.example.com
 ```
 
 Common:
@@ -74,6 +79,8 @@ NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL=https://botapi.messenger.yandex.net
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=
+NEXUS_SEC_PROXY_TRUST_REPORT_DIR=/var/lib/nexus-sec-proxy/trust-reports
+NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS=30
 NEXUS_SEC_PROXY_LOG_JSON=false
 NEXUS_SEC_PROXY_FAIL_OPEN=true
 NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow
@@ -102,6 +109,15 @@ Configuration notes:
   `NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false` to force them off. Binaries
   built with `--no-default-features` accept these variables but never send
   Messenger notifications.
+- `NEXUS_SEC_PROXY_TRUST_BASE_URL` is the public HTTP(S) origin or base path
+  used in report links. Query strings and fragments are rejected.
+- `NEXUS_SEC_PROXY_TRUST_REPORT_DIR` must be writable. Startup fails if the
+  directory cannot be created and tested. Runtime write failures deny the
+  download with `503 Service Unavailable`.
+- Trust reports expire after
+  `NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS` (minimum `1`, default `30`).
+  Replicas on different hosts must mount the same external shared filesystem
+  at the configured report directory.
 - `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV fails. Set it to
   `false` to return `503 Service Unavailable` on scanner failures.
 - `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
@@ -196,7 +212,8 @@ Read-only endpoints:
 - `GET /admin/api/scanner` returns scanner config and best-effort local DB
   file age.
 - `GET /admin/api/decisions?limit=N` returns recent blocked and report-only
-  decisions, newest first.
+  decisions, newest first. Blocked decisions include `report_url`; report-only
+  decisions use `null`.
 
 Operations:
 
@@ -230,6 +247,19 @@ Audit event names:
 
 Each event includes repository, format, team, policy ID, mode, target display
 name, vulnerability IDs, and exception metadata when present.
+`policy_blocked` also includes `report_url`.
+
+## Trust Reports
+
+Every enforced policy or unsupported-target block creates a new UUID v4 report
+at `GET /trust/reports/{uuid}`. The route does not use admin authentication:
+possession of the unguessable URL grants access until retention expiry.
+Responses disable caching and send restrictive browser security headers.
+
+Reports contain the block context, policy violations, severity counts, and only
+the vulnerabilities relevant to the block. Scanner-provided text is escaped;
+only HTTP and HTTPS references become links. Report-only decisions do not
+create Trust pages. Repeated blocks from cache receive distinct URLs.
 
 ## Yandex Messenger Notifications
 
@@ -261,10 +291,13 @@ active. Supported placeholders:
 {reason}
 {policy_id}
 {vulnerability_ids}
+{report_url}
 {timestamp}
 ```
 
-Unknown placeholders are left unchanged.
+Unknown placeholders are left unchanged. If `{report_url}` is omitted, the
+notifier appends `Report: <url>`. Message truncation always reserves room for
+the complete report URL.
 
 ## Cache
 

@@ -59,6 +59,7 @@ pub(crate) struct RecentDecision {
 	pub(crate) policy_id: Option<String>,
 	pub(crate) reason: String,
 	pub(crate) vulnerability_ids: Vec<String>,
+	pub(crate) report_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -79,6 +80,7 @@ pub(crate) fn record_decision(
 	context: &PolicyContext,
 	outcome: DecisionOutcome,
 	report: &BlockReport,
+	report_url: Option<&str>,
 ) {
 	state.decision_log.push(RecentDecision {
 		timestamp: now_rfc3339(),
@@ -90,5 +92,6 @@ pub(crate) fn record_decision(
 		policy_id: report.policy_id.clone(),
 		reason: report.reason.clone(),
 		vulnerability_ids: vulnerability_ids(report),
+		report_url: report_url.map(str::to_owned),
 	});
 }

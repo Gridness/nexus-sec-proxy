@@ -13,6 +13,7 @@ use crate::env::{
 	DEFAULT_CACHE_ALLOWED_TTL_SECS, DEFAULT_CACHE_BLOCKED_TTL_SECS,
 	DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_OSV_API_URL, DEFAULT_REPOSITORY_FORMAT,
 	DEFAULT_REPOSITORY_NAME, DEFAULT_REQUEST_TIMEOUT_SECS,
+	DEFAULT_TRUST_REPORT_DIR, DEFAULT_TRUST_REPORT_RETENTION_DAYS,
 	DEFAULT_YANDEX_MESSENGER_API_URL, artifact_scanner_env, bool_env,
 	default_artifact_scanner_command, optional_bool_env, optional_string_env,
 	osv_ecosystem_overrides_env, required_string_env_with_fallbacks,
@@ -42,6 +43,9 @@ pub struct AppConfig {
 	pub yandex_messenger_template_file: Option<String>,
 	pub yandex_messenger_api_url: String,
 	pub yandex_messenger_enabled: bool,
+	pub trust_base_url: String,
+	pub trust_report_dir: String,
+	pub trust_report_retention_days: u64,
 	pub log_json: bool,
 	pub fail_open: bool,
 	pub unsupported_target_policy: UnsupportedTargetPolicy,
@@ -137,6 +141,25 @@ impl AppConfig {
 		)?
 		.unwrap_or(yandex_messenger_configured)
 			&& yandex_messenger_configured;
+		let trust_base_url =
+			trust_base_url(&mut lookup, "NEXUS_SEC_PROXY_TRUST_BASE_URL")?;
+		let trust_report_dir = string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_TRUST_REPORT_DIR",
+			DEFAULT_TRUST_REPORT_DIR,
+		);
+		let trust_report_retention_days = u64_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS",
+			DEFAULT_TRUST_REPORT_RETENTION_DAYS,
+		)?;
+		if trust_report_retention_days < 1 {
+			return Err(ConfigError::ValueBelowMinimum {
+				name: "NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS",
+				value: trust_report_retention_days,
+				minimum: 1,
+			});
+		}
 		let log_json =
 			bool_env(&mut lookup, "NEXUS_SEC_PROXY_LOG_JSON", false)?;
 		let fail_open =
@@ -225,6 +248,9 @@ impl AppConfig {
 			yandex_messenger_template_file,
 			yandex_messenger_api_url,
 			yandex_messenger_enabled,
+			trust_base_url,
+			trust_report_dir,
+			trust_report_retention_days,
 			log_json,
 			fail_open,
 			unsupported_target_policy,
@@ -244,4 +270,43 @@ impl AppConfig {
 			policy_set,
 		})
 	}
+}
+
+fn trust_base_url(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<String, ConfigError> {
+	let value = optional_string_env(lookup, name)
+		.ok_or(ConfigError::MissingRequired { name })?;
+	let parsed = url::Url::parse(&value).map_err(|error| {
+		ConfigError::InvalidTrustBaseUrl {
+			name,
+			value: value.clone(),
+			reason: error.to_string(),
+		}
+	})?;
+
+	if !matches!(parsed.scheme(), "http" | "https") {
+		return Err(ConfigError::InvalidTrustBaseUrl {
+			name,
+			value,
+			reason: "scheme must be http or https".to_owned(),
+		});
+	}
+	if parsed.host_str().is_none() || parsed.cannot_be_a_base() {
+		return Err(ConfigError::InvalidTrustBaseUrl {
+			name,
+			value,
+			reason: "URL must include a host".to_owned(),
+		});
+	}
+	if parsed.query().is_some() || parsed.fragment().is_some() {
+		return Err(ConfigError::InvalidTrustBaseUrl {
+			name,
+			value,
+			reason: "query and fragment are not allowed".to_owned(),
+		});
+	}
+
+	Ok(value.trim_end_matches('/').to_owned())
 }
