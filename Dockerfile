@@ -16,13 +16,15 @@ COPY crates/cache/Cargo.toml crates/cache/Cargo.toml
 COPY crates/config/Cargo.toml crates/config/Cargo.toml
 COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
 COPY crates/security/Cargo.toml crates/security/Cargo.toml
+COPY crates/yandex-messenger/Cargo.toml crates/yandex-messenger/Cargo.toml
 
 RUN set -eux; \
-	mkdir -p crates/cache/src crates/config/src crates/proxy/src crates/security/src; \
+	mkdir -p crates/cache/src crates/config/src crates/proxy/src crates/security/src crates/yandex-messenger/src; \
 	printf 'pub fn placeholder() {}\n' > crates/cache/src/lib.rs; \
 	printf 'pub fn placeholder() {}\n' > crates/config/src/lib.rs; \
 	printf 'fn main() {}\n' > crates/proxy/src/main.rs; \
-	printf 'pub fn placeholder() {}\n' > crates/security/src/lib.rs
+	printf 'pub fn placeholder() {}\n' > crates/security/src/lib.rs; \
+	printf 'pub fn placeholder() {}\n' > crates/yandex-messenger/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
 	--mount=type=cache,target=/usr/local/cargo/git \
@@ -79,6 +81,7 @@ RUN set -eux; \
 		/layout/home/nonroot \
 		/layout/var/cache/grype/db \
 		/layout/var/cache/trivy \
+		/layout/var/lib/nexus-sec-proxy/trust-reports \
 		/layout/var/tmp/nexus-sec-proxy; \
 	chown -R 65532:65532 /layout/etc/nexus-sec-proxy /layout/home/nonroot /layout/var
 
@@ -99,6 +102,7 @@ ENV HOME=/home/nonroot \
 	RUST_LOG=nexus_sec_proxy=info \
 	NEXUS_SEC_PROXY_BIND_ADDR=0.0.0.0:3000 \
 	NEXUS_SEC_PROXY_LOG_JSON=false \
+	NEXUS_SEC_PROXY_TRUST_REPORT_DIR=/var/lib/nexus-sec-proxy/trust-reports \
 	NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy \
 	TRIVY_CACHE_DIR=/var/cache/trivy \
 	GRYPE_DB_CACHE_DIR=/var/cache/grype/db

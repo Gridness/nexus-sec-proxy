@@ -37,6 +37,12 @@ pub(crate) async fn proxy_handler(
 			admin_disabled().await
 		};
 	}
+	if uri.path().starts_with("/trust/reports") {
+		return response_with_text(
+			StatusCode::NOT_FOUND,
+			"Trust report not found\n",
+		);
+	}
 
 	if let Some(repository_path) = parse_repository_path(uri.path()) {
 		let catalog = state.repository_catalog();

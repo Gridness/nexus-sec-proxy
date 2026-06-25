@@ -37,6 +37,18 @@ pub enum ConfigError {
 	InvalidArtifactScanner { name: &'static str, value: String },
 	#[error("invalid OSV ecosystem override in {name}: {value}")]
 	InvalidOsvEcosystemOverride { name: &'static str, value: String },
+	#[error("invalid Trust base URL in {name}: {value} ({reason})")]
+	InvalidTrustBaseUrl {
+		name: &'static str,
+		value: String,
+		reason: String,
+	},
+	#[error("{name} must be at least {minimum}, got {value}")]
+	ValueBelowMinimum {
+		name: &'static str,
+		value: u64,
+		minimum: u64,
+	},
 	#[error("missing required environment variable: {name}")]
 	MissingRequired { name: &'static str },
 	#[error("failed to read policy file {path}")]

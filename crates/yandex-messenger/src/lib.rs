@@ -95,7 +95,7 @@ impl YandexMessengerNotifier {
 
 		let request = SendTextRequest {
 			login: notification.login,
-			text: truncate_text(text),
+			text: truncate_text(text, &notification.report_url),
 			payload_id: self.next_payload_id(),
 		};
 		let response = self
@@ -116,12 +116,11 @@ impl YandexMessengerNotifier {
 			bail!("Yandex Messenger returned {status}");
 		}
 
-		if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-			if value.get("ok").and_then(serde_json::Value::as_bool)
+		if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+			&& value.get("ok").and_then(serde_json::Value::as_bool)
 				== Some(false)
-			{
-				bail!("Yandex Messenger returned ok=false");
-			}
+		{
+			bail!("Yandex Messenger returned ok=false");
 		}
 
 		Ok(())
@@ -151,6 +150,7 @@ pub struct BlockNotification {
 	pub reason: String,
 	pub policy_id: Option<String>,
 	pub vulnerability_ids: Vec<String>,
+	pub report_url: String,
 }
 
 impl BlockNotification {
@@ -164,6 +164,7 @@ impl BlockNotification {
 			reason: self.reason.clone(),
 			policy_id: self.policy_id.clone().unwrap_or_default(),
 			vulnerability_ids: self.vulnerability_ids.join(","),
+			report_url: self.report_url.clone(),
 			timestamp,
 		}
 	}
@@ -186,8 +187,18 @@ impl TemplateLoader {
 
 	pub async fn render(&self, context: &TemplateContext) -> Option<String> {
 		let template = self.current_template().await?;
+		let contains_report_url = template.contains("{report_url}");
+		let mut rendered = render_template(&template, context);
 
-		Some(render_template(&template, context))
+		if !contains_report_url {
+			if !rendered.ends_with('\n') && !rendered.is_empty() {
+				rendered.push('\n');
+			}
+			rendered.push_str("Report: ");
+			rendered.push_str(&context.report_url);
+		}
+
+		Some(rendered)
 	}
 
 	async fn current_template(&self) -> Option<String> {
@@ -246,6 +257,7 @@ pub struct TemplateContext {
 	pub reason: String,
 	pub policy_id: String,
 	pub vulnerability_ids: String,
+	pub report_url: String,
 	pub timestamp: String,
 }
 
@@ -289,17 +301,27 @@ fn placeholder_value<'a>(
 		"reason" => Some(&context.reason),
 		"policy_id" => Some(&context.policy_id),
 		"vulnerability_ids" => Some(&context.vulnerability_ids),
+		"report_url" => Some(&context.report_url),
 		"timestamp" => Some(&context.timestamp),
 		_ => None,
 	}
 }
 
-fn truncate_text(text: String) -> String {
+fn truncate_text(text: String, report_url: &str) -> String {
 	if text.chars().count() <= MAX_TEXT_CHARS {
 		return text;
 	}
 
-	text.chars().take(MAX_TEXT_CHARS).collect()
+	let suffix = format!("\nReport: {report_url}");
+	let suffix_chars = suffix.chars().count();
+	if suffix_chars >= MAX_TEXT_CHARS {
+		return suffix.chars().take(MAX_TEXT_CHARS).collect();
+	}
+
+	let prefix_chars = MAX_TEXT_CHARS - suffix_chars;
+	let mut truncated = text.chars().take(prefix_chars).collect::<String>();
+	truncated.push_str(&suffix);
+	truncated
 }
 
 fn now_rfc3339() -> String {
@@ -328,13 +350,13 @@ mod tests {
 	fn renders_known_template_placeholders_and_leaves_unknown_unchanged() {
 		let context = template_context();
 		let rendered = render_template(
-			"{user}/{repository}/{format}/{target}/{reason}/{policy_id}/{vulnerability_ids}/{timestamp}/{unknown}",
+			"{user}/{repository}/{format}/{target}/{reason}/{policy_id}/{vulnerability_ids}/{report_url}/{timestamp}/{unknown}",
 			&context,
 		);
 
 		assert_eq!(
 			rendered,
-			"alice/npm-proxy/npm/npm:left-pad@1.0.0/blocked/default/CVE-1,CVE-2/2026-06-11T00:00:00Z/{unknown}"
+			"alice/npm-proxy/npm/npm:left-pad@1.0.0/blocked/default/CVE-1,CVE-2/https://trust.example.invalid/trust/reports/123/2026-06-11T00:00:00Z/{unknown}"
 		);
 	}
 
@@ -348,14 +370,18 @@ mod tests {
 
 		assert_eq!(
 			loader.render(&context).await.as_deref(),
-			Some("blocked alice")
+			Some(
+				"blocked alice\nReport: https://trust.example.invalid/trust/reports/123"
+			)
 		);
 
 		tokio::time::sleep(Duration::from_millis(5)).await;
 		std::fs::write(&path, "blocked {repository}").unwrap();
 		assert_eq!(
 			loader.render(&context).await.as_deref(),
-			Some("blocked npm-proxy")
+			Some(
+				"blocked npm-proxy\nReport: https://trust.example.invalid/trust/reports/123"
+			)
 		);
 
 		tokio::time::sleep(Duration::from_millis(5)).await;
@@ -363,8 +389,36 @@ mod tests {
 		std::fs::create_dir(&path).unwrap();
 		assert_eq!(
 			loader.render(&context).await.as_deref(),
-			Some("blocked npm-proxy")
+			Some(
+				"blocked npm-proxy\nReport: https://trust.example.invalid/trust/reports/123"
+			)
 		);
+	}
+
+	#[tokio::test]
+	async fn template_can_place_report_url_explicitly() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("message.txt");
+		std::fs::write(&path, "Open {report_url} for {user}").unwrap();
+		let loader = TemplateLoader::new(path);
+
+		assert_eq!(
+			loader.render(&template_context()).await.as_deref(),
+			Some(
+				"Open https://trust.example.invalid/trust/reports/123 for alice"
+			)
+		);
+	}
+
+	#[test]
+	fn oversized_text_always_keeps_complete_report_url() {
+		let report_url = "https://trust.example.invalid/trust/reports/123";
+		let text = format!("{} {report_url}", "x".repeat(MAX_TEXT_CHARS * 2));
+
+		let truncated = truncate_text(text, report_url);
+
+		assert_eq!(truncated.chars().count(), MAX_TEXT_CHARS);
+		assert!(truncated.ends_with(&format!("Report: {report_url}")));
 	}
 
 	#[tokio::test]
@@ -384,6 +438,8 @@ mod tests {
 			reason: "blocked".to_owned(),
 			policy_id: "default".to_owned(),
 			vulnerability_ids: "CVE-1,CVE-2".to_owned(),
+			report_url: "https://trust.example.invalid/trust/reports/123"
+				.to_owned(),
 			timestamp: "2026-06-11T00:00:00Z".to_owned(),
 		}
 	}

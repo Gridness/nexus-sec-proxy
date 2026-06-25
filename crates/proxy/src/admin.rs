@@ -16,9 +16,7 @@ use nexus_sec_proxy_security::{EnforcementMode, PolicyContext, PolicySet};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::catalog::{
-	NexusRepository, RepositoryCatalogSummary, load_repository_catalog,
-};
+use crate::catalog::{NexusRepository, RepositoryCatalogSummary};
 use crate::decisions::RecentDecision;
 use crate::responses::{json_error, response_with_text};
 use crate::scanner_db::{ScannerDbSummary, scanner_db_summaries_from_env};
@@ -29,11 +27,15 @@ pub(crate) struct ImmutableConfigSummary {
 	bind_addr: String,
 	nexus_base_url: String,
 	nexus_username_configured: bool,
+	repository_refresh_interval_secs: u64,
 	yandex_messenger_available: bool,
 	yandex_messenger_enabled: bool,
 	yandex_messenger_token_configured: bool,
 	yandex_messenger_template_file: Option<String>,
 	yandex_messenger_api_url: String,
+	trust_base_url: String,
+	trust_report_dir: String,
+	trust_report_retention_days: u64,
 	legacy_repository_name: String,
 	legacy_repository_format: String,
 	legacy_osv_ecosystem: Option<String>,
@@ -454,30 +456,13 @@ pub(crate) async fn admin_reload_repositories(
 		return *response;
 	}
 
-	let generation = state.repository_catalog().generation + 1;
-	match load_repository_catalog(
-		&state.http_client,
-		&state.nexus_base_url,
-		&state.config,
-		generation,
-	)
-	.await
-	{
-		Ok(catalog) => {
-			let catalog = state.replace_repository_catalog(catalog);
-			info!(
-				generation = catalog.generation,
-				repository_count = catalog.repositories.len(),
-				"repository catalog reloaded"
-			);
-
-			Json(ReloadRepositoriesResponse {
-				reloaded: true,
-				catalog: catalog.summary(),
-				repositories: catalog.response().repositories,
-			})
-			.into_response()
-		}
+	match state.reload_repository_catalog().await {
+		Ok(catalog) => Json(ReloadRepositoriesResponse {
+			reloaded: true,
+			catalog: catalog.summary(),
+			repositories: catalog.response().repositories,
+		})
+		.into_response(),
 		Err(error) => {
 			error!(%error, "repository catalog reload failed");
 			json_error(
@@ -584,6 +569,8 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 		bind_addr: config.bind_addr.to_string(),
 		nexus_base_url: config.nexus_base_url.clone(),
 		nexus_username_configured: config.nexus_username.is_some(),
+		repository_refresh_interval_secs: config
+			.repository_refresh_interval_secs,
 		yandex_messenger_available: cfg!(feature = "yandex-messenger"),
 		yandex_messenger_enabled: cfg!(feature = "yandex-messenger")
 			&& config.yandex_messenger_enabled,
@@ -594,6 +581,9 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 			.yandex_messenger_template_file
 			.clone(),
 		yandex_messenger_api_url: config.yandex_messenger_api_url.clone(),
+		trust_base_url: config.trust_base_url.clone(),
+		trust_report_dir: config.trust_report_dir.clone(),
+		trust_report_retention_days: config.trust_report_retention_days,
 		legacy_repository_name: config.repository_name.clone(),
 		legacy_repository_format: config.repository_format.clone(),
 		legacy_osv_ecosystem: config.osv_ecosystem.clone(),

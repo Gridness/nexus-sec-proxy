@@ -4,6 +4,17 @@ use std::io::Write;
 use super::*;
 use nexus_sec_proxy_security::Severity;
 
+fn config_from_env(
+	env: &BTreeMap<&str, &str>,
+) -> Result<AppConfig, ConfigError> {
+	AppConfig::from_env_vars(|name| {
+		env.get(name).map(ToString::to_string).or_else(|| {
+			(name == "NEXUS_SEC_PROXY_TRUST_BASE_URL")
+				.then(|| "https://proxy.example.invalid".to_owned())
+		})
+	})
+}
+
 #[test]
 fn default_config_uses_strict_high_and_critical_policy() {
 	let env = BTreeMap::from([(
@@ -11,9 +22,7 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		"https://repo.example.invalid",
 	)]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(
 		config.security_policy.minimum_blocking_severity,
@@ -22,6 +31,7 @@ fn default_config_uses_strict_high_and_critical_policy() {
 	assert_eq!(config.nexus_base_url, "https://repo.example.invalid");
 	assert_eq!(config.upstream_base_url, config.nexus_base_url);
 	assert_eq!(config.repository_name, "default");
+	assert_eq!(config.repository_refresh_interval_secs, 60);
 	assert_eq!(config.policy_file, None);
 	assert_eq!(config.admin_token, None);
 	assert_eq!(config.yandex_messenger_token, None);
@@ -30,6 +40,12 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		config.yandex_messenger_api_url,
 		"https://botapi.messenger.yandex.net"
 	);
+	assert_eq!(config.trust_base_url, "https://proxy.example.invalid");
+	assert_eq!(
+		config.trust_report_dir,
+		"/var/lib/nexus-sec-proxy/trust-reports"
+	);
+	assert_eq!(config.trust_report_retention_days, 30);
 	assert!(!config.yandex_messenger_enabled);
 	assert!(!config.log_json);
 	assert_eq!(config.policy_set.default_policy.id, "default");
@@ -45,6 +61,41 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		config.security_policy.effective_limit(Severity::Critical),
 		Some(0)
 	);
+}
+
+#[test]
+fn parses_repository_refresh_interval() {
+	for (value, expected) in [("15", 15), ("0", 0)] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS", value),
+		]);
+
+		let config = config_from_env(&env).unwrap();
+
+		assert_eq!(config.repository_refresh_interval_secs, expected);
+	}
+
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS", "soon"),
+	]);
+
+	let error = config_from_env(&env).unwrap_err();
+
+	assert!(matches!(
+		error,
+		ConfigError::InvalidUnsignedInt {
+			name: "NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS",
+			..
+		}
+	));
 }
 
 #[test]
@@ -65,9 +116,7 @@ fn parses_yandex_messenger_config_and_effective_enabled_state() {
 		),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.yandex_messenger_token.as_deref(), Some("token"));
 	assert_eq!(
@@ -93,9 +142,7 @@ fn parses_yandex_messenger_config_and_effective_enabled_state() {
 		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "false"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert!(!config.yandex_messenger_enabled);
 
@@ -107,9 +154,7 @@ fn parses_yandex_messenger_config_and_effective_enabled_state() {
 		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert!(!config.yandex_messenger_enabled);
 }
@@ -130,9 +175,7 @@ fn yandex_messenger_token_is_redacted_from_serialized_config() {
 		),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 	let value = serde_json::to_value(config).unwrap();
 
 	assert!(value.get("admin_token").is_none());
@@ -163,9 +206,7 @@ fn parses_policy_controls_from_env() {
 		("NEXUS_SEC_PROXY_MAX_CRITICAL_VULNERABILITIES", "0"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(
 		config.security_policy.minimum_blocking_severity,
@@ -207,9 +248,7 @@ fn parses_admin_token_and_treats_empty_as_disabled() {
 		("NEXUS_SEC_PROXY_ADMIN_TOKEN", " secret-token "),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.admin_token.as_deref(), Some("secret-token"));
 
@@ -221,9 +260,7 @@ fn parses_admin_token_and_treats_empty_as_disabled() {
 		("NEXUS_SEC_PROXY_ADMIN_TOKEN", "   "),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.admin_token, None);
 }
@@ -253,9 +290,7 @@ fn loads_policy_file_and_ignores_legacy_policy_env() {
 		("NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY", "LOW"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.repository_name, "npm-internal");
 	assert_eq!(config.policy_file.as_deref(), Some(path.as_str()));
@@ -284,9 +319,7 @@ fn parses_artifact_scanner_config() {
 		("NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR", "/var/tmp/nsp"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.artifact_scanner, ArtifactScannerKind::Trivy);
 	assert_eq!(config.artifact_scanner_command, "/usr/bin/trivy");
@@ -308,9 +341,7 @@ fn rejects_invalid_severity() {
 		("NEXUS_SEC_PROXY_MINIMUM_BLOCKING_SEVERITY", "extreme"),
 	]);
 
-	let error =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap_err();
+	let error = config_from_env(&env).unwrap_err();
 
 	assert!(matches!(error, ConfigError::InvalidSeverity { .. }));
 }
@@ -320,6 +351,83 @@ fn requires_generic_upstream_base_url() {
 	let error = AppConfig::from_env_vars(|_| None).unwrap_err();
 
 	assert!(matches!(error, ConfigError::MissingRequired { .. }));
+
+	let env = BTreeMap::from([(
+		"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+		"https://repo.example.invalid",
+	)]);
+	let error =
+		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
+			.unwrap_err();
+	assert!(matches!(
+		error,
+		ConfigError::MissingRequired {
+			name: "NEXUS_SEC_PROXY_TRUST_BASE_URL"
+		}
+	));
+}
+
+#[test]
+fn validates_trust_report_configuration() {
+	let valid = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		(
+			"NEXUS_SEC_PROXY_TRUST_BASE_URL",
+			"https://proxy.example.invalid/base/",
+		),
+		(
+			"NEXUS_SEC_PROXY_TRUST_REPORT_DIR",
+			"/srv/shared/trust-reports",
+		),
+		("NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS", "7"),
+	]);
+	let config = AppConfig::from_env_vars(|name| {
+		valid.get(name).map(ToString::to_string)
+	})
+	.unwrap();
+	assert_eq!(config.trust_base_url, "https://proxy.example.invalid/base");
+	assert_eq!(config.trust_report_dir, "/srv/shared/trust-reports");
+	assert_eq!(config.trust_report_retention_days, 7);
+
+	for invalid_url in [
+		"ftp://proxy.example.invalid",
+		"https://proxy.example.invalid/path?token=secret",
+		"https://proxy.example.invalid/path#fragment",
+		"not a URL",
+	] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_TRUST_BASE_URL", invalid_url),
+		]);
+		let error = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap_err();
+		assert!(matches!(error, ConfigError::InvalidTrustBaseUrl { .. }));
+	}
+
+	let zero_retention = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		(
+			"NEXUS_SEC_PROXY_TRUST_BASE_URL",
+			"https://proxy.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS", "0"),
+	]);
+	let error = AppConfig::from_env_vars(|name| {
+		zero_retention.get(name).map(ToString::to_string)
+	})
+	.unwrap_err();
+	assert!(matches!(error, ConfigError::ValueBelowMinimum { .. }));
 }
 
 #[test]
@@ -335,9 +443,7 @@ fn prefers_nexus_base_url_and_accepts_legacy_upstream_fallbacks() {
 		),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.nexus_base_url, "https://nexus.example.invalid");
 	assert_eq!(config.upstream_base_url, config.nexus_base_url);
@@ -347,9 +453,7 @@ fn prefers_nexus_base_url_and_accepts_legacy_upstream_fallbacks() {
 		"https://oldest.example.invalid",
 	)]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.nexus_base_url, "https://oldest.example.invalid");
 }
@@ -369,9 +473,7 @@ fn parses_repository_osv_ecosystem_overrides_and_nexus_auth() {
 		("NEXUS_SEC_PROXY_NEXUS_PASSWORD", " secret "),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(
 		config.osv_ecosystem_overrides.get("apt-proxy"),
@@ -395,9 +497,7 @@ fn rejects_malformed_repository_osv_ecosystem_override() {
 		("NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES", " apt-proxy "),
 	]);
 
-	let error =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap_err();
+	let error = config_from_env(&env).unwrap_err();
 
 	assert!(matches!(
 		error,
@@ -415,9 +515,7 @@ fn derives_osv_ecosystem_from_repository_format() {
 		("NEXUS_SEC_PROXY_REPOSITORY_FORMAT", "maven2"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.repository_format, "maven2");
 	assert_eq!(config.osv_ecosystem.as_deref(), Some("Maven"));
@@ -434,9 +532,7 @@ fn explicit_osv_ecosystem_overrides_format_mapping() {
 		("NEXUS_SEC_PROXY_OSV_ECOSYSTEM", "PyPI"),
 	]);
 
-	let config =
-		AppConfig::from_env_vars(|name| env.get(name).map(ToString::to_string))
-			.unwrap();
+	let config = config_from_env(&env).unwrap();
 
 	assert_eq!(config.repository_format, "raw");
 	assert_eq!(config.osv_ecosystem.as_deref(), Some("PyPI"));

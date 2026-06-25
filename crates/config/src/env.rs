@@ -11,6 +11,7 @@ pub(crate) const DEFAULT_YANDEX_MESSENGER_API_URL: &str =
 	"https://botapi.messenger.yandex.net";
 pub(crate) const DEFAULT_REPOSITORY_NAME: &str = "default";
 pub(crate) const DEFAULT_REPOSITORY_FORMAT: &str = "generic";
+pub(crate) const DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS: u64 = 60;
 pub(crate) const DEFAULT_CACHE_ALLOWED_TTL_SECS: u64 = 24 * 60 * 60;
 pub(crate) const DEFAULT_CACHE_BLOCKED_TTL_SECS: u64 = 60 * 60;
 pub(crate) const DEFAULT_CACHE_MAX_CAPACITY: u64 = 100_000;
@@ -18,6 +19,9 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_TIMEOUT_SECS: u64 = 5 * 60;
 pub(crate) const DEFAULT_ARTIFACT_SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_CONCURRENCY: u64 = 2;
+pub(crate) const DEFAULT_TRUST_REPORT_DIR: &str =
+	"/var/lib/nexus-sec-proxy/trust-reports";
+pub(crate) const DEFAULT_TRUST_REPORT_RETENTION_DAYS: u64 = 30;
 pub(crate) fn security_policy_env(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 ) -> Result<SecurityPolicy, ConfigError> {
