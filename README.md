@@ -71,6 +71,7 @@ Common:
 NEXUS_SEC_PROXY_BIND_ADDR=127.0.0.1:3000
 NEXUS_SEC_PROXY_NEXUS_USERNAME=
 NEXUS_SEC_PROXY_NEXUS_PASSWORD=
+NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS=60
 NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES=apt-proxy=Ubuntu OS,yum-proxy=Rocky Linux
 NEXUS_SEC_PROXY_OSV_API_URL=https://api.osv.dev/v1/query
 NEXUS_SEC_PROXY_POLICY_FILE=/etc/nexus-sec-proxy/policy.toml
@@ -94,6 +95,10 @@ Configuration notes:
 - `NEXUS_SEC_PROXY_NEXUS_USERNAME` and
   `NEXUS_SEC_PROXY_NEXUS_PASSWORD` are used only for repository catalog
   discovery.
+- `NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS` refreshes the repository
+  catalog independently in each proxy replica. The default is `60`; set it to
+  `0` to disable automatic refresh. Failed refreshes keep the last valid
+  catalog.
 - Repository names and formats come from Nexus. Legacy
   `NEXUS_SEC_PROXY_REPOSITORY_NAME`, `NEXUS_SEC_PROXY_REPOSITORY_FORMAT`, and
   `NEXUS_SEC_PROXY_OSV_ECOSYSTEM` are still parsed for compatibility helpers,
@@ -122,7 +127,8 @@ Configuration notes:
   `false` to return `503 Service Unavailable` on scanner failures.
 - `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
   be checked before Nexus. Set it to `block` to deny them before Nexus.
-- Repository catalog load failure or an empty catalog fails startup.
+- The initial repository catalog load is mandatory. A load failure or empty
+  catalog fails startup.
 
 ## Policy Configuration
 

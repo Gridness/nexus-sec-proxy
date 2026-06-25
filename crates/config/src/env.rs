@@ -11,6 +11,7 @@ pub(crate) const DEFAULT_YANDEX_MESSENGER_API_URL: &str =
 	"https://botapi.messenger.yandex.net";
 pub(crate) const DEFAULT_REPOSITORY_NAME: &str = "default";
 pub(crate) const DEFAULT_REPOSITORY_FORMAT: &str = "generic";
+pub(crate) const DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS: u64 = 60;
 pub(crate) const DEFAULT_CACHE_ALLOWED_TTL_SECS: u64 = 24 * 60 * 60;
 pub(crate) const DEFAULT_CACHE_BLOCKED_TTL_SECS: u64 = 60 * 60;
 pub(crate) const DEFAULT_CACHE_MAX_CAPACITY: u64 = 100_000;

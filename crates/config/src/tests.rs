@@ -31,6 +31,7 @@ fn default_config_uses_strict_high_and_critical_policy() {
 	assert_eq!(config.nexus_base_url, "https://repo.example.invalid");
 	assert_eq!(config.upstream_base_url, config.nexus_base_url);
 	assert_eq!(config.repository_name, "default");
+	assert_eq!(config.repository_refresh_interval_secs, 60);
 	assert_eq!(config.policy_file, None);
 	assert_eq!(config.admin_token, None);
 	assert_eq!(config.yandex_messenger_token, None);
@@ -60,6 +61,41 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		config.security_policy.effective_limit(Severity::Critical),
 		Some(0)
 	);
+}
+
+#[test]
+fn parses_repository_refresh_interval() {
+	for (value, expected) in [("15", 15), ("0", 0)] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS", value),
+		]);
+
+		let config = config_from_env(&env).unwrap();
+
+		assert_eq!(config.repository_refresh_interval_secs, expected);
+	}
+
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS", "soon"),
+	]);
+
+	let error = config_from_env(&env).unwrap_err();
+
+	assert!(matches!(
+		error,
+		ConfigError::InvalidUnsignedInt {
+			name: "NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS",
+			..
+		}
+	));
 }
 
 #[test]

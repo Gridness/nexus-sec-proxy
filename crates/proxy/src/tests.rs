@@ -21,7 +21,7 @@ use nexus_sec_proxy_config::{
 	AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy,
 };
 use nexus_sec_proxy_security::{OsvClient, PolicySet, ScanTarget};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -37,6 +37,21 @@ struct OsvMockState {
 	request_count: Arc<AtomicUsize>,
 	response: Value,
 	status: StatusCode,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogMockResponse {
+	status: StatusCode,
+	body: String,
+}
+
+#[derive(Clone)]
+struct CatalogMockState {
+	response: Arc<Mutex<CatalogMockResponse>>,
+	request_count: Arc<AtomicUsize>,
+	active_requests: Arc<AtomicUsize>,
+	max_concurrent_requests: Arc<AtomicUsize>,
+	delay: Duration,
 }
 
 #[cfg(feature = "yandex-messenger")]
@@ -55,6 +70,57 @@ async fn spawn_server(app: Router) -> Url {
 	});
 
 	Url::parse(&format!("http://{addr}")).unwrap()
+}
+
+fn catalog_mock(body: Value, delay: Duration) -> CatalogMockState {
+	CatalogMockState {
+		response: Arc::new(Mutex::new(CatalogMockResponse {
+			status: StatusCode::OK,
+			body: body.to_string(),
+		})),
+		request_count: Arc::new(AtomicUsize::new(0)),
+		active_requests: Arc::new(AtomicUsize::new(0)),
+		max_concurrent_requests: Arc::new(AtomicUsize::new(0)),
+		delay,
+	}
+}
+
+fn set_catalog_response(
+	state: &CatalogMockState,
+	status: StatusCode,
+	body: impl Into<String>,
+) {
+	*state.response.lock().unwrap() = CatalogMockResponse {
+		status,
+		body: body.into(),
+	};
+}
+
+async fn wait_for_request_count(state: &CatalogMockState, expected: usize) {
+	tokio::time::timeout(Duration::from_secs(2), async {
+		while state.request_count.load(Ordering::SeqCst) < expected {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.unwrap();
+}
+
+async fn wait_for_catalog(
+	state: &AppState,
+	mut predicate: impl FnMut(&RepositoryCatalog) -> bool,
+) {
+	tokio::time::timeout(Duration::from_secs(2), async {
+		loop {
+			let catalog = state.repository_catalog();
+			if predicate(&catalog) {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.unwrap();
 }
 
 async fn record_nexus_request(
@@ -86,6 +152,26 @@ async fn mock_osv(
 	state.request_count.fetch_add(1, Ordering::SeqCst);
 
 	(state.status, Json(state.response)).into_response()
+}
+
+async fn mock_catalog(State(state): State<CatalogMockState>) -> Response<Body> {
+	state.request_count.fetch_add(1, Ordering::SeqCst);
+	let active = state.active_requests.fetch_add(1, Ordering::SeqCst) + 1;
+	state
+		.max_concurrent_requests
+		.fetch_max(active, Ordering::SeqCst);
+
+	if !state.delay.is_zero() {
+		tokio::time::sleep(state.delay).await;
+	}
+
+	state.active_requests.fetch_sub(1, Ordering::SeqCst);
+	let response = state.response.lock().unwrap().clone();
+	Response::builder()
+		.status(response.status)
+		.header(CONTENT_TYPE, "application/json")
+		.body(Body::from(response.body))
+		.unwrap()
 }
 
 #[cfg(feature = "yandex-messenger")]
@@ -269,6 +355,276 @@ async fn repository_catalog_reports_auth_malformed_and_empty_failures() {
 		.await
 		.unwrap_err();
 	assert!(error.to_string().contains("catalog is empty"));
+}
+
+#[tokio::test]
+async fn repository_catalog_refresh_failures_preserve_last_valid_catalog() {
+	let mock = catalog_mock(json!([]), Duration::ZERO);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(mock.clone()),
+	)
+	.await;
+	let policy_set = PolicySet::default();
+	let config = test_config(
+		Some("secret"),
+		None,
+		policy_set.clone(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	let state = test_state_from_config(
+		config,
+		policy_set,
+		None,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+
+	set_catalog_response(
+		&mock,
+		StatusCode::BAD_GATEWAY,
+		"upstream unavailable",
+	);
+	let response = build_app(state.clone())
+		.oneshot(
+			Request::builder()
+				.method(Method::POST)
+				.uri("/admin/api/repositories/reload")
+				.header(AUTHORIZATION, "Bearer secret")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+	assert_eq!(state.repository_catalog().generation, 1);
+	assert!(state.repository_catalog().get("npm-proxy").is_some());
+
+	set_catalog_response(&mock, StatusCode::OK, "not json");
+	assert!(state.reload_repository_catalog().await.is_err());
+	assert_eq!(state.repository_catalog().generation, 1);
+	assert!(state.repository_catalog().get("npm-proxy").is_some());
+
+	set_catalog_response(&mock, StatusCode::OK, "[]");
+	assert!(state.reload_repository_catalog().await.is_err());
+	assert_eq!(state.repository_catalog().generation, 1);
+	assert!(state.repository_catalog().get("npm-proxy").is_some());
+}
+
+#[tokio::test]
+async fn periodic_repository_refresh_adds_modifies_and_deletes_repositories() {
+	let mock = catalog_mock(
+		json!([
+			{
+				"name": "npm-proxy",
+				"format": "npm",
+				"type": "proxy",
+				"online": false
+			},
+			{
+				"name": "pypi-proxy",
+				"format": "pypi",
+				"type": "proxy",
+				"online": true
+			}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(mock.clone()),
+	)
+	.await;
+	let policy_set = PolicySet::default();
+	let config = test_config(
+		None,
+		None,
+		policy_set.clone(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	let state = test_state_from_config(
+		config,
+		policy_set,
+		None,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let cancellation = CancellationToken::new();
+	let task = spawn_repository_catalog_refresh_with_interval(
+		state.clone(),
+		Duration::from_millis(100),
+		cancellation.clone(),
+	);
+
+	tokio::time::sleep(Duration::from_millis(30)).await;
+	assert_eq!(mock.request_count.load(Ordering::SeqCst), 0);
+
+	wait_for_catalog(&state, |catalog| {
+		catalog.generation >= 2 && catalog.get("pypi-proxy").is_some()
+	})
+	.await;
+	assert_eq!(
+		state.repository_catalog().get("npm-proxy").unwrap().online,
+		Some(false)
+	);
+
+	set_catalog_response(
+		&mock,
+		StatusCode::OK,
+		json!([
+			{
+				"name": "pypi-proxy",
+				"format": "raw",
+				"type": "hosted",
+				"online": false
+			}
+		])
+		.to_string(),
+	);
+	wait_for_catalog(&state, |catalog| {
+		catalog.generation >= 3
+			&& catalog.get("npm-proxy").is_none()
+			&& catalog
+				.get("pypi-proxy")
+				.is_some_and(|repository| repository.format == "raw")
+	})
+	.await;
+
+	cancellation.cancel();
+	task.await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_and_background_repository_reloads_are_serialized() {
+	let mock = catalog_mock(
+		json!([
+			{
+				"name": "npm-proxy",
+				"format": "npm",
+				"type": "proxy"
+			}
+		]),
+		Duration::from_millis(50),
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(mock.clone()),
+	)
+	.await;
+	let policy_set = PolicySet::default();
+	let config = test_config(
+		Some("secret"),
+		None,
+		policy_set.clone(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	let state = test_state_from_config(
+		config,
+		policy_set,
+		None,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let background = tokio::spawn({
+		let state = state.clone();
+		async move { state.reload_repository_catalog().await }
+	});
+	wait_for_request_count(&mock, 1).await;
+
+	let response = build_app(state.clone())
+		.oneshot(
+			Request::builder()
+				.method(Method::POST)
+				.uri("/admin/api/repositories/reload")
+				.header(AUTHORIZATION, "Bearer secret")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	background.await.unwrap().unwrap();
+	assert_eq!(mock.request_count.load(Ordering::SeqCst), 2);
+	assert_eq!(mock.max_concurrent_requests.load(Ordering::SeqCst), 1);
+	assert_eq!(state.repository_catalog().generation, 3);
+}
+
+#[tokio::test]
+async fn repository_refresh_can_be_disabled_and_cancelled() {
+	let mock = catalog_mock(
+		json!([
+			{
+				"name": "npm-proxy",
+				"format": "npm",
+				"type": "proxy"
+			}
+		]),
+		Duration::from_secs(60),
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(mock.clone()),
+	)
+	.await;
+	let policy_set = PolicySet::default();
+	let mut config = test_config(
+		None,
+		None,
+		policy_set.clone(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.repository_refresh_interval_secs = 0;
+	let state = test_state_from_config(
+		config,
+		policy_set,
+		None,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let disabled_cancellation = CancellationToken::new();
+
+	assert!(
+		spawn_repository_catalog_refresh(state.clone(), disabled_cancellation)
+			.is_none()
+	);
+	tokio::time::sleep(Duration::from_millis(30)).await;
+	assert_eq!(mock.request_count.load(Ordering::SeqCst), 0);
+
+	let idle_cancellation = CancellationToken::new();
+	let idle_task = spawn_repository_catalog_refresh_with_interval(
+		state.clone(),
+		Duration::from_secs(60),
+		idle_cancellation.clone(),
+	);
+	idle_cancellation.cancel();
+	tokio::time::timeout(Duration::from_millis(200), idle_task)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(mock.request_count.load(Ordering::SeqCst), 0);
+
+	let active_cancellation = CancellationToken::new();
+	let active_task = spawn_repository_catalog_refresh_with_interval(
+		state.clone(),
+		Duration::from_millis(10),
+		active_cancellation.clone(),
+	);
+	wait_for_request_count(&mock, 1).await;
+	active_cancellation.cancel();
+	tokio::time::timeout(Duration::from_millis(200), active_task)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(state.repository_catalog().generation, 1);
 }
 
 #[test]
@@ -1117,6 +1473,7 @@ async fn admin_status_reports_yandex_config_without_token() {
 		immutable_config["yandex_messenger_api_url"],
 		"https://messenger.example.invalid"
 	);
+	assert_eq!(immutable_config["repository_refresh_interval_secs"], 60);
 	assert!(!body.to_string().contains("bot-secret"));
 }
 
@@ -1687,6 +2044,7 @@ fn test_config(
 		osv_ecosystem_overrides: Default::default(),
 		nexus_username: None,
 		nexus_password: None,
+		repository_refresh_interval_secs: 60,
 		osv_api_url: osv_api_url.to_owned(),
 		policy_file,
 		admin_token: admin_token.map(str::to_owned),
@@ -1784,6 +2142,7 @@ fn test_state_from_config(
 		repository_catalog: Arc::new(RwLock::new(Arc::new(
 			test_repository_catalog(repositories),
 		))),
+		repository_catalog_reload: Arc::new(AsyncMutex::new(())),
 		decision_log: DecisionLog::new(100),
 		report_store: {
 			let directory = tempfile::tempdir().unwrap().keep();

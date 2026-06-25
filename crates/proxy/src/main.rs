@@ -25,8 +25,11 @@ use nexus_sec_proxy_security::OsvClient;
 use nexus_sec_proxy_yandex_messenger::{
 	YandexMessengerConfig, YandexMessengerNotifier,
 };
-use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use url::Url;
 
 use crate::admin::{
@@ -126,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
 		artifact_scanner_semaphore,
 		active_policy,
 		repository_catalog: Arc::new(RwLock::new(Arc::new(repository_catalog))),
+		repository_catalog_reload: Arc::new(Mutex::new(())),
 		decision_log: DecisionLog::new(100),
 		report_store,
 		started_at,
@@ -138,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
 		nexus_base_url = %state.config.nexus_base_url,
 		repository_count = repository_catalog.repositories.len(),
 		repository_catalog_generation = repository_catalog.generation,
+		repository_refresh_interval_secs =
+			state.config.repository_refresh_interval_secs,
 		osv_ecosystem = ?state.config.osv_ecosystem,
 		osv_ecosystem_overrides = ?state.config.osv_ecosystem_overrides,
 		osv_api_url = %state.config.osv_api_url,
@@ -154,15 +160,29 @@ async fn main() -> anyhow::Result<()> {
 		"starting nexus security proxy"
 	);
 
-	let app = build_app(state);
+	let app = build_app(Arc::clone(&state));
 	let listener = tokio::net::TcpListener::bind(bind_addr)
 		.await
 		.with_context(|| format!("failed to bind {bind_addr}"))?;
+	let cancellation = CancellationToken::new();
+	let repository_refresh_task =
+		spawn_repository_catalog_refresh(state, cancellation.clone());
 
-	axum::serve(listener, app)
-		.with_graceful_shutdown(shutdown_signal())
-		.await
-		.context("server failed")?;
+	let server_result = axum::serve(listener, app)
+		.with_graceful_shutdown({
+			let cancellation = cancellation.clone();
+			async move {
+				shutdown_signal().await;
+				cancellation.cancel();
+			}
+		})
+		.await;
+	cancellation.cancel();
+	if let Some(task) = repository_refresh_task {
+		task.await
+			.context("repository catalog refresh task failed")?;
+	}
+	server_result.context("server failed")?;
 
 	Ok(())
 }
@@ -216,6 +236,58 @@ fn build_app(state: Arc<AppState>) -> Router {
 
 async fn healthz() -> &'static str {
 	"ok\n"
+}
+
+fn spawn_repository_catalog_refresh(
+	state: Arc<AppState>,
+	cancellation: CancellationToken,
+) -> Option<JoinHandle<()>> {
+	let interval_secs = state.config.repository_refresh_interval_secs;
+	if interval_secs == 0 {
+		info!("automatic repository catalog refresh disabled");
+		return None;
+	}
+
+	Some(spawn_repository_catalog_refresh_with_interval(
+		state,
+		Duration::from_secs(interval_secs),
+		cancellation,
+	))
+}
+
+fn spawn_repository_catalog_refresh_with_interval(
+	state: Arc<AppState>,
+	interval: Duration,
+	cancellation: CancellationToken,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		let mut ticker = tokio::time::interval_at(
+			tokio::time::Instant::now() + interval,
+			interval,
+		);
+		ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+		loop {
+			tokio::select! {
+				biased;
+				() = cancellation.cancelled() => break,
+				_ = ticker.tick() => {
+					tokio::select! {
+						biased;
+						() = cancellation.cancelled() => break,
+						result = state.reload_repository_catalog() => {
+							if let Err(error) = result {
+								warn!(
+									%error,
+									"background repository catalog refresh failed"
+								);
+							}
+						}
+					}
+				}
+			}
+		}
+	})
 }
 
 async fn shutdown_signal() {

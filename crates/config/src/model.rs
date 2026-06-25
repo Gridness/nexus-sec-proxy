@@ -12,12 +12,13 @@ use crate::env::{
 	DEFAULT_ARTIFACT_SCANNER_TIMEOUT_SECS, DEFAULT_BIND_ADDR,
 	DEFAULT_CACHE_ALLOWED_TTL_SECS, DEFAULT_CACHE_BLOCKED_TTL_SECS,
 	DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_OSV_API_URL, DEFAULT_REPOSITORY_FORMAT,
-	DEFAULT_REPOSITORY_NAME, DEFAULT_REQUEST_TIMEOUT_SECS,
-	DEFAULT_TRUST_REPORT_DIR, DEFAULT_TRUST_REPORT_RETENTION_DAYS,
-	DEFAULT_YANDEX_MESSENGER_API_URL, artifact_scanner_env, bool_env,
-	default_artifact_scanner_command, optional_bool_env, optional_string_env,
-	osv_ecosystem_overrides_env, required_string_env_with_fallbacks,
-	socket_addr_env, string_env, u64_env, unsupported_target_policy_env,
+	DEFAULT_REPOSITORY_NAME, DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS,
+	DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TRUST_REPORT_DIR,
+	DEFAULT_TRUST_REPORT_RETENTION_DAYS, DEFAULT_YANDEX_MESSENGER_API_URL,
+	artifact_scanner_env, bool_env, default_artifact_scanner_command,
+	optional_bool_env, optional_string_env, osv_ecosystem_overrides_env,
+	required_string_env_with_fallbacks, socket_addr_env, string_env, u64_env,
+	unsupported_target_policy_env,
 };
 use crate::policy_file::load_policy;
 use crate::{ArtifactScannerKind, ConfigError, UnsupportedTargetPolicy};
@@ -34,6 +35,7 @@ pub struct AppConfig {
 	pub nexus_username: Option<String>,
 	#[serde(skip_serializing)]
 	pub nexus_password: Option<String>,
+	pub repository_refresh_interval_secs: u64,
 	pub osv_api_url: String,
 	pub policy_file: Option<String>,
 	#[serde(skip_serializing)]
@@ -111,6 +113,11 @@ impl AppConfig {
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_USERNAME");
 		let nexus_password =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_PASSWORD");
+		let repository_refresh_interval_secs = u64_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS",
+			DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS,
+		)?;
 		let osv_api_url = string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_OSV_API_URL",
@@ -241,6 +248,7 @@ impl AppConfig {
 			osv_ecosystem_overrides,
 			nexus_username,
 			nexus_password,
+			repository_refresh_interval_secs,
 			osv_api_url,
 			policy_file,
 			admin_token,

@@ -9,11 +9,11 @@ use nexus_sec_proxy_security::{
 #[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::YandexMessengerNotifier;
 use serde::Serialize;
-use tokio::sync::Semaphore;
-use tracing::error;
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, error, info};
 use url::Url;
 
-use crate::catalog::RepositoryCatalog;
+use crate::catalog::{RepositoryCatalog, load_repository_catalog};
 use crate::decisions::DecisionLog;
 use crate::time_utils::now_rfc3339;
 use crate::trust_reports::ReportStore;
@@ -31,6 +31,7 @@ pub(crate) struct AppState {
 	pub(crate) artifact_scanner_semaphore: Arc<Semaphore>,
 	pub(crate) active_policy: Arc<RwLock<Arc<ActivePolicy>>>,
 	pub(crate) repository_catalog: Arc<RwLock<Arc<RepositoryCatalog>>>,
+	pub(crate) repository_catalog_reload: Arc<Mutex<()>>,
 	pub(crate) decision_log: DecisionLog,
 	pub(crate) report_store: ReportStore,
 	pub(crate) started_at: Instant,
@@ -109,6 +110,42 @@ impl AppState {
 		}
 
 		catalog
+	}
+
+	pub(crate) async fn reload_repository_catalog(
+		&self,
+	) -> anyhow::Result<Arc<RepositoryCatalog>> {
+		let _reload = self.repository_catalog_reload.lock().await;
+		let current = self.repository_catalog();
+		let generation =
+			current.generation.checked_add(1).ok_or_else(|| {
+				anyhow::anyhow!("repository catalog generation overflow")
+			})?;
+		let next = load_repository_catalog(
+			&self.http_client,
+			&self.nexus_base_url,
+			&self.config,
+			generation,
+		)
+		.await?;
+		let changed = current.repositories != next.repositories;
+		let catalog = self.replace_repository_catalog(next);
+
+		if changed {
+			info!(
+				generation = catalog.generation,
+				repository_count = catalog.repositories.len(),
+				"repository catalog changed"
+			);
+		} else {
+			debug!(
+				generation = catalog.generation,
+				repository_count = catalog.repositories.len(),
+				"repository catalog refresh completed without changes"
+			);
+		}
+
+		Ok(catalog)
 	}
 }
 

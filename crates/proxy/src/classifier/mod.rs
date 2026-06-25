@@ -520,6 +520,7 @@ mod tests {
 			osv_ecosystem_overrides: Default::default(),
 			nexus_username: None,
 			nexus_password: None,
+			repository_refresh_interval_secs: 60,
 			osv_api_url: "https://api.osv.dev/v1/query".to_owned(),
 			policy_file: None,
 			admin_token: None,
