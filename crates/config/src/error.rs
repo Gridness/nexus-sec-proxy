@@ -33,12 +33,24 @@ pub enum ConfigError {
 	},
 	#[error("invalid unsupported target policy in {name}: {value}")]
 	InvalidUnsupportedTargetPolicy { name: &'static str, value: String },
-	#[error("invalid artifact scanner in {name}: {value}")]
-	InvalidArtifactScanner { name: &'static str, value: String },
+	#[error(
+		"invalid artifact scanner format map in {name}: {value} ({reason})"
+	)]
+	InvalidArtifactScannerFormatMap {
+		name: &'static str,
+		value: String,
+		reason: String,
+	},
 	#[error("invalid OSV ecosystem override in {name}: {value}")]
 	InvalidOsvEcosystemOverride { name: &'static str, value: String },
 	#[error("invalid Trust base URL in {name}: {value} ({reason})")]
 	InvalidTrustBaseUrl {
+		name: &'static str,
+		value: String,
+		reason: String,
+	},
+	#[error("invalid Docker registry base URL in {name}: {value} ({reason})")]
+	InvalidDockerRegistryBaseUrl {
 		name: &'static str,
 		value: String,
 		reason: String,

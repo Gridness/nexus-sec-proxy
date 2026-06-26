@@ -266,9 +266,7 @@ fn is_probable_artifact(file: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use axum::http::Uri;
-	use nexus_sec_proxy_config::{
-		AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy,
-	};
+	use nexus_sec_proxy_config::{AppConfig, UnsupportedTargetPolicy};
 	use nexus_sec_proxy_security::{
 		PackageIdentity, PolicySet, SecurityPolicy,
 	};
@@ -331,19 +329,13 @@ mod tests {
 	}
 
 	#[test]
-	fn classifies_docker_blob_as_artifact() {
+	fn docker_blob_is_proxy_only_for_legacy_repository_path() {
 		let config = config("docker", None);
 		let uri = uri("/v2/library/alpine/blobs/sha256:abc123");
 
 		let classification = classify_request(&config, &Method::GET, &uri);
 
-		match classification {
-			RequestClassification::Scan(ScanTarget::Artifact(artifact)) => {
-				assert_eq!(artifact.source_format, "docker");
-				assert_eq!(artifact.digest.as_deref(), Some("sha256:abc123"));
-			}
-			other => panic!("unexpected classification: {other:?}"),
-		}
+		assert_eq!(classification, RequestClassification::ProxyOnly);
 	}
 
 	#[test]
@@ -516,6 +508,8 @@ mod tests {
 			upstream_base_url: "https://repo.example.invalid".to_owned(),
 			repository_name: "default".to_owned(),
 			repository_format: format.to_owned(),
+			docker_registry_base_url: None,
+			docker_repository_name: None,
 			osv_ecosystem: ecosystem.map(str::to_owned),
 			osv_ecosystem_overrides: Default::default(),
 			nexus_username: None,
@@ -539,8 +533,7 @@ mod tests {
 			cache_blocked_ttl_secs: 3_600,
 			cache_max_capacity: 100,
 			request_timeout_secs: 30,
-			artifact_scanner: ArtifactScannerKind::Disabled,
-			artifact_scanner_command: String::new(),
+			artifact_scanner_formats: Default::default(),
 			artifact_scanner_skip_db_update: true,
 			artifact_scanner_offline: true,
 			artifact_scanner_timeout_secs: 300,

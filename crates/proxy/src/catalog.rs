@@ -155,7 +155,44 @@ pub(crate) async fn load_repository_catalog(
 		})
 		.collect();
 
-	RepositoryCatalog::new(repositories, generation)
+	let catalog = RepositoryCatalog::new(repositories, generation)?;
+	validate_configured_repositories(&catalog, config)?;
+
+	Ok(catalog)
+}
+
+fn validate_configured_repositories(
+	catalog: &RepositoryCatalog,
+	config: &AppConfig,
+) -> anyhow::Result<()> {
+	let Some(repository_name) = config.docker_repository_name.as_deref() else {
+		return Ok(());
+	};
+	if !config.docker_registry_configured() {
+		return Ok(());
+	}
+
+	let Some(repository) = catalog.get(repository_name) else {
+		anyhow::bail!(
+			"configured Docker repository {repository_name} was not found in Nexus catalog"
+		);
+	};
+	if normalize_repository_format(&repository.format) != "docker" {
+		anyhow::bail!(
+			"configured Docker repository {repository_name} has format {}, expected docker",
+			repository.format
+		);
+	}
+
+	Ok(())
+}
+
+fn normalize_repository_format(format: &str) -> String {
+	format
+		.chars()
+		.filter(|character| character.is_ascii_alphanumeric())
+		.flat_map(char::to_lowercase)
+		.collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

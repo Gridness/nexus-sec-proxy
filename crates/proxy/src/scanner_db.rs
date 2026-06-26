@@ -38,7 +38,9 @@ pub(crate) fn scanner_db_summaries_from_env() -> Vec<ScannerDbSummary> {
 	.collect()
 }
 
-fn scanner_db_summary_from_env(env_var: &'static str) -> ScannerDbSummary {
+pub(crate) fn scanner_db_summary_from_env(
+	env_var: &'static str,
+) -> ScannerDbSummary {
 	match env::var(env_var)
 		.ok()
 		.map(|value| value.trim().to_owned())

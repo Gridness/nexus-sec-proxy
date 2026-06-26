@@ -15,7 +15,7 @@ use crate::env::{
 	DEFAULT_REPOSITORY_NAME, DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS,
 	DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TRUST_REPORT_DIR,
 	DEFAULT_TRUST_REPORT_RETENTION_DAYS, DEFAULT_YANDEX_MESSENGER_API_URL,
-	artifact_scanner_env, bool_env, default_artifact_scanner_command,
+	artifact_scanner_formats_env, bool_env, normalize_artifact_format,
 	optional_bool_env, optional_string_env, osv_ecosystem_overrides_env,
 	required_string_env_with_fallbacks, socket_addr_env, string_env, u64_env,
 	unsupported_target_policy_env,
@@ -30,6 +30,8 @@ pub struct AppConfig {
 	pub upstream_base_url: String,
 	pub repository_name: String,
 	pub repository_format: String,
+	pub docker_registry_base_url: Option<String>,
+	pub docker_repository_name: Option<String>,
 	pub osv_ecosystem: Option<String>,
 	pub osv_ecosystem_overrides: BTreeMap<String, String>,
 	pub nexus_username: Option<String>,
@@ -55,8 +57,7 @@ pub struct AppConfig {
 	pub cache_blocked_ttl_secs: u64,
 	pub cache_max_capacity: u64,
 	pub request_timeout_secs: u64,
-	pub artifact_scanner: ArtifactScannerKind,
-	pub artifact_scanner_command: String,
+	pub artifact_scanner_formats: BTreeMap<String, ArtifactScannerKind>,
 	pub artifact_scanner_skip_db_update: bool,
 	pub artifact_scanner_offline: bool,
 	pub artifact_scanner_timeout_secs: u64,
@@ -99,6 +100,21 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_REPOSITORY_FORMAT",
 			DEFAULT_REPOSITORY_FORMAT,
 		);
+		let docker_registry_base_url = docker_registry_base_url(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL",
+		)?;
+		let docker_repository_name = optional_string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME",
+		);
+		if docker_registry_base_url.is_some()
+			&& docker_repository_name.is_none()
+		{
+			return Err(ConfigError::MissingRequired {
+				name: "NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME",
+			});
+		}
 		let osv_ecosystem =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_OSV_ECOSYSTEM")
 				.or_else(|| {
@@ -196,16 +212,10 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_REQUEST_TIMEOUT_SECS",
 			DEFAULT_REQUEST_TIMEOUT_SECS,
 		)?;
-		let artifact_scanner = artifact_scanner_env(
+		let artifact_scanner_formats = artifact_scanner_formats_env(
 			&mut lookup,
-			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER",
-			ArtifactScannerKind::Disabled,
+			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS",
 		)?;
-		let artifact_scanner_command = optional_string_env(
-			&mut lookup,
-			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER_COMMAND",
-		)
-		.unwrap_or_else(|| default_artifact_scanner_command(artifact_scanner));
 		let artifact_scanner_skip_db_update = bool_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE",
@@ -244,6 +254,8 @@ impl AppConfig {
 			upstream_base_url,
 			repository_name,
 			repository_format,
+			docker_registry_base_url,
+			docker_repository_name,
 			osv_ecosystem,
 			osv_ecosystem_overrides,
 			nexus_username,
@@ -266,8 +278,7 @@ impl AppConfig {
 			cache_blocked_ttl_secs,
 			cache_max_capacity,
 			request_timeout_secs,
-			artifact_scanner,
-			artifact_scanner_command,
+			artifact_scanner_formats,
 			artifact_scanner_skip_db_update,
 			artifact_scanner_offline,
 			artifact_scanner_timeout_secs,
@@ -278,6 +289,70 @@ impl AppConfig {
 			policy_set,
 		})
 	}
+
+	#[must_use]
+	pub fn artifact_scanner_for_format(
+		&self,
+		format: &str,
+	) -> Option<ArtifactScannerKind> {
+		self.artifact_scanner_formats
+			.get(&normalize_artifact_format(format))
+			.copied()
+	}
+
+	#[must_use]
+	pub fn docker_registry_configured(&self) -> bool {
+		self.docker_registry_base_url.is_some()
+			&& self.docker_repository_name.is_some()
+	}
+}
+
+fn docker_registry_base_url(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+	let Some(value) = optional_string_env(lookup, name) else {
+		return Ok(None);
+	};
+	let parsed = url::Url::parse(&value).map_err(|error| {
+		ConfigError::InvalidDockerRegistryBaseUrl {
+			name,
+			value: value.clone(),
+			reason: error.to_string(),
+		}
+	})?;
+
+	if !matches!(parsed.scheme(), "http" | "https") {
+		return Err(ConfigError::InvalidDockerRegistryBaseUrl {
+			name,
+			value,
+			reason: "scheme must be http or https".to_owned(),
+		});
+	}
+	if parsed.host_str().is_none() || parsed.cannot_be_a_base() {
+		return Err(ConfigError::InvalidDockerRegistryBaseUrl {
+			name,
+			value,
+			reason: "URL must include a host".to_owned(),
+		});
+	}
+	if parsed.query().is_some() || parsed.fragment().is_some() {
+		return Err(ConfigError::InvalidDockerRegistryBaseUrl {
+			name,
+			value,
+			reason: "query and fragment are not allowed".to_owned(),
+		});
+	}
+	let path = parsed.path();
+	if path != "/" && !path.is_empty() {
+		return Err(ConfigError::InvalidDockerRegistryBaseUrl {
+			name,
+			value,
+			reason: "path must be empty or /".to_owned(),
+		});
+	}
+
+	Ok(Some(value))
 }
 
 fn trust_base_url(

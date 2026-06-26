@@ -135,7 +135,7 @@ impl ReportStore {
 		}
 	}
 
-	async fn verify_writable(&self) -> io::Result<()> {
+	pub(crate) async fn verify_writable(&self) -> io::Result<()> {
 		let probe = self
 			.directory
 			.join(format!(".write-test-{}", Uuid::new_v4()));
