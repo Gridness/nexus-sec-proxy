@@ -3,6 +3,7 @@ mod audit;
 mod catalog;
 mod classifier;
 mod decisions;
+mod docker;
 mod gateway;
 mod responses;
 mod scan;
@@ -12,19 +13,26 @@ mod time_utils;
 mod tracing_setup;
 mod trust_reports;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use nexus_sec_proxy_cache::MokaScanCache;
-use nexus_sec_proxy_config::AppConfig;
+use nexus_sec_proxy_config::{AppConfig, ArtifactScannerKind};
 use nexus_sec_proxy_security::OsvClient;
 #[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::{
 	YandexMessengerConfig, YandexMessengerNotifier,
 };
+use serde::Serialize;
+use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -41,7 +49,7 @@ use crate::admin::{
 use crate::catalog::load_repository_catalog;
 use crate::decisions::DecisionLog;
 use crate::gateway::proxy_handler;
-use crate::scan::external_scanner_from_config;
+use crate::scanner_db::{ScannerDbStatus, scanner_db_summary_from_env};
 use crate::state::{ActivePolicy, AppState};
 use crate::time_utils::now_rfc3339;
 use crate::tracing_setup::{env_log_json, init_tracing};
@@ -60,9 +68,7 @@ pub(crate) use crate::responses::response_with_text;
 #[cfg(test)]
 pub(crate) use crate::scan::handle_policy_evaluation;
 #[cfg(test)]
-pub(crate) use crate::scanner_db::{
-	ScannerDbStatus, scanner_db_summary_for_dir,
-};
+pub(crate) use crate::scanner_db::scanner_db_summary_for_dir;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -103,7 +109,6 @@ async fn main() -> anyhow::Result<()> {
 		Duration::from_secs(config.cache_blocked_ttl_secs),
 	);
 	let osv = OsvClient::new(http_client.clone(), config.osv_api_url.clone());
-	let artifact_scanner = external_scanner_from_config(&config);
 	#[cfg(feature = "yandex-messenger")]
 	let yandex_messenger =
 		yandex_messenger_from_config(&config, http_client.clone());
@@ -123,7 +128,6 @@ async fn main() -> anyhow::Result<()> {
 		http_client,
 		cache,
 		osv,
-		artifact_scanner,
 		#[cfg(feature = "yandex-messenger")]
 		yandex_messenger,
 		artifact_scanner_semaphore,
@@ -151,8 +155,7 @@ async fn main() -> anyhow::Result<()> {
 		admin_enabled = state.config.admin_token.is_some(),
 		fail_open = state.config.fail_open,
 		unsupported_target_policy = ?state.config.unsupported_target_policy,
-		artifact_scanner = ?state.config.artifact_scanner,
-		artifact_scanner_command = %state.config.artifact_scanner_command,
+		artifact_scanner_formats = ?state.config.artifact_scanner_formats,
 		cache_max_capacity = state.config.cache_max_capacity,
 		trust_base_url = %state.config.trust_base_url,
 		trust_report_dir = %state.config.trust_report_dir,
@@ -234,8 +237,242 @@ fn build_app(state: Arc<AppState>) -> Router {
 	app.fallback(proxy_handler).with_state(state)
 }
 
-async fn healthz() -> &'static str {
-	"ok\n"
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+	status: &'static str,
+	checks: BTreeMap<&'static str, &'static str>,
+}
+
+async fn healthz(State(state): State<Arc<AppState>>) -> Response<Body> {
+	let checks = match tokio::time::timeout(
+		Duration::from_secs(2),
+		health_checks(Arc::clone(&state)),
+	)
+	.await
+	{
+		Ok(checks) => checks,
+		Err(_) => {
+			error!("health check timed out");
+			timed_out_health_checks(&state)
+		}
+	};
+	let healthy = checks.values().all(|status| *status != "failed");
+	let status = if healthy { "ok" } else { "failed" };
+	let http_status = if healthy {
+		StatusCode::OK
+	} else {
+		StatusCode::SERVICE_UNAVAILABLE
+	};
+
+	(http_status, axum::Json(HealthResponse { status, checks })).into_response()
+}
+
+async fn health_checks(
+	state: Arc<AppState>,
+) -> BTreeMap<&'static str, &'static str> {
+	let scanners = used_artifact_scanners(&state.config);
+	let nexus = check_nexus(Arc::clone(&state));
+	let trust_reports = check_trust_reports(Arc::clone(&state));
+	let docker_registry = check_docker_registry(Arc::clone(&state));
+	let trivy = check_scanner(
+		ArtifactScannerKind::Trivy,
+		scanners.contains(&ArtifactScannerKind::Trivy),
+	);
+	let grype = check_scanner(
+		ArtifactScannerKind::Grype,
+		scanners.contains(&ArtifactScannerKind::Grype),
+	);
+	let (nexus, trust_reports, docker_registry, trivy, grype) =
+		tokio::join!(nexus, trust_reports, docker_registry, trivy, grype);
+
+	BTreeMap::from([
+		("nexus", nexus),
+		("trust_reports", trust_reports),
+		("docker_registry", docker_registry),
+		("trivy", trivy),
+		("grype", grype),
+	])
+}
+
+fn timed_out_health_checks(
+	state: &AppState,
+) -> BTreeMap<&'static str, &'static str> {
+	let scanners = used_artifact_scanners(&state.config);
+
+	BTreeMap::from([
+		("nexus", "failed"),
+		("trust_reports", "failed"),
+		(
+			"docker_registry",
+			if state.config.docker_registry_configured() {
+				"failed"
+			} else {
+				"unused"
+			},
+		),
+		(
+			"trivy",
+			if scanners.contains(&ArtifactScannerKind::Trivy) {
+				"failed"
+			} else {
+				"unused"
+			},
+		),
+		(
+			"grype",
+			if scanners.contains(&ArtifactScannerKind::Grype) {
+				"failed"
+			} else {
+				"unused"
+			},
+		),
+	])
+}
+
+async fn check_nexus(state: Arc<AppState>) -> &'static str {
+	match load_repository_catalog(
+		&state.http_client,
+		&state.nexus_base_url,
+		&state.config,
+		0,
+	)
+	.await
+	{
+		Ok(_) => "ok",
+		Err(error) => {
+			error!(%error, "Nexus health check failed");
+			"failed"
+		}
+	}
+}
+
+async fn check_trust_reports(state: Arc<AppState>) -> &'static str {
+	match state.report_store.verify_writable().await {
+		Ok(()) => "ok",
+		Err(error) => {
+			error!(%error, "Trust report storage health check failed");
+			"failed"
+		}
+	}
+}
+
+async fn check_docker_registry(state: Arc<AppState>) -> &'static str {
+	let Some(base_url) = state.config.docker_registry_base_url.as_deref()
+	else {
+		return "unused";
+	};
+	let mut url = match Url::parse(base_url) {
+		Ok(url) => url,
+		Err(error) => {
+			error!(%error, "Docker registry base URL parse failed");
+			return "failed";
+		}
+	};
+	url.set_path("/v2/");
+	url.set_query(None);
+
+	let mut request = state.http_client.get(url);
+	if let Some(username) = state.config.nexus_username.as_deref() {
+		request =
+			request.basic_auth(username, state.config.nexus_password.clone());
+	}
+
+	match request.send().await {
+		Ok(response)
+			if response.status().is_success()
+				|| response.status().as_u16()
+					== StatusCode::UNAUTHORIZED.as_u16() =>
+		{
+			"ok"
+		}
+		Ok(response) => {
+			error!(
+				status = %response.status(),
+				"Docker registry health check failed"
+			);
+			"failed"
+		}
+		Err(error) => {
+			error!(%error, "Docker registry health check failed");
+			"failed"
+		}
+	}
+}
+
+async fn check_scanner(
+	scanner: ArtifactScannerKind,
+	used: bool,
+) -> &'static str {
+	if !used {
+		return "unused";
+	}
+
+	let version_ok = scanner_version_ok(scanner).await;
+	let db_summary = scanner_db_summary_from_env(scanner_db_env(scanner));
+	let db_ok = db_summary.status == ScannerDbStatus::Found;
+
+	if version_ok && db_ok {
+		"ok"
+	} else {
+		if !db_ok {
+			error!(
+				?scanner,
+				status = ?db_summary.status,
+				cache_dir = ?db_summary.cache_dir,
+				error = ?db_summary.error,
+				"scanner DB health check failed"
+			);
+		}
+		"failed"
+	}
+}
+
+async fn scanner_version_ok(scanner: ArtifactScannerKind) -> bool {
+	let mut command = Command::new(scanner.command());
+	match scanner {
+		ArtifactScannerKind::Trivy => {
+			command.arg("--version");
+		}
+		ArtifactScannerKind::Grype => {
+			command.arg("version");
+		}
+	}
+	command.kill_on_drop(true);
+
+	match command.output().await {
+		Ok(output) if output.status.success() => true,
+		Ok(output) => {
+			error!(
+				?scanner,
+				status = %output.status,
+				stderr = %String::from_utf8_lossy(&output.stderr),
+				"scanner version health check failed"
+			);
+			false
+		}
+		Err(error) => {
+			error!(?scanner, %error, "scanner version command failed");
+			false
+		}
+	}
+}
+
+fn scanner_db_env(scanner: ArtifactScannerKind) -> &'static str {
+	match scanner {
+		ArtifactScannerKind::Trivy => "TRIVY_CACHE_DIR",
+		ArtifactScannerKind::Grype => "GRYPE_DB_CACHE_DIR",
+	}
+}
+
+fn used_artifact_scanners(config: &AppConfig) -> BTreeSet<ArtifactScannerKind> {
+	config
+		.artifact_scanner_formats
+		.iter()
+		.filter(|(format, _)| {
+			format.as_str() != "docker" || config.docker_registry_configured()
+		})
+		.map(|(_, scanner)| *scanner)
+		.collect()
 }
 
 fn spawn_repository_catalog_refresh(

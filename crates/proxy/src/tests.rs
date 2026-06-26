@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::to_bytes;
@@ -11,12 +12,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use nexus_sec_proxy_cache::MokaScanCache;
+use nexus_sec_proxy_cache::{CacheKey, CachedScan, MokaScanCache, ScanCache};
 use nexus_sec_proxy_config::{
 	AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy,
 };
@@ -52,6 +53,21 @@ struct CatalogMockState {
 	active_requests: Arc<AtomicUsize>,
 	max_concurrent_requests: Arc<AtomicUsize>,
 	delay: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct DockerRegistryMockResponse {
+	status: StatusCode,
+	content_type: Option<String>,
+	digest: Option<String>,
+	headers: HeaderMap,
+	body: String,
+}
+
+#[derive(Clone)]
+struct DockerRegistryMockState {
+	records: Arc<Mutex<Vec<RecordedRequest>>>,
+	response: Arc<Mutex<DockerRegistryMockResponse>>,
 }
 
 #[cfg(feature = "yandex-messenger")]
@@ -94,6 +110,36 @@ fn set_catalog_response(
 		status,
 		body: body.into(),
 	};
+}
+
+fn docker_registry_mock(
+	response: DockerRegistryMockResponse,
+) -> DockerRegistryMockState {
+	DockerRegistryMockState {
+		records: Arc::new(Mutex::new(Vec::new())),
+		response: Arc::new(Mutex::new(response)),
+	}
+}
+
+fn docker_response(
+	content_type: Option<&str>,
+	digest: Option<&str>,
+	body: &str,
+) -> DockerRegistryMockResponse {
+	DockerRegistryMockResponse {
+		status: StatusCode::OK,
+		content_type: content_type.map(str::to_owned),
+		digest: digest.map(str::to_owned),
+		headers: HeaderMap::new(),
+		body: body.to_owned(),
+	}
+}
+
+fn set_docker_response(
+	state: &DockerRegistryMockState,
+	response: DockerRegistryMockResponse,
+) {
+	*state.response.lock().unwrap() = response;
 }
 
 async fn wait_for_request_count(state: &CatalogMockState, expected: usize) {
@@ -142,6 +188,39 @@ async fn record_nexus_request(
 	});
 
 	response_with_text(StatusCode::OK, "nexus\n")
+}
+
+async fn mock_docker_registry(
+	State(state): State<DockerRegistryMockState>,
+	method: Method,
+	uri: Uri,
+	headers: HeaderMap,
+	body: Body,
+) -> Response<Body> {
+	let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+	state.records.lock().unwrap().push(RecordedRequest {
+		method,
+		path_and_query: uri
+			.path_and_query()
+			.map(|value| value.as_str().to_owned())
+			.unwrap_or_else(|| uri.path().to_owned()),
+		headers,
+		body,
+	});
+
+	let response = state.response.lock().unwrap().clone();
+	let mut builder = Response::builder().status(response.status);
+	if let Some(content_type) = response.content_type {
+		builder = builder.header(CONTENT_TYPE, content_type);
+	}
+	if let Some(digest) = response.digest {
+		builder = builder.header("Docker-Content-Digest", digest);
+	}
+	for (name, value) in &response.headers {
+		builder = builder.header(name, value);
+	}
+
+	builder.body(Body::from(response.body)).unwrap()
 }
 
 async fn mock_osv(
@@ -355,6 +434,93 @@ async fn repository_catalog_reports_auth_malformed_and_empty_failures() {
 		.await
 		.unwrap_err();
 	assert!(error.to_string().contains("catalog is empty"));
+}
+
+#[tokio::test]
+async fn repository_catalog_validates_configured_docker_repository() {
+	let app = Router::new().route(
+		"/service/rest/v1/repositories",
+		get(|| async {
+			Json(json!([
+				{
+					"name": "docker-proxy",
+					"format": "docker",
+					"type": "proxy"
+				}
+			]))
+		}),
+	);
+	let nexus_base_url = spawn_server(app).await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_base_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.docker_registry_base_url =
+		Some("http://nexus.example.invalid:5000".to_owned());
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	let client = reqwest::Client::new();
+
+	let catalog = load_repository_catalog(&client, &nexus_base_url, &config, 1)
+		.await
+		.unwrap();
+
+	assert_eq!(catalog.get("docker-proxy").unwrap().format, "docker");
+	assert_eq!(
+		config.artifact_scanner_for_format("docker"),
+		None,
+		"repository config alone must not enable Docker scanning"
+	);
+}
+
+#[tokio::test]
+async fn repository_catalog_rejects_missing_or_non_docker_configured_repository()
+ {
+	for (body, expected) in [
+		(
+			json!([
+				{"name": "npm-proxy", "format": "npm", "type": "proxy"}
+			]),
+			"was not found",
+		),
+		(
+			json!([
+				{"name": "docker-proxy", "format": "raw", "type": "proxy"}
+			]),
+			"expected docker",
+		),
+	] {
+		let app = Router::new().route(
+			"/service/rest/v1/repositories",
+			get({
+				let body = body.clone();
+				move || async move { Json(body) }
+			}),
+		);
+		let nexus_base_url = spawn_server(app).await;
+		let mut config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			nexus_base_url.as_str(),
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		config.docker_registry_base_url =
+			Some("http://nexus.example.invalid:5000".to_owned());
+		config.docker_repository_name = Some("docker-proxy".to_owned());
+		let client = reqwest::Client::new();
+
+		let error =
+			load_repository_catalog(&client, &nexus_base_url, &config, 1)
+				.await
+				.unwrap_err();
+
+		assert!(error.to_string().contains(expected));
+	}
 }
 
 #[tokio::test]
@@ -1292,7 +1458,7 @@ async fn unknown_repository_fails_closed_before_nexus() {
 }
 
 #[tokio::test]
-async fn artifact_target_with_block_policy_returns_403_before_nexus() {
+async fn unmapped_artifact_target_with_block_policy_returns_403_before_nexus() {
 	let nexus_records = Arc::new(Mutex::new(Vec::new()));
 	let nexus_url = spawn_server(
 		Router::new()
@@ -1305,7 +1471,7 @@ async fn artifact_target_with_block_policy_returns_403_before_nexus() {
 		"http://127.0.0.1:9/osv",
 		PolicySet::default(),
 		UnsupportedTargetPolicy::Block,
-		vec![test_repository("docker-proxy", "docker", None)],
+		vec![test_repository("helm-proxy", "helm", None)],
 	);
 	let app = build_app(state.clone());
 
@@ -1313,9 +1479,7 @@ async fn artifact_target_with_block_policy_returns_403_before_nexus() {
 		.clone()
 		.oneshot(
 			Request::builder()
-				.uri(
-					"/repository/docker-proxy/v2/library/alpine/blobs/sha256:abc123",
-				)
+				.uri("/repository/helm-proxy/charts/demo-1.2.3.tgz")
 				.body(Body::empty())
 				.unwrap(),
 		)
@@ -1328,7 +1492,7 @@ async fn artifact_target_with_block_policy_returns_403_before_nexus() {
 	assert_eq!(nexus_records.lock().unwrap().len(), 0);
 	assert_eq!(
 		state.decision_log.list(10)[0].repository,
-		"docker-proxy".to_owned()
+		"helm-proxy".to_owned()
 	);
 	assert_eq!(
 		state.decision_log.list(10)[0].report_url.as_deref(),
@@ -1345,13 +1509,725 @@ async fn artifact_target_with_block_policy_returns_403_before_nexus() {
 		.unwrap();
 	assert_eq!(report_response.status(), StatusCode::OK);
 	let report_html = response_text(report_response).await;
-	assert!(report_html.contains(
-		"artifact targets cannot be scanned before contacting Nexus"
-	));
+	assert!(
+		report_html.contains("artifact format helm is not mapped to a scanner")
+	);
 	assert!(
 		report_html
 			.contains("No vulnerabilities are associated with this block.")
 	);
+}
+
+#[tokio::test]
+async fn docker_v2_ping_and_blob_requests_forward_to_docker_registry() {
+	let docker = docker_registry_mock(docker_response(None, None, "docker\n"));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+	let app = build_app(state);
+
+	let ping = app
+		.clone()
+		.oneshot(
+			Request::builder()
+				.uri("/v2/")
+				.header("Authorization", "Bearer client-token")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(ping.status(), StatusCode::OK);
+	assert_eq!(response_text(ping).await, "docker\n");
+
+	let blob = app
+		.clone()
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/blobs/sha256:abc123")
+				.header("Range", "bytes=0-10")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(blob.status(), StatusCode::OK);
+
+	let unsupported = app
+		.oneshot(
+			Request::builder()
+				.method(Method::POST)
+				.uri("/v2/library/alpine/blobs/uploads/")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(unsupported.status(), StatusCode::METHOD_NOT_ALLOWED);
+	let unsupported_body = response_json(unsupported).await;
+	assert_eq!(unsupported_body["errors"][0]["code"], "UNSUPPORTED");
+
+	let records = docker.records.lock().unwrap();
+	assert_eq!(records.len(), 2);
+	assert_eq!(records[0].path_and_query, "/v2/");
+	assert_eq!(
+		records[0]
+			.headers
+			.get("Authorization")
+			.and_then(|value| value.to_str().ok()),
+		Some("Bearer client-token")
+	);
+	assert_eq!(
+		records[1].path_and_query,
+		"/v2/library/alpine/blobs/sha256:abc123"
+	);
+	assert_eq!(
+		records[1]
+			.headers
+			.get("Range")
+			.and_then(|value| value.to_str().ok()),
+		Some("bytes=0-10")
+	);
+}
+
+#[tokio::test]
+async fn docker_auth_challenge_rewrites_realm_to_proxy_host() {
+	let docker = docker_registry_mock(docker_response(None, None, ""));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let internal_realm = docker_url.join("/v2/token").unwrap();
+	let mut registry_response = docker_response(None, None, "unauthorized\n");
+	registry_response.status = StatusCode::UNAUTHORIZED;
+	registry_response.headers.insert(
+		WWW_AUTHENTICATE,
+		format!(
+			"Bearer realm=\"{internal_realm}\",service=\"{internal_realm}\""
+		)
+		.parse()
+		.unwrap(),
+	);
+	set_docker_response(&docker, registry_response);
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/v2/")
+				.header("Host", "proxy.example.test")
+				.header("X-Forwarded-Proto", "https")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+	let challenge = response
+		.headers()
+		.get(WWW_AUTHENTICATE)
+		.and_then(|value| value.to_str().ok())
+		.unwrap();
+	assert!(
+		challenge.contains("realm=\"https://proxy.example.test/v2/token\"")
+	);
+	assert!(challenge.contains(&format!("service=\"{internal_realm}\"")));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_manifest_index_forwards_without_scanner() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(temp_dir.path(), &scanner_record, r#"{"Results":[]}"#);
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.docker.distribution.manifest.list.v2+json"),
+		Some("sha256:index"),
+		r#"{"schemaVersion":2,"manifests":[]}"#,
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+	let app = build_app(state);
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/latest")
+				.header(
+					"Accept",
+					"application/vnd.docker.distribution.manifest.list.v2+json",
+				)
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	assert_eq!(
+		response.headers().get(CONTENT_TYPE).unwrap(),
+		"application/vnd.docker.distribution.manifest.list.v2+json"
+	);
+	assert!(!scanner_record.exists());
+	assert_eq!(docker.records.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_attestation_manifest_forwards_without_scanner() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(temp_dir.path(), &scanner_record, r#"{"Results":[]}"#);
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.oci.image.manifest.v1+json"),
+		Some("sha256:attestation"),
+		r#"{"schemaVersion":2,"layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:abc","size":42}]}"#,
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/sha256:attestation")
+				.header("Accept", "application/vnd.oci.image.manifest.v1+json")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	assert!(response_text(response).await.contains("in-toto"));
+	assert_eq!(docker.records.lock().unwrap().len(), 1);
+	assert!(!scanner_record.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_concrete_manifest_scans_by_digest_and_reuses_cache() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(temp_dir.path(), &scanner_record, r#"{"Results":[]}"#);
+	let digest = "sha256:1111222233334444";
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.docker.distribution.manifest.v2+json"),
+		Some(digest),
+		r#"{"schemaVersion":2,"config":{},"layers":[]}"#,
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+	let app = build_app(state);
+
+	let latest = app
+		.clone()
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/latest")
+				.header(
+					"Accept",
+					"application/vnd.docker.distribution.manifest.v2+json",
+				)
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(latest.status(), StatusCode::OK);
+	assert_eq!(
+		response_text(latest).await,
+		r#"{"schemaVersion":2,"config":{},"layers":[]}"#
+	);
+
+	set_docker_response(
+		&docker,
+		docker_response(
+			Some("application/vnd.docker.distribution.manifest.v2+json"),
+			None,
+			r#"{"schemaVersion":2,"config":{},"layers":[]}"#,
+		),
+	);
+	let by_digest = app
+		.oneshot(
+			Request::builder()
+				.uri(format!("/v2/library/alpine/manifests/{digest}"))
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(by_digest.status(), StatusCode::OK);
+
+	let records = docker.records.lock().unwrap();
+	assert_eq!(records.len(), 2);
+	assert_eq!(
+		records[0].path_and_query,
+		"/v2/library/alpine/manifests/latest"
+	);
+	assert_eq!(
+		records[0]
+			.headers
+			.get("Accept")
+			.and_then(|value| value.to_str().ok()),
+		Some("application/vnd.docker.distribution.manifest.v2+json")
+	);
+	assert_eq!(
+		records[1].path_and_query,
+		format!("/v2/library/alpine/manifests/{digest}")
+	);
+	drop(records);
+
+	let scanner_paths = std::fs::read_to_string(scanner_record).unwrap();
+	let scanner_paths = scanner_paths.lines().collect::<Vec<_>>();
+	assert_eq!(scanner_paths.len(), 1);
+	assert_eq!(
+		scanner_paths[0],
+		format!(
+			"{}:{}/library/alpine@{digest}",
+			docker_url.host_str().unwrap(),
+			docker_url.port().unwrap()
+		)
+	);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_blocked_manifest_creates_trust_report() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(
+		temp_dir.path(),
+		&scanner_record,
+		r#"{"Results":[{"Vulnerabilities":[{"VulnerabilityID":"CVE-2026-0001","PkgName":"openssl","Title":"bad image","Description":"bad","Severity":"HIGH","References":[]}]}]}"#,
+	);
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.oci.image.manifest.v1+json"),
+		Some("sha256:blockme"),
+		r#"{"schemaVersion":2}"#,
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Trivy));
+	let app = build_app(state.clone());
+
+	let response = app
+		.clone()
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/3.20")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	let body = response_text(response).await;
+	assert!(body.contains("CVE-2026-0001"));
+	let report_url = report_url_from_body(&body);
+	let decisions = state.decision_log.list(10);
+	assert_eq!(decisions[0].repository, "docker-proxy");
+	assert_eq!(decisions[0].format, "docker");
+	assert_eq!(decisions[0].report_url.as_deref(), Some(report_url));
+
+	let report_response = app
+		.oneshot(
+			Request::builder()
+				.uri(Url::parse(report_url).unwrap().path())
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(report_response.status(), StatusCode::OK);
+	assert!(
+		response_text(report_response)
+			.await
+			.contains("CVE-2026-0001")
+	);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_scanner_failures_follow_fail_open() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(temp_dir.path(), &scanner_record, "not json");
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.docker.distribution.manifest.v2+json"),
+		Some("sha256:badscan"),
+		"manifest",
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+
+	for (fail_open, expected_status) in [
+		(true, StatusCode::OK),
+		(false, StatusCode::SERVICE_UNAVAILABLE),
+	] {
+		let mut config = test_config(
+			None,
+			None,
+			PolicySet::default(),
+			"http://127.0.0.1:9",
+			"http://127.0.0.1:9/osv",
+			UnsupportedTargetPolicy::Allow,
+		);
+		config.docker_registry_base_url = Some(docker_url.as_str().to_owned());
+		config.docker_repository_name = Some("docker-proxy".to_owned());
+		config.fail_open = fail_open;
+		config
+			.artifact_scanner_formats
+			.insert("docker".to_owned(), ArtifactScannerKind::Trivy);
+		let state = test_state_from_config(
+			config,
+			PolicySet::default(),
+			None,
+			vec![test_repository("docker-proxy", "docker", None)],
+		);
+		let response = build_app(state)
+			.oneshot(
+				Request::builder()
+					.uri(format!("/v2/library/alpine/manifests/{fail_open}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), expected_status);
+	}
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_grype_scans_image_reference() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("grype-images.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_grype(temp_dir.path(), &scanner_record, r#"{"matches":[]}"#);
+	let digest = "sha256:grype";
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.docker.distribution.manifest.v2+json"),
+		Some(digest),
+		"manifest",
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker),
+	)
+	.await;
+	let state =
+		docker_test_state(&docker_url, Some(ArtifactScannerKind::Grype));
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/latest")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let images = std::fs::read_to_string(scanner_record).unwrap();
+	assert_eq!(
+		images.trim(),
+		format!(
+			"{}:{}/library/alpine@{digest}",
+			docker_url.host_str().unwrap(),
+			docker_url.port().unwrap()
+		)
+	);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn docker_scanner_auth_config_is_temporary() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-auth.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy_auth_recorder(temp_dir.path(), &scanner_record);
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.docker.distribution.manifest.v2+json"),
+		Some("sha256:auth"),
+		"manifest",
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.docker_registry_base_url = Some(docker_url.as_str().to_owned());
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	config.nexus_username = Some("svc".to_owned());
+	config.nexus_password = Some("secret".to_owned());
+	config.fail_open = false;
+	config
+		.artifact_scanner_formats
+		.insert("docker".to_owned(), ArtifactScannerKind::Trivy);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("docker-proxy", "docker", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/latest")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let record = std::fs::read_to_string(scanner_record).unwrap();
+	let mut lines = record.lines();
+	let docker_config = lines.next().unwrap();
+	assert!(lines.next().unwrap().contains(r#""auths""#));
+	assert!(lines.next().unwrap().contains("c3ZjOnNlY3JldA=="));
+	assert!(
+		!std::path::Path::new(docker_config).exists(),
+		"temporary DOCKER_CONFIG directory should be removed after scan"
+	);
+}
+
+#[tokio::test]
+async fn mapped_artifact_range_uses_unsupported_target_policy() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Block,
+	);
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+	let app = build_app(state);
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri("/repository/helm-proxy/charts/demo-1.2.3.tgz")
+				.header("Range", "bytes=0-10")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert!(
+		response_text(response)
+			.await
+			.contains("artifact range requests cannot be scanned")
+	);
+}
+
+#[tokio::test]
+async fn cached_artifact_block_is_re_evaluated_before_nexus() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+	state
+		.cache
+		.put(
+			CacheKey::from_parts(
+				"helm",
+				"helm-proxy\n/repository/helm-proxy/charts/demo-1.2.3.tgz",
+				None::<String>,
+			),
+			CachedScan::new(vec![vulnerability(
+				"CVE-2026-0001",
+				Severity::High,
+			)]),
+		)
+		.await
+		.unwrap();
+	let app = build_app(state);
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri("/repository/helm-proxy/charts/demo-1.2.3.tgz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn mapped_artifact_prefetches_once_strips_conditionals_and_reuses_cache()
+{
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(temp_dir.path(), &scanner_record, r#"{"Results":[]}"#);
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.fail_open = false;
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	config.artifact_tmp_dir =
+		Some(temp_dir.path().to_string_lossy().into_owned());
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+	let app = build_app(state);
+
+	for _ in 0..2 {
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.uri(
+						"/repository/helm-proxy/charts/demo-1.2.3.tgz?download=1",
+					)
+					.header("If-None-Match", r#""old""#)
+					.header(
+						"If-Modified-Since",
+						"Wed, 21 Oct 2015 07:28:00 GMT",
+					)
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response_text(response).await, "nexus\n");
+	}
+
+	let records = nexus_records.lock().unwrap();
+	assert_eq!(records.len(), 2);
+	assert!(records[0].headers.get("If-None-Match").is_none());
+	assert!(records[0].headers.get("If-Modified-Since").is_none());
+	assert_eq!(
+		records[1]
+			.headers
+			.get("If-None-Match")
+			.and_then(|value| value.to_str().ok()),
+		Some(r#""old""#)
+	);
+	drop(records);
+
+	let scanner_paths = std::fs::read_to_string(scanner_record).unwrap();
+	let scanner_paths = scanner_paths.lines().collect::<Vec<_>>();
+	assert_eq!(scanner_paths.len(), 1);
+	assert!(scanner_paths[0].ends_with(".tgz"));
 }
 
 #[tokio::test]
@@ -1475,6 +2351,58 @@ async fn admin_status_reports_yandex_config_without_token() {
 	);
 	assert_eq!(immutable_config["repository_refresh_interval_secs"], 60);
 	assert!(!body.to_string().contains("bot-secret"));
+}
+
+#[tokio::test]
+async fn admin_scanner_reports_format_routes_and_limits() {
+	let mut config = test_config(
+		Some("secret"),
+		None,
+		PolicySet::default(),
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	config
+		.artifact_scanner_formats
+		.insert("p2".to_owned(), ArtifactScannerKind::Grype);
+	config.artifact_scanner_timeout_secs = 120;
+	config.artifact_scan_max_bytes = 1024;
+	config.artifact_scanner_concurrency = 3;
+	let app = build_app(test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("default", "npm", Some("npm"))],
+	));
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri("/admin/api/scanner")
+				.header(AUTHORIZATION, "Bearer secret")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let body = response_json(response).await;
+	assert_eq!(body["enabled"], true);
+	assert_eq!(body["routes"]["helm"], "trivy");
+	assert_eq!(body["routes"]["p2"], "grype");
+	assert_eq!(body["docker_registry_configured"], false);
+	assert_eq!(body["docker_repository_name"], Value::Null);
+	assert_eq!(body["docker_scanner"], Value::Null);
+	assert_eq!(body["timeout_secs"], 120);
+	assert_eq!(body["max_bytes"], 1024);
+	assert_eq!(body["concurrency"], 3);
+	assert_eq!(body["available_permits"], 2);
+	assert!(body["db_files"].as_array().unwrap().len() >= 2);
 }
 
 #[cfg(not(feature = "yandex-messenger"))]
@@ -1880,6 +2808,485 @@ fn scanner_db_age_reports_missing_empty_and_db_files() {
 	);
 }
 
+#[tokio::test]
+async fn healthz_reports_live_checks_and_unused_scanners() {
+	let catalog_state = catalog_mock(
+		json!([
+			{"name": "npm-proxy", "format": "npm", "type": "proxy"}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(catalog_state),
+	)
+	.await;
+	let state = proxy_test_state(
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		PolicySet::default(),
+		UnsupportedTargetPolicy::Allow,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let body = response_json(response).await;
+	assert_eq!(body["status"], "ok");
+	assert_eq!(body["checks"]["nexus"], "ok");
+	assert_eq!(body["checks"]["trust_reports"], "ok");
+	assert_eq!(body["checks"]["docker_registry"], "unused");
+	assert_eq!(body["checks"]["trivy"], "unused");
+	assert_eq!(body["checks"]["grype"], "unused");
+}
+
+#[tokio::test]
+async fn healthz_reports_configured_docker_registry() {
+	let catalog_state = catalog_mock(
+		json!([
+			{"name": "docker-proxy", "format": "docker", "type": "proxy"}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(catalog_state),
+	)
+	.await;
+	let docker = docker_registry_mock(docker_response(None, None, ""));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.docker_registry_base_url = Some(docker_url.as_str().to_owned());
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("docker-proxy", "docker", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	let body = response_json(response).await;
+	assert_eq!(body["checks"]["docker_registry"], "ok");
+}
+
+#[tokio::test]
+async fn healthz_fails_when_nexus_catalog_is_unavailable() {
+	let state = proxy_test_state(
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		PolicySet::default(),
+		UnsupportedTargetPolicy::Allow,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let body = response_json(response).await;
+	assert_eq!(body["status"], "failed");
+	assert_eq!(body["checks"]["nexus"], "failed");
+}
+
+#[tokio::test]
+async fn healthz_fails_when_trust_report_storage_is_unwritable() {
+	let catalog_state = catalog_mock(
+		json!([
+			{"name": "npm-proxy", "format": "npm", "type": "proxy"}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(catalog_state),
+	)
+	.await;
+	let state = proxy_test_state(
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		PolicySet::default(),
+		UnsupportedTargetPolicy::Allow,
+		vec![test_repository("npm-proxy", "npm", Some("npm"))],
+	);
+	let report_directory = state.report_store.directory().to_owned();
+	std::fs::remove_dir_all(&report_directory).unwrap();
+	std::fs::write(&report_directory, "not a directory").unwrap();
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let body = response_json(response).await;
+	assert_eq!(body["checks"]["trust_reports"], "failed");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn healthz_fails_when_used_scanner_database_is_missing() {
+	let missing_db = tempfile::tempdir().unwrap().path().join("missing");
+	let _env_guard = set_env_var("TRIVY_CACHE_DIR", missing_db.as_os_str());
+	let catalog_state = catalog_mock(
+		json!([
+			{"name": "helm-proxy", "format": "helm", "type": "proxy"}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(catalog_state),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let body = response_json(response).await;
+	assert_eq!(body["checks"]["trivy"], "failed");
+	assert_eq!(body["checks"]["grype"], "unused");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn healthz_fails_when_used_scanner_executable_is_missing() {
+	let empty_path = tempfile::tempdir().unwrap();
+	let db_dir = tempfile::tempdir().unwrap();
+	std::fs::create_dir(db_dir.path().join("db")).unwrap();
+	std::fs::write(db_dir.path().join("db").join("metadata.json"), "{}")
+		.unwrap();
+	let _env_guard = set_env_vars(vec![
+		("PATH", empty_path.path().as_os_str().to_os_string()),
+		("TRIVY_CACHE_DIR", db_dir.path().as_os_str().to_os_string()),
+	]);
+	let catalog_state = catalog_mock(
+		json!([
+			{"name": "helm-proxy", "format": "helm", "type": "proxy"}
+		]),
+		Duration::ZERO,
+	);
+	let nexus_url = spawn_server(
+		Router::new()
+			.route("/service/rest/v1/repositories", get(mock_catalog))
+			.with_state(catalog_state),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/healthz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let body = response_json(response).await;
+	assert_eq!(body["checks"]["trivy"], "failed");
+	assert_eq!(body["checks"]["grype"], "unused");
+}
+
+#[cfg(unix)]
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+struct PathGuard {
+	_guard: std::sync::MutexGuard<'static, ()>,
+	old_path: Option<OsString>,
+}
+
+#[cfg(unix)]
+impl Drop for PathGuard {
+	fn drop(&mut self) {
+		match &self.old_path {
+			Some(path) => unsafe {
+				std::env::set_var("PATH", path);
+			},
+			None => unsafe {
+				std::env::remove_var("PATH");
+			},
+		}
+	}
+}
+
+#[cfg(unix)]
+fn prepend_path(path: &std::path::Path) -> PathGuard {
+	let guard = ENV_LOCK.lock().unwrap();
+	let old_path = std::env::var_os("PATH");
+	let mut paths = vec![path.to_path_buf()];
+	if let Some(old_path) = &old_path {
+		paths.extend(std::env::split_paths(old_path));
+	}
+	let joined = std::env::join_paths(paths).unwrap();
+	unsafe {
+		std::env::set_var("PATH", joined);
+	}
+
+	PathGuard {
+		_guard: guard,
+		old_path,
+	}
+}
+
+#[cfg(unix)]
+struct EnvVarGuard {
+	_guard: std::sync::MutexGuard<'static, ()>,
+	name: &'static str,
+	old_value: Option<OsString>,
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+	fn drop(&mut self) {
+		match &self.old_value {
+			Some(value) => unsafe {
+				std::env::set_var(self.name, value);
+			},
+			None => unsafe {
+				std::env::remove_var(self.name);
+			},
+		}
+	}
+}
+
+#[cfg(unix)]
+fn set_env_var(name: &'static str, value: &std::ffi::OsStr) -> EnvVarGuard {
+	let guard = ENV_LOCK.lock().unwrap();
+	let old_value = std::env::var_os(name);
+	unsafe {
+		std::env::set_var(name, value);
+	}
+
+	EnvVarGuard {
+		_guard: guard,
+		name,
+		old_value,
+	}
+}
+
+#[cfg(unix)]
+struct EnvVarsGuard {
+	_guard: std::sync::MutexGuard<'static, ()>,
+	old_values: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarsGuard {
+	fn drop(&mut self) {
+		for (name, old_value) in &self.old_values {
+			match old_value {
+				Some(value) => unsafe {
+					std::env::set_var(*name, value);
+				},
+				None => unsafe {
+					std::env::remove_var(*name);
+				},
+			}
+		}
+	}
+}
+
+#[cfg(unix)]
+fn set_env_vars(values: Vec<(&'static str, OsString)>) -> EnvVarsGuard {
+	let guard = ENV_LOCK.lock().unwrap();
+	let old_values = values
+		.iter()
+		.map(|(name, _)| (*name, std::env::var_os(name)))
+		.collect();
+	for (name, value) in values {
+		unsafe {
+			std::env::set_var(name, value);
+		}
+	}
+
+	EnvVarsGuard {
+		_guard: guard,
+		old_values,
+	}
+}
+
+#[cfg(unix)]
+fn write_fake_trivy(
+	directory: &std::path::Path,
+	record_path: &std::path::Path,
+	output: &str,
+) {
+	use std::os::unix::fs::PermissionsExt;
+
+	let script = format!(
+		r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+	echo "Version: fake"
+	exit 0
+fi
+last=""
+for arg in "$@"; do
+	last="$arg"
+done
+printf '%s\n' "$last" >> "{}"
+cat <<'JSON'
+{}
+JSON
+"#,
+		record_path.display(),
+		output
+	);
+	let path = directory.join("trivy");
+	std::fs::write(&path, script).unwrap();
+	let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_grype(
+	directory: &std::path::Path,
+	record_path: &std::path::Path,
+	output: &str,
+) {
+	use std::os::unix::fs::PermissionsExt;
+
+	let script = format!(
+		r#"#!/bin/sh
+if [ "$1" = "version" ]; then
+	echo "Application: fake"
+	exit 0
+fi
+printf '%s\n' "$1" >> "{}"
+cat <<'JSON'
+{}
+JSON
+"#,
+		record_path.display(),
+		output
+	);
+	let path = directory.join("grype");
+	std::fs::write(&path, script).unwrap();
+	let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_trivy_auth_recorder(
+	directory: &std::path::Path,
+	record_path: &std::path::Path,
+) {
+	use std::os::unix::fs::PermissionsExt;
+
+	let script = format!(
+		r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+	echo "Version: fake"
+	exit 0
+fi
+printf '%s\n' "$DOCKER_CONFIG" >> "{record}"
+cat "$DOCKER_CONFIG/config.json" >> "{record}"
+printf '\n' >> "{record}"
+grep '"auth"' "$DOCKER_CONFIG/config.json" >> "{record}"
+cat <<'JSON'
+{{"Results":[]}}
+JSON
+"#,
+		record = record_path.display(),
+	);
+	let path = directory.join("trivy");
+	std::fs::write(&path, script).unwrap();
+	let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(path, permissions).unwrap();
+}
+
 async fn response_text(response: Response<Body>) -> String {
 	let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
@@ -2024,6 +3431,36 @@ fn proxy_test_state(
 	test_state_from_config(config, policy_set, None, repositories)
 }
 
+fn docker_test_state(
+	docker_registry_url: &Url,
+	scanner: Option<ArtifactScannerKind>,
+) -> Arc<AppState> {
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.docker_registry_base_url =
+		Some(docker_registry_url.as_str().to_owned());
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	config.fail_open = false;
+	if let Some(scanner) = scanner {
+		config
+			.artifact_scanner_formats
+			.insert("docker".to_owned(), scanner);
+	}
+
+	test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("docker-proxy", "docker", None)],
+	)
+}
+
 fn test_config(
 	admin_token: Option<&str>,
 	policy_file: Option<String>,
@@ -2040,6 +3477,8 @@ fn test_config(
 		upstream_base_url: nexus_base_url.to_owned(),
 		repository_name: "default".to_owned(),
 		repository_format: "npm".to_owned(),
+		docker_registry_base_url: None,
+		docker_repository_name: None,
 		osv_ecosystem: None,
 		osv_ecosystem_overrides: Default::default(),
 		nexus_username: None,
@@ -2063,8 +3502,7 @@ fn test_config(
 		cache_blocked_ttl_secs: 3_600,
 		cache_max_capacity: 100,
 		request_timeout_secs: 1,
-		artifact_scanner: ArtifactScannerKind::Disabled,
-		artifact_scanner_command: String::new(),
+		artifact_scanner_formats: Default::default(),
 		artifact_scanner_skip_db_update: true,
 		artifact_scanner_offline: true,
 		artifact_scanner_timeout_secs: 300,
@@ -2130,7 +3568,6 @@ fn test_state_from_config(
 			Duration::from_secs(60),
 		),
 		osv: OsvClient::new(http_client.clone(), osv_api_url),
-		artifact_scanner: None,
 		#[cfg(feature = "yandex-messenger")]
 		yandex_messenger,
 		artifact_scanner_semaphore: Arc::new(Semaphore::new(2)),

@@ -9,8 +9,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use nexus_sec_proxy_cache::CacheStats;
 use nexus_sec_proxy_config::{
-	AppConfig, ArtifactScannerKind, UnsupportedTargetPolicy, load_policy_file,
-	parse_policy_toml,
+	AppConfig, UnsupportedTargetPolicy, load_policy_file, parse_policy_toml,
 };
 use nexus_sec_proxy_security::{EnforcementMode, PolicyContext, PolicySet};
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,8 @@ pub(crate) struct ImmutableConfigSummary {
 	bind_addr: String,
 	nexus_base_url: String,
 	nexus_username_configured: bool,
+	docker_registry_base_url: Option<String>,
+	docker_repository_name: Option<String>,
 	repository_refresh_interval_secs: u64,
 	yandex_messenger_available: bool,
 	yandex_messenger_enabled: bool,
@@ -60,8 +61,10 @@ pub(crate) struct CacheSummary {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScannerSummary {
 	enabled: bool,
-	kind: ArtifactScannerKind,
-	command: String,
+	routes: BTreeMap<String, String>,
+	docker_registry_configured: bool,
+	docker_repository_name: Option<String>,
+	docker_scanner: Option<String>,
 	skip_db_update: bool,
 	offline: bool,
 	timeout_secs: u64,
@@ -569,6 +572,8 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 		bind_addr: config.bind_addr.to_string(),
 		nexus_base_url: config.nexus_base_url.clone(),
 		nexus_username_configured: config.nexus_username.is_some(),
+		docker_registry_base_url: config.docker_registry_base_url.clone(),
+		docker_repository_name: config.docker_repository_name.clone(),
 		repository_refresh_interval_secs: config
 			.repository_refresh_interval_secs,
 		yandex_messenger_available: cfg!(feature = "yandex-messenger"),
@@ -615,10 +620,31 @@ async fn cache_summary(state: &AppState) -> CacheSummary {
 }
 
 fn scanner_summary(state: &AppState) -> ScannerSummary {
+	let routes = state
+		.config
+		.artifact_scanner_formats
+		.iter()
+		.map(|(format, scanner)| (format.clone(), scanner.command().to_owned()))
+		.collect();
+	let enabled =
+		state
+			.config
+			.artifact_scanner_formats
+			.iter()
+			.any(|(format, _)| {
+				format.as_str() != "docker"
+					|| state.config.docker_registry_configured()
+			});
+
 	ScannerSummary {
-		enabled: state.artifact_scanner.is_some(),
-		kind: state.config.artifact_scanner,
-		command: state.config.artifact_scanner_command.clone(),
+		enabled,
+		routes,
+		docker_registry_configured: state.config.docker_registry_configured(),
+		docker_repository_name: state.config.docker_repository_name.clone(),
+		docker_scanner: state
+			.config
+			.artifact_scanner_for_format("docker")
+			.map(|scanner| scanner.command().to_owned()),
 		skip_db_update: state.config.artifact_scanner_skip_db_update,
 		offline: state.config.artifact_scanner_offline,
 		timeout_secs: state.config.artifact_scanner_timeout_secs,
