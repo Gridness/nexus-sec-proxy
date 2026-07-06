@@ -1,0 +1,68 @@
+# Example policy file for nexus-sec-proxy.
+#
+# Point the proxy at it with:
+#   NEXUS_SEC_PROXY_POLICY_FILE=/etc/nexus-sec-proxy/policy.toml
+#
+# Reload at runtime without a restart:
+#   curl -X POST -H "Authorization: Bearer ${NEXUS_SEC_PROXY_ADMIN_TOKEN}" \
+#     http://127.0.0.1:3000/admin/api/policy/reload
+#
+# Validate this file's structure and JSON Schema:
+#   schemas/policy.schema.json
+
+# [default_policy] is required. It applies when no scoped [[policies]] entry
+# matches. Omitted limit fields are treated as "no cap" for that severity.
+[default_policy]
+id = "default"
+minimum_blocking_severity = "HIGH"
+mode = "enforce"
+max_critical_vulnerabilities = 0
+max_high_vulnerabilities = 0
+max_medium_vulnerabilities = 5
+max_low_vulnerabilities = 10
+
+# Map Nexus repository names to teams. The `team` value feeds both policy
+# scoping (see [[policies]] below) and audit events.
+[repositories."npm-internal"]
+team = "web"
+
+[repositories."pypi-proxy"]
+team = "data"
+
+# Scoped policies are evaluated in file order; the first match wins. Omitted
+# scope arrays (repositories / formats / teams) act as wildcards.
+[[policies]]
+id = "web-npm-internal"
+repositories = ["npm-internal"]
+formats = ["npm"]
+teams = ["web"]
+minimum_blocking_severity = "MEDIUM"
+mode = "enforce"
+max_critical_vulnerabilities = 0
+max_high_vulnerabilities = 0
+
+# A report-only policy: violations are logged (audit event
+# `policy_report_only_violation`) but the request is still forwarded to Nexus.
+[[policies]]
+id = "data-pypi-monitor"
+repositories = ["pypi-proxy"]
+formats = ["PyPI"]
+teams = ["data"]
+minimum_blocking_severity = "HIGH"
+mode = "report_only"
+
+# Allow a specific, ticketed vulnerability to pass even when it would otherwise
+# be blocked. `expires_at` is RFC 3339; expired exceptions are ignored and
+# logged as `policy_exception_expired_match`.
+[[exceptions]]
+id = "SEC-1234"
+owner = "security"
+ticket = "SEC-1234"
+reason = "temporary rollout exception pending upstream fix"
+expires_at = "2026-12-31T23:59:59Z"
+vulnerability_ids = ["CVE-2026-0001", "GHSA-xxxx-yyyy-zzzz"]
+repositories = ["npm-internal"]
+formats = ["npm"]
+teams = ["web"]
+packages = ["left-pad"]
+versions = ["1.0.0"]
