@@ -97,6 +97,85 @@ impl ExternalScanner {
 			}
 		}
 	}
+
+	pub async fn scan_image(
+		&self,
+		target: &ScanTarget,
+		image: &str,
+		docker_config: Option<&Path>,
+		insecure_registry: bool,
+	) -> Result<Vec<Vulnerability>, SecurityError> {
+		let mut command = Command::new(&self.command);
+		if let Some(docker_config) = docker_config {
+			command.env("DOCKER_CONFIG", docker_config);
+		}
+
+		match self.kind {
+			ExternalScannerKind::Trivy => {
+				command
+					.arg("image")
+					.arg("--format")
+					.arg("json")
+					.arg("--quiet")
+					.arg("--scanners")
+					.arg("vuln")
+					.arg("--exit-code")
+					.arg("0")
+					.arg("--image-src")
+					.arg("remote");
+
+				if insecure_registry {
+					command.arg("--insecure");
+				}
+
+				if self.skip_db_update {
+					command.arg("--skip-db-update");
+					command.arg("--skip-java-db-update");
+				}
+
+				if self.offline {
+					command.arg("--offline-scan");
+				}
+
+				command.arg(image);
+			}
+			ExternalScannerKind::Grype => {
+				if insecure_registry {
+					command.env("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true");
+					command
+						.env("GRYPE_REGISTRY_INSECURE_SKIP_TLS_VERIFY", "true");
+				}
+
+				command
+					.arg(image)
+					.arg("-o")
+					.arg("json")
+					.arg("--from")
+					.arg("registry");
+			}
+		}
+
+		let output = tokio_time::timeout(self.timeout, command.output())
+			.await
+			.map_err(|_| SecurityError::ScannerTimeout(self.timeout))?
+			.map_err(|error| SecurityError::Request(error.to_string()))?;
+
+		if !output.status.success() {
+			return Err(SecurityError::ScannerFailed {
+				status: output.status.to_string(),
+				stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+			});
+		}
+
+		match self.kind {
+			ExternalScannerKind::Trivy => {
+				parse_trivy_output(target, &output.stdout)
+			}
+			ExternalScannerKind::Grype => {
+				parse_grype_output(target, &output.stdout)
+			}
+		}
+	}
 }
 pub(crate) fn parse_trivy_output(
 	target: &ScanTarget,

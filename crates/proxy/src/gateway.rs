@@ -3,11 +3,17 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONNECTION, HOST, TRANSFER_ENCODING};
+use axum::http::header::{
+	AUTHORIZATION, CONNECTION, HOST, RANGE, TRANSFER_ENCODING,
+};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::StreamExt;
+use nexus_sec_proxy_cache::{CacheKey, CachedScan, ScanCache};
 use nexus_sec_proxy_security::ScanTarget;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tokio::io::AsyncWriteExt;
 use tracing::error;
 use url::Url;
 
@@ -16,8 +22,12 @@ use crate::catalog::parse_repository_path;
 use crate::classifier::{
 	ClassificationContext, RequestClassification, classify_path,
 };
+use crate::docker::{handle_docker_registry_request, is_docker_registry_path};
 use crate::responses::{response_with_text, unknown_repository_response};
-use crate::scan::{authorize_package_target, handle_unsupported_target};
+use crate::scan::{
+	authorize_package_target, external_scanner_for_kind,
+	handle_policy_evaluation, handle_unsupported_target, put_cache,
+};
 use crate::state::AppState;
 
 pub(crate) async fn proxy_handler(
@@ -42,6 +52,19 @@ pub(crate) async fn proxy_handler(
 			StatusCode::NOT_FOUND,
 			"Trust report not found\n",
 		);
+	}
+	if state.config.docker_registry_configured()
+		&& is_docker_registry_path(uri.path())
+	{
+		return handle_docker_registry_request(
+			&state,
+			method,
+			uri,
+			&headers,
+			body,
+			requester_login.as_deref(),
+		)
+		.await;
 	}
 
 	if let Some(repository_path) = parse_repository_path(uri.path()) {
@@ -75,13 +98,53 @@ pub(crate) async fn proxy_handler(
 						return *response;
 					}
 				}
-				RequestClassification::Scan(target @ ScanTarget::Artifact(_)) => {
-					if let Err(response) = handle_unsupported_target(
+				RequestClassification::Scan(
+					target @ ScanTarget::Artifact(_),
+				) => {
+					if let Some(scanner) = state
+						.config
+						.artifact_scanner_for_format(&repository.format)
+					{
+						if method == Method::HEAD {
+							// HEAD has no bytes to scan.
+						} else if headers.contains_key(RANGE) {
+							if let Err(response) = handle_unsupported_target(
+								&state,
+								&repository,
+								target,
+								"artifact range requests cannot be scanned"
+									.to_owned(),
+								requester_login.as_deref(),
+							)
+							.await
+							{
+								return *response;
+							}
+						} else {
+							match authorize_artifact_target(
+								&state,
+								&repository,
+								target,
+								scanner,
+								&uri,
+								&headers,
+								requester_login.as_deref(),
+							)
+							.await
+							{
+								Ok(Some(response)) => return response,
+								Ok(None) => {}
+								Err(response) => return *response,
+							}
+						}
+					} else if let Err(response) = handle_unsupported_target(
 						&state,
 						&repository,
 						target,
-						"artifact targets cannot be scanned before contacting Nexus"
-							.to_owned(),
+						format!(
+							"artifact format {} is not mapped to a scanner",
+							repository.format
+						),
 						requester_login.as_deref(),
 					)
 					.await
@@ -111,19 +174,34 @@ async fn forward_request(
 	headers: &HeaderMap,
 	body: Body,
 ) -> anyhow::Result<Response<Body>> {
-	let nexus_url = build_nexus_url(&state.nexus_base_url, &uri);
+	forward_request_to_base(
+		state,
+		&state.nexus_base_url,
+		method,
+		uri,
+		headers,
+		body,
+	)
+	.await
+}
+
+pub(crate) async fn forward_request_to_base(
+	state: &AppState,
+	base_url: &Url,
+	method: Method,
+	uri: Uri,
+	headers: &HeaderMap,
+	body: Body,
+) -> anyhow::Result<Response<Body>> {
+	let nexus_url = build_nexus_url(base_url, &uri);
 	let reqwest_method =
 		reqwest::Method::from_bytes(method.as_str().as_bytes())
 			.context("invalid request method")?;
-	let mut request = state.http_client.request(reqwest_method, nexus_url);
-
-	for (name, value) in headers {
-		if is_hop_by_hop_header(name.as_str()) {
-			continue;
-		}
-
-		request = request.header(name, value);
-	}
+	let request = copy_request_headers(
+		state.http_client.request(reqwest_method, nexus_url),
+		headers,
+		false,
+	);
 
 	let response = request
 		.body(reqwest::Body::wrap_stream(body.into_data_stream()))
@@ -133,7 +211,375 @@ async fn forward_request(
 	response_from_nexus(response)
 }
 
-fn response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
+async fn authorize_artifact_target(
+	state: &AppState,
+	repository: &crate::catalog::NexusRepository,
+	target: ScanTarget,
+	scanner: nexus_sec_proxy_config::ArtifactScannerKind,
+	uri: &Uri,
+	headers: &HeaderMap,
+	requester_login: Option<&str>,
+) -> Result<Option<Response<Body>>, Box<Response<Body>>> {
+	let cache_key = artifact_cache_key(repository, &target, uri);
+
+	match state.cache.get(&cache_key).await {
+		Ok(Some(scan)) => {
+			let active_policy = state.active_policy();
+			let context =
+				active_policy.context_for(&repository.name, &repository.format);
+			handle_policy_evaluation(
+				state,
+				&context,
+				&target,
+				active_policy.evaluator.evaluate_with_context(
+					&context,
+					&target,
+					scan.vulnerabilities,
+				),
+				requester_login,
+			)
+			.await?;
+			return Ok(None);
+		}
+		Ok(None) => {}
+		Err(error) => {
+			error!(%error, target = %target.display_name(), "cache lookup failed");
+		}
+	}
+
+	let permit = match state
+		.artifact_scanner_semaphore
+		.clone()
+		.acquire_owned()
+		.await
+	{
+		Ok(permit) => permit,
+		Err(error) => {
+			return artifact_scan_failure(
+				state,
+				&target,
+				format!("scanner concurrency limiter failed: {error}"),
+			);
+		}
+	};
+
+	let prefetched = match prefetch_artifact(state, uri, headers, &target).await
+	{
+		Ok(PrefetchResult::Complete(prefetched)) => prefetched,
+		Ok(PrefetchResult::Forward(response)) => {
+			drop(permit);
+			return Ok(Some(response));
+		}
+		Ok(PrefetchResult::TooLarge { nexus_response }) => {
+			drop(permit);
+			return oversized_artifact_response(
+				state,
+				repository,
+				target,
+				nexus_response,
+				requester_login,
+			)
+			.await;
+		}
+		Err(error) => {
+			drop(permit);
+			return artifact_scan_failure(
+				state,
+				&target,
+				format!("artifact prefetch failed: {error}"),
+			);
+		}
+	};
+
+	let scanner = external_scanner_for_kind(&state.config, scanner);
+	let vulnerabilities = match scanner
+		.scan_path(&target, prefetched.file.path())
+		.await
+	{
+		Ok(vulnerabilities) => vulnerabilities,
+		Err(error) => {
+			drop(permit);
+			if state.config.fail_open {
+				tracing::warn!(
+					%error,
+					target = %target.display_name(),
+					"allowing artifact because scanner failed and fail_open=true"
+				);
+				return Ok(Some(prefetched.into_response()));
+			}
+
+			return Err(Box::new(response_with_text(
+				StatusCode::SERVICE_UNAVAILABLE,
+				format!(
+					"Artifact scan failed and fail_open=false\n\nTarget: {}\nReason: {error}\n",
+					target.display_name()
+				),
+			)));
+		}
+	};
+	drop(permit);
+
+	put_cache(
+		state,
+		cache_key,
+		CachedScan::new(vulnerabilities.clone()),
+		&target,
+	)
+	.await;
+	let active_policy = state.active_policy();
+	let context =
+		active_policy.context_for(&repository.name, &repository.format);
+	handle_policy_evaluation(
+		state,
+		&context,
+		&target,
+		active_policy.evaluator.evaluate_with_context(
+			&context,
+			&target,
+			vulnerabilities,
+		),
+		requester_login,
+	)
+	.await?;
+
+	Ok(Some(prefetched.into_response()))
+}
+
+enum PrefetchResult {
+	Complete(PrefetchedArtifact),
+	Forward(Response<Body>),
+	TooLarge {
+		nexus_response: Option<reqwest::Response>,
+	},
+}
+
+struct PrefetchedArtifact {
+	status: StatusCode,
+	headers: HeaderMap,
+	bytes: Vec<u8>,
+	file: NamedTempFile,
+}
+
+impl PrefetchedArtifact {
+	fn into_response(self) -> Response<Body> {
+		let mut builder = Response::builder().status(self.status);
+		for (name, value) in &self.headers {
+			builder = builder.header(name, value);
+		}
+		builder
+			.body(Body::from(self.bytes))
+			.expect("prefetched Nexus response is valid")
+	}
+}
+
+async fn prefetch_artifact(
+	state: &AppState,
+	uri: &Uri,
+	headers: &HeaderMap,
+	target: &ScanTarget,
+) -> anyhow::Result<PrefetchResult> {
+	let nexus_url = build_nexus_url(&state.nexus_base_url, uri);
+	let request =
+		copy_request_headers(state.http_client.get(nexus_url), headers, true);
+	let response = request
+		.send()
+		.await
+		.context("Nexus artifact request failed")?;
+	let status = StatusCode::from_u16(response.status().as_u16())
+		.context("invalid Nexus status code")?;
+
+	if status != StatusCode::OK {
+		return response_from_nexus(response).map(PrefetchResult::Forward);
+	}
+
+	if response
+		.content_length()
+		.is_some_and(|length| length > state.config.artifact_scan_max_bytes)
+	{
+		return Ok(PrefetchResult::TooLarge {
+			nexus_response: Some(response),
+		});
+	}
+
+	let headers = response_headers(response.headers());
+	let file = temporary_artifact_file(state, uri)?;
+	let mut writer = tokio::fs::File::from_std(
+		file.reopen()
+			.context("failed to reopen artifact temp file")?,
+	);
+	let mut bytes = Vec::new();
+	let mut total_size = 0_u64;
+	let mut stream = response.bytes_stream();
+
+	while let Some(chunk) = stream.next().await {
+		let chunk = chunk.context("failed to read Nexus artifact bytes")?;
+		total_size = total_size
+			.checked_add(chunk.len() as u64)
+			.context("artifact size overflow")?;
+		if total_size > state.config.artifact_scan_max_bytes {
+			return Ok(PrefetchResult::TooLarge {
+				nexus_response: None,
+			});
+		}
+		writer
+			.write_all(&chunk)
+			.await
+			.context("failed to write artifact temp file")?;
+		bytes.extend_from_slice(&chunk);
+	}
+	writer
+		.flush()
+		.await
+		.context("failed to flush artifact temp file")?;
+	writer
+		.sync_all()
+		.await
+		.context("failed to sync artifact temp file")?;
+	drop(writer);
+
+	tracing::debug!(
+		target = %target.display_name(),
+		bytes = total_size,
+		path = %file.path().display(),
+		"prefetched artifact for scanning"
+	);
+
+	Ok(PrefetchResult::Complete(PrefetchedArtifact {
+		status,
+		headers,
+		bytes,
+		file,
+	}))
+}
+
+fn temporary_artifact_file(
+	state: &AppState,
+	uri: &Uri,
+) -> anyhow::Result<NamedTempFile> {
+	let mut builder = TempFileBuilder::new();
+	builder.prefix("artifact-");
+	let suffix = artifact_suffix(uri.path());
+	if !suffix.is_empty() {
+		builder.suffix(&suffix);
+	}
+
+	if let Some(dir) = state.config.artifact_tmp_dir.as_deref() {
+		builder
+			.tempfile_in(dir)
+			.with_context(|| format!("failed to create temp file in {dir}"))
+	} else {
+		builder.tempfile().context("failed to create temp file")
+	}
+}
+
+fn artifact_suffix(path: &str) -> String {
+	let file_name = path.rsplit('/').next().unwrap_or_default();
+	let Some(dot) = file_name.find('.') else {
+		return String::new();
+	};
+
+	file_name[dot..].to_owned()
+}
+
+async fn oversized_artifact_response(
+	state: &AppState,
+	repository: &crate::catalog::NexusRepository,
+	target: ScanTarget,
+	nexus_response: Option<reqwest::Response>,
+	requester_login: Option<&str>,
+) -> Result<Option<Response<Body>>, Box<Response<Body>>> {
+	let result = handle_unsupported_target(
+		state,
+		repository,
+		target,
+		format!(
+			"artifact exceeds NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES ({})",
+			state.config.artifact_scan_max_bytes
+		),
+		requester_login,
+	)
+	.await;
+
+	match result {
+		Ok(()) => match nexus_response {
+			Some(response) => {
+				response_from_nexus(response).map(Some).map_err(|error| {
+					Box::new(response_with_text(
+						StatusCode::BAD_GATEWAY,
+						format!("failed to proxy Nexus request: {error}\n"),
+					))
+				})
+			}
+			None => Ok(None),
+		},
+		Err(response) => Err(response),
+	}
+}
+
+fn artifact_scan_failure(
+	state: &AppState,
+	target: &ScanTarget,
+	reason: String,
+) -> Result<Option<Response<Body>>, Box<Response<Body>>> {
+	error!(target = %target.display_name(), reason, "artifact scanner failed");
+
+	if state.config.fail_open {
+		tracing::warn!(
+			target = %target.display_name(),
+			"allowing artifact because scanner failed and fail_open=true"
+		);
+		return Ok(None);
+	}
+
+	Err(Box::new(response_with_text(
+		StatusCode::SERVICE_UNAVAILABLE,
+		format!(
+			"Artifact scan failed and fail_open=false\n\nTarget: {}\nReason: {reason}\n",
+			target.display_name()
+		),
+	)))
+}
+
+fn artifact_cache_key(
+	repository: &crate::catalog::NexusRepository,
+	target: &ScanTarget,
+	uri: &Uri,
+) -> CacheKey {
+	let ScanTarget::Artifact(artifact) = target else {
+		unreachable!("artifact cache key requires an artifact target");
+	};
+	let identifier = artifact.digest.clone().unwrap_or_else(|| {
+		let path_query = uri
+			.path_and_query()
+			.map(|value| value.as_str())
+			.unwrap_or_else(|| uri.path());
+		format!("{}\n{path_query}", repository.name)
+	});
+
+	CacheKey::from_parts(target.cache_namespace(), identifier, None::<String>)
+}
+
+pub(crate) fn copy_request_headers(
+	mut request: reqwest::RequestBuilder,
+	headers: &HeaderMap,
+	strip_conditionals: bool,
+) -> reqwest::RequestBuilder {
+	for (name, value) in headers {
+		if is_hop_by_hop_header(name.as_str())
+			|| (strip_conditionals && is_conditional_header(name.as_str()))
+		{
+			continue;
+		}
+
+		request = request.header(name, value);
+	}
+
+	request
+}
+
+pub(crate) fn response_headers(
+	headers: &reqwest::header::HeaderMap,
+) -> HeaderMap {
 	let mut response_headers = HeaderMap::new();
 
 	for (name, value) in headers {
@@ -147,7 +593,7 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
 	response_headers
 }
 
-fn response_from_nexus(
+pub(crate) fn response_from_nexus(
 	response: reqwest::Response,
 ) -> anyhow::Result<Response<Body>> {
 	let status = StatusCode::from_u16(response.status().as_u16())
@@ -190,6 +636,14 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 		|| name.eq_ignore_ascii_case("te")
 		|| name.eq_ignore_ascii_case("trailer")
 		|| name.eq_ignore_ascii_case("upgrade")
+}
+
+fn is_conditional_header(name: &str) -> bool {
+	name.eq_ignore_ascii_case("if-match")
+		|| name.eq_ignore_ascii_case("if-none-match")
+		|| name.eq_ignore_ascii_case("if-modified-since")
+		|| name.eq_ignore_ascii_case("if-unmodified-since")
+		|| name.eq_ignore_ascii_case("if-range")
 }
 
 pub(crate) fn basic_auth_username(headers: &HeaderMap) -> Option<String> {

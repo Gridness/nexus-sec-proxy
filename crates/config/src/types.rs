@@ -27,12 +27,10 @@ impl FromStr for UnsupportedTargetPolicy {
 }
 
 #[derive(
-	Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+	Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactScannerKind {
-	#[default]
-	Disabled,
 	Trivy,
 	Grype,
 }
@@ -42,10 +40,19 @@ impl FromStr for ArtifactScannerKind {
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		match value.trim().to_ascii_lowercase().as_str() {
-			"disabled" | "none" | "off" => Ok(Self::Disabled),
 			"trivy" => Ok(Self::Trivy),
 			"grype" => Ok(Self::Grype),
 			_ => Err(()),
+		}
+	}
+}
+
+impl ArtifactScannerKind {
+	#[must_use]
+	pub fn command(self) -> &'static str {
+		match self {
+			Self::Trivy => "trivy",
+			Self::Grype => "grype",
 		}
 	}
 }

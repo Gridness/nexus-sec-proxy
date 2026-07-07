@@ -19,9 +19,16 @@ Request flow:
 6. Enforced blocks create a self-contained Trust report and return
    `403 Forbidden` with its secret URL before Nexus receives the request.
 7. Report-only and allowed package requests are forwarded to Nexus.
-8. Artifact-only targets are not prefetched from Nexus. They are controlled by
-   `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`: `block` denies them before
-   Nexus; `allow` forwards them without artifact scanning.
+8. When Docker registry mode is configured, root `/v2/...` pull requests are
+   sent to the Nexus Docker connector. Ping, tag, blob, and manifest-list
+   requests pass through; concrete `GET /v2/{name}/manifests/{reference}`
+   responses are scanned by image digest before the manifest is released.
+9. Artifact-only targets are scanned only when their Nexus repository format is
+   explicitly mapped in `NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS`. Unmapped
+   artifacts use `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`.
+10. Mapped artifact `GET` requests are fetched from Nexus, buffered to a
+   temporary file, scanned, and released only after the active policy allows or
+   reports the result.
 
 ## Run
 
@@ -36,6 +43,11 @@ Health check:
 ```bash
 curl http://127.0.0.1:3000/healthz
 ```
+
+`/healthz` returns readiness JSON with `200 OK` when Nexus catalog access,
+Trust report storage, the configured Docker registry connector, and every
+active mapped scanner are healthy. It returns `503 Service Unavailable` when
+any required check fails. OSV is not probed.
 
 ## E2E Environment
 
@@ -71,6 +83,8 @@ Common:
 NEXUS_SEC_PROXY_BIND_ADDR=127.0.0.1:3000
 NEXUS_SEC_PROXY_NEXUS_USERNAME=
 NEXUS_SEC_PROXY_NEXUS_PASSWORD=
+NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL=
+NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME=
 NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS=60
 NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES=apt-proxy=Ubuntu OS,yum-proxy=Rocky Linux
 NEXUS_SEC_PROXY_OSV_API_URL=https://api.osv.dev/v1/query
@@ -85,6 +99,13 @@ NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS=30
 NEXUS_SEC_PROXY_LOG_JSON=false
 NEXUS_SEC_PROXY_FAIL_OPEN=true
 NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS=
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE=true
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_OFFLINE=true
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS=300
+NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES=536870912
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY=2
+NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy
 ```
 
 Configuration notes:
@@ -93,8 +114,14 @@ Configuration notes:
   `NEXUS_SEC_PROXY_UPSTREAM_BASE_URL` and `NEXUS_SEC_PROXY_UPSTREAM_REGISTRY`
   names are accepted as compatibility fallbacks.
 - `NEXUS_SEC_PROXY_NEXUS_USERNAME` and
-  `NEXUS_SEC_PROXY_NEXUS_PASSWORD` are used only for repository catalog
-  discovery.
+  `NEXUS_SEC_PROXY_NEXUS_PASSWORD` are used for repository catalog discovery
+  and, when both are set, for the scanner's temporary Docker auth config.
+- `NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL` enables root `/v2/...` Docker
+  registry mode. Set it to the Nexus Docker proxy connector origin, for
+  example `http://nexus:5000`; do not set it to the Nexus UI URL.
+- `NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME` is required when Docker registry
+  mode is enabled. Startup and catalog reload fail if this repository is
+  missing from the Nexus catalog or its format is not `docker`.
 - `NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS` refreshes the repository
   catalog independently in each proxy replica. The default is `60`; set it to
   `0` to disable automatic refresh. Failed refreshes keep the last valid
@@ -123,12 +150,59 @@ Configuration notes:
   `NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS` (minimum `1`, default `30`).
   Replicas on different hosts must mount the same external shared filesystem
   at the configured report directory.
-- `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV fails. Set it to
-  `false` to return `503 Service Unavailable` on scanner failures.
+- `NEXUS_SEC_PROXY_FAIL_OPEN=true` allows downloads when OSV, artifact
+  prefetch, or artifact scanning fails. Set it to `false` to return
+  `503 Service Unavailable` on scanner failures.
 - `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
-  be checked before Nexus. Set it to `block` to deny them before Nexus.
+  be checked. Set it to `block` to deny them and create Trust reports.
+- `NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS` maps normalized Nexus repository
+  formats to `trivy` or `grype`, for example
+  `helm=trivy,p2=grype,docker=trivy`.
+  Empty/unset means no artifact formats are scanned. Malformed entries,
+  unknown scanners, and duplicate normalized formats fail startup.
+- Docker scanning is active only when Docker registry mode is configured, the
+  configured repository format is `docker`, and this map includes
+  `docker=trivy` or `docker=grype`.
+- Artifact scanning contacts Nexus and buffers one complete `200 OK` response
+  before releasing bytes to the client. Conditional request headers are
+  stripped from uncached artifact prefetches so Nexus returns bytes to scan.
+- Docker blobs are never scanned directly. Docker pull safety is enforced at
+  concrete image manifest requests; manual blob-by-digest downloads are
+  pass-through.
+- Git LFS objects, arbitrary raw files, and other binary-only formats require
+  explicit operator validation before mapping. The project ships no default
+  map to avoid false security claims.
 - The initial repository catalog load is mandatory. A load failure or empty
   catalog fails startup.
+
+## Docker Pull Safety
+
+Docker clients use the registry API at this proxy's root `/v2/...` path when
+Docker registry mode is configured:
+
+```bash
+NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL=http://nexus:5000
+NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME=docker-proxy
+NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS=docker=trivy
+```
+
+Behavior:
+
+- `GET` and `HEAD /v2/`, tag listing, manifest lists/indexes, and blob
+  requests are forwarded to the Nexus Docker connector unchanged, including
+  client auth, `Accept`, and `Range` headers.
+- Push/upload/delete and other non-pull methods under `/v2` return a Docker
+  `UNSUPPORTED` error. This version is pull-only.
+- `GET /v2/{image}/manifests/{reference}` is the enforcement point for
+  concrete image manifests. The proxy first asks Nexus to resolve/cache the
+  image, resolves `Docker-Content-Digest` or a digest reference, scans
+  `{registry-host}/{image}@{digest}` with Trivy or Grype image mode, then
+  releases the already-fetched manifest only when policy allows or reports it.
+- Raw vulnerabilities are cached as `docker:{repository}/{image}@{digest}` and
+  re-evaluated against the current policy on every pull. Tag changes do not
+  reuse stale tag-based decisions.
+- Scanner failures and manifest-resolution failures follow
+  `NEXUS_SEC_PROXY_FAIL_OPEN`.
 
 ## Policy Configuration
 
@@ -222,8 +296,9 @@ Read-only endpoints:
 - `GET /admin/api/repositories` returns the loaded Nexus repository catalog.
 - `GET /admin/api/cache` returns cache counts plus configured TTLs and
   capacity.
-- `GET /admin/api/scanner` returns scanner config and best-effort local DB
-  file age.
+- `GET /admin/api/scanner` returns artifact format routes, Docker registry
+  scanner status, shared scanner limits, available permits, and best-effort
+  local DB file age.
 - `GET /admin/api/decisions?limit=N` returns recent blocked and report-only
   decisions, newest first. Blocked decisions include `report_url`; report-only
   decisions use `null`.
@@ -324,7 +399,9 @@ NEXUS_SEC_PROXY_REQUEST_TIMEOUT_SECS=30
 The cache stores raw vulnerability lists, not final allow/block decisions.
 Cached vulnerability lists are re-evaluated on every request so policy reloads,
 repository scopes, team scopes, and exception expiry do not leak across
-repositories.
+repositories. URI-addressed artifact cache keys include the repository name and
+full path/query; generic digest-addressed artifact keys use the digest. Docker
+image scan keys use `docker:{repository}/{image}@{digest}`.
 
 ## Current Format Handling
 
@@ -350,15 +427,16 @@ database precisely enough:
 - APT / Debian / Ubuntu
 - Yum / RPM
 
-These formats are classified as artifact targets by default and are controlled
-by `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`:
+These formats are classified as artifact targets by default. They are scanned
+only when their Nexus format is explicitly mapped in
+`NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS`; otherwise they are controlled by
+`NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`:
 
 - Ansible Galaxy collections
 - Bower
 - CocoaPods
 - Conan
 - Conda
-- Docker manifests and blobs
 - Git LFS objects
 - Helm charts
 - Hugging Face assets
@@ -366,3 +444,7 @@ by `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`:
 - Raw repositories
 - Terraform modules/providers
 - unknown binary archives
+
+Docker is handled separately through root `/v2` registry mode. Docker blobs
+are pass-through; concrete image manifest requests are scanned in image mode
+when `docker=trivy` or `docker=grype` is configured.

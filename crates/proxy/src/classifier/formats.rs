@@ -308,32 +308,10 @@ pub(super) fn classify_git_lfs(
 }
 
 pub(super) fn classify_docker(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
+	_context: &ClassificationContext,
+	_path: &str,
+	_segments: &[String],
 ) -> Option<ScanTarget> {
-	if segments.first().is_none_or(|segment| segment != "v2") {
-		return None;
-	}
-
-	if let Some(index) = segments.iter().position(|segment| segment == "blobs")
-	{
-		let digest = segments.get(index + 1)?;
-
-		return Some(ScanTarget::Artifact(ArtifactTarget::with_digest(
-			&context.repository_format,
-			path,
-			digest.clone(),
-		)));
-	}
-
-	if segments.iter().any(|segment| segment == "manifests") {
-		return Some(ScanTarget::Artifact(ArtifactTarget::new(
-			&context.repository_format,
-			path,
-		)));
-	}
-
 	None
 }
 

@@ -19,11 +19,12 @@ COPY crates/security/Cargo.toml crates/security/Cargo.toml
 COPY crates/yandex-messenger/Cargo.toml crates/yandex-messenger/Cargo.toml
 
 RUN set -eux; \
-	mkdir -p crates/cache/src crates/config/src crates/proxy/src crates/security/src crates/yandex-messenger/src; \
+	mkdir -p crates/cache/src crates/config/src crates/proxy/src crates/security/src crates/security/examples crates/yandex-messenger/src; \
 	printf 'pub fn placeholder() {}\n' > crates/cache/src/lib.rs; \
 	printf 'pub fn placeholder() {}\n' > crates/config/src/lib.rs; \
 	printf 'fn main() {}\n' > crates/proxy/src/main.rs; \
 	printf 'pub fn placeholder() {}\n' > crates/security/src/lib.rs; \
+	printf 'fn main() {}\n' > crates/security/examples/policy_schema.rs; \
 	printf 'pub fn placeholder() {}\n' > crates/yandex-messenger/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

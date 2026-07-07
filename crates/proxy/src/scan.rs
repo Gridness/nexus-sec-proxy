@@ -280,7 +280,7 @@ fn block_response_body(report: &BlockReport, report_url: &str) -> String {
 	body
 }
 
-async fn put_cache(
+pub(crate) async fn put_cache(
 	state: &AppState,
 	key: CacheKey,
 	scan: CachedScan,
@@ -291,22 +291,22 @@ async fn put_cache(
 	}
 }
 
-pub(crate) fn external_scanner_from_config(
+pub(crate) fn external_scanner_for_kind(
 	config: &AppConfig,
-) -> Option<ExternalScanner> {
-	let kind = match config.artifact_scanner {
-		ArtifactScannerKind::Disabled => return None,
+	kind: ArtifactScannerKind,
+) -> ExternalScanner {
+	let external_kind = match kind {
 		ArtifactScannerKind::Trivy => ExternalScannerKind::Trivy,
 		ArtifactScannerKind::Grype => ExternalScannerKind::Grype,
 	};
 
-	Some(ExternalScanner::new(
-		kind,
-		config.artifact_scanner_command.clone(),
+	ExternalScanner::new(
+		external_kind,
+		kind.command(),
 		Duration::from_secs(config.artifact_scanner_timeout_secs),
 		config.artifact_scanner_skip_db_update,
 		config.artifact_scanner_offline,
-	))
+	)
 }
 fn cache_key_for_target(target: &ScanTarget) -> CacheKey {
 	CacheKey::from_parts(

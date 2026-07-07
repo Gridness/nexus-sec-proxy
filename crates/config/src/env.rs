@@ -212,33 +212,6 @@ pub(crate) fn unsupported_target_policy_env(
 		.unwrap_or(Ok(default))
 }
 
-pub(crate) fn artifact_scanner_env(
-	lookup: &mut impl FnMut(&'static str) -> Option<String>,
-	name: &'static str,
-	default: ArtifactScannerKind,
-) -> Result<ArtifactScannerKind, ConfigError> {
-	optional_string_env(lookup, name)
-		.map(|value| {
-			value
-				.parse()
-				.map_err(|()| ConfigError::InvalidArtifactScanner {
-					name,
-					value,
-				})
-		})
-		.unwrap_or(Ok(default))
-}
-
-pub(crate) fn default_artifact_scanner_command(
-	scanner: ArtifactScannerKind,
-) -> String {
-	match scanner {
-		ArtifactScannerKind::Disabled => String::new(),
-		ArtifactScannerKind::Trivy => "trivy".to_owned(),
-		ArtifactScannerKind::Grype => "grype".to_owned(),
-	}
-}
-
 pub(crate) fn list_env(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 	name: &'static str,
@@ -292,4 +265,78 @@ pub(crate) fn osv_ecosystem_overrides_env(
 	}
 
 	Ok(overrides)
+}
+
+pub(crate) fn artifact_scanner_formats_env(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<BTreeMap<String, ArtifactScannerKind>, ConfigError> {
+	let Some(value) = optional_string_env(lookup, name) else {
+		return Ok(BTreeMap::new());
+	};
+	let mut routes = BTreeMap::new();
+
+	for item in value.split(',') {
+		let trimmed = item.trim();
+		if trimmed.is_empty() {
+			return Err(invalid_artifact_scanner_format_map(
+				name,
+				trimmed,
+				"empty entry",
+			));
+		}
+
+		let Some((format, scanner)) = trimmed.split_once('=') else {
+			return Err(invalid_artifact_scanner_format_map(
+				name,
+				trimmed,
+				"expected format=scanner",
+			));
+		};
+		let format = normalize_artifact_format(format);
+		if format.is_empty() {
+			return Err(invalid_artifact_scanner_format_map(
+				name,
+				trimmed,
+				"empty format",
+			));
+		}
+
+		let scanner = scanner.trim().parse().map_err(|()| {
+			invalid_artifact_scanner_format_map(
+				name,
+				trimmed,
+				"scanner must be trivy or grype",
+			)
+		})?;
+		if routes.insert(format.clone(), scanner).is_some() {
+			return Err(invalid_artifact_scanner_format_map(
+				name,
+				trimmed,
+				"duplicate normalized format",
+			));
+		}
+	}
+
+	Ok(routes)
+}
+
+pub(crate) fn normalize_artifact_format(format: &str) -> String {
+	format
+		.chars()
+		.filter(|character| character.is_ascii_alphanumeric())
+		.flat_map(char::to_lowercase)
+		.collect()
+}
+
+fn invalid_artifact_scanner_format_map(
+	name: &'static str,
+	value: &str,
+	reason: &str,
+) -> ConfigError {
+	ConfigError::InvalidArtifactScannerFormatMap {
+		name,
+		value: value.to_owned(),
+		reason: reason.to_owned(),
+	}
 }

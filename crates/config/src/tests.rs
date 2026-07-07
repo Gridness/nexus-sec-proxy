@@ -31,6 +31,9 @@ fn default_config_uses_strict_high_and_critical_policy() {
 	assert_eq!(config.nexus_base_url, "https://repo.example.invalid");
 	assert_eq!(config.upstream_base_url, config.nexus_base_url);
 	assert_eq!(config.repository_name, "default");
+	assert_eq!(config.docker_registry_base_url, None);
+	assert_eq!(config.docker_repository_name, None);
+	assert!(!config.docker_registry_configured());
 	assert_eq!(config.repository_refresh_interval_secs, 60);
 	assert_eq!(config.policy_file, None);
 	assert_eq!(config.admin_token, None);
@@ -48,6 +51,7 @@ fn default_config_uses_strict_high_and_critical_policy() {
 	assert_eq!(config.trust_report_retention_days, 30);
 	assert!(!config.yandex_messenger_enabled);
 	assert!(!config.log_json);
+	assert!(config.artifact_scanner_formats.is_empty());
 	assert_eq!(config.policy_set.default_policy.id, "default");
 	assert_eq!(
 		config.security_policy.effective_limit(Severity::Medium),
@@ -309,8 +313,15 @@ fn parses_artifact_scanner_config() {
 			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
 			"https://repo.example.invalid",
 		),
-		("NEXUS_SEC_PROXY_ARTIFACT_SCANNER", "trivy"),
-		("NEXUS_SEC_PROXY_ARTIFACT_SCANNER_COMMAND", "/usr/bin/trivy"),
+		(
+			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS",
+			" helm = trivy, P2 = grype, docker = trivy ",
+		),
+		(
+			"NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL",
+			"http://nexus.example.invalid:5000/",
+		),
+		("NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME", "docker-proxy"),
 		("NEXUS_SEC_PROXY_ARTIFACT_SCANNER_SKIP_DB_UPDATE", "false"),
 		("NEXUS_SEC_PROXY_ARTIFACT_SCANNER_OFFLINE", "false"),
 		("NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS", "120"),
@@ -321,14 +332,114 @@ fn parses_artifact_scanner_config() {
 
 	let config = config_from_env(&env).unwrap();
 
-	assert_eq!(config.artifact_scanner, ArtifactScannerKind::Trivy);
-	assert_eq!(config.artifact_scanner_command, "/usr/bin/trivy");
+	assert_eq!(
+		config.artifact_scanner_formats.get("helm"),
+		Some(&ArtifactScannerKind::Trivy)
+	);
+	assert_eq!(
+		config.artifact_scanner_formats.get("p2"),
+		Some(&ArtifactScannerKind::Grype)
+	);
+	assert_eq!(
+		config.artifact_scanner_for_format(" Helm "),
+		Some(ArtifactScannerKind::Trivy)
+	);
+	assert_eq!(
+		config.artifact_scanner_for_format("docker"),
+		Some(ArtifactScannerKind::Trivy)
+	);
+	assert_eq!(
+		config.docker_registry_base_url.as_deref(),
+		Some("http://nexus.example.invalid:5000/")
+	);
+	assert_eq!(
+		config.docker_repository_name.as_deref(),
+		Some("docker-proxy")
+	);
+	assert!(config.docker_registry_configured());
 	assert!(!config.artifact_scanner_skip_db_update);
 	assert!(!config.artifact_scanner_offline);
 	assert_eq!(config.artifact_scanner_timeout_secs, 120);
 	assert_eq!(config.artifact_scan_max_bytes, 1_048_576);
 	assert_eq!(config.artifact_scanner_concurrency, 4);
 	assert_eq!(config.artifact_tmp_dir.as_deref(), Some("/var/tmp/nsp"));
+}
+
+#[test]
+fn rejects_docker_registry_base_without_repository_name() {
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		(
+			"NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL",
+			"http://nexus.example.invalid:5000",
+		),
+	]);
+
+	let error = config_from_env(&env).unwrap_err();
+
+	assert!(matches!(
+		error,
+		ConfigError::MissingRequired {
+			name: "NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME"
+		}
+	));
+}
+
+#[test]
+fn rejects_invalid_docker_registry_base_url() {
+	for value in [
+		"not a url",
+		"ftp://nexus.example.invalid",
+		"http://",
+		"http://nexus.example.invalid:5000/repository/docker",
+		"http://nexus.example.invalid:5000/?x=1",
+	] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL", value),
+			("NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME", "docker-proxy"),
+		]);
+
+		let error = config_from_env(&env).unwrap_err();
+
+		assert!(matches!(
+			error,
+			ConfigError::InvalidDockerRegistryBaseUrl { .. }
+		));
+	}
+}
+
+#[test]
+fn rejects_invalid_artifact_scanner_format_map() {
+	for value in [
+		"helm",
+		"=trivy",
+		"helm=clair",
+		"helm=disabled",
+		"helm=trivy,Helm=grype",
+		"helm=trivy,,p2=grype",
+	] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_UPSTREAM_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS", value),
+		]);
+
+		let error = config_from_env(&env).unwrap_err();
+
+		assert!(matches!(
+			error,
+			ConfigError::InvalidArtifactScannerFormatMap { .. }
+		));
+	}
 }
 
 #[test]
