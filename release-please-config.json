@@ -17,11 +17,13 @@
   ],
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "component": "nexus-sec-proxy",
+      "version-file": ".release-please-version",
       "extra-files": [
-        ".env.example",
-        "e2e.compose.yaml"
+        { "type": "generic", "path": "Cargo.toml" },
+        { "type": "generic", "path": ".env.example" },
+        { "type": "generic", "path": "e2e.compose.yaml" }
       ]
     }
   }

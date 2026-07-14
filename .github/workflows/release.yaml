@@ -133,6 +133,29 @@ jobs:
         if: steps.candidate.outputs.mode == 'open'
         run: rustup toolchain install --profile minimal
 
+      - name: Refresh Cargo lockfile
+        if: steps.candidate.outputs.mode == 'open'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.candidate.outputs.number }}
+        run: |
+          version=$(tr -d '\r\n' < .release-please-version)
+          metadata=$(cargo metadata --format-version=1 --no-deps)
+          while IFS= read -r package; do
+            cargo update -p "$package" --precise "$version"
+          done < <(jq -r '.packages[].name' <<<"$metadata")
+
+          if git diff --quiet -- Cargo.lock; then
+            exit 0
+          fi
+
+          head_ref=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName --jq .headRefName)
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock
+          git commit -m "chore: refresh Cargo.lock for release"
+          git push origin "HEAD:refs/heads/$head_ref"
+
       - name: Validate release-only changes
         if: steps.candidate.outputs.mode == 'open'
         id: candidate-metadata
@@ -149,7 +172,7 @@ jobs:
 
           while IFS= read -r file; do
             case "$file" in
-              Cargo.toml|Cargo.lock|CHANGELOG.md|.env.example|.release-please-manifest.json|e2e.compose.yaml|crates/*/Cargo.toml) ;;
+              Cargo.toml|Cargo.lock|CHANGELOG.md|.env.example|.release-please-manifest.json|.release-please-version|e2e.compose.yaml) ;;
               *) echo "Unexpected release PR file: $file" >&2; exit 1 ;;
             esac
           done < <(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only)
@@ -160,6 +183,7 @@ jobs:
           test "$(rustc --version | awk '{print $2}')" = "$rust_version"
           manifest_version=$(jq -er '.["."]' .release-please-manifest.json)
           test "$version" = "$manifest_version"
+          test "$version" = "$(tr -d '\r\n' < .release-please-version)"
           grep -Fq "## [$version]" CHANGELOG.md
           git diff --check "origin/main...HEAD"
 
@@ -237,6 +261,7 @@ jobs:
           test "$(rustc --version | awk '{print $2}')" = "$rust_version"
           manifest_version=$(jq -er '.["."]' .release-please-manifest.json)
           test "$version" = "$manifest_version"
+          test "$version" = "$(tr -d '\r\n' < .release-please-version)"
 
           if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release v$version already exists; nothing to publish"

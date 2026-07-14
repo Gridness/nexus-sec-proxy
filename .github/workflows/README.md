@@ -24,7 +24,8 @@ flowchart TD
     PENDING -->|No| RP[Create or update Release Please PR]
     RP --> WORTHY{Release-worthy commits?}
     WORTHY -->|No| NO_RELEASE[Finish without release]
-    WORTHY -->|Yes| VALIDATE[Validate release-only files and Cargo versions]
+    WORTHY -->|Yes| LOCK[Refresh Cargo.lock when the version changes]
+    LOCK --> VALIDATE[Validate release-only files and Cargo versions]
     VALIDATE --> E2E[Run Nexus/proxy e2e gate]
     E2E --> MERGE[Squash-merge release PR]
     MERGE --> RELEASE_COMMIT
