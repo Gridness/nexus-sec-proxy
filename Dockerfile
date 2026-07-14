@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.95.0
 ARG DEBIAN_VERSION=bookworm
 ARG TRIVY_VERSION=0.71.0
 ARG HELM_VERSION=3.18.4
 
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+FROM --platform=$TARGETPLATFORM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
 ARG YANDEX_MESSENGER_FEATURE=true
 
@@ -95,14 +95,14 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 ARG BUILD_DATE=unknown
 ARG VCS_REF=unknown
-ARG VERSION=0.1.0
+ARG VERSION=dev
 
 LABEL org.opencontainers.image.title="nexus-sec-proxy" \
 	org.opencontainers.image.description="Front-of-Nexus security proxy for package vulnerability policy enforcement" \
 	org.opencontainers.image.version="${VERSION}" \
 	org.opencontainers.image.revision="${VCS_REF}" \
 	org.opencontainers.image.created="${BUILD_DATE}" \
-	org.opencontainers.image.source="https://github.com/local/nexus-sec-proxy"
+	org.opencontainers.image.source="https://github.com/Gridness/nexus-sec-proxy"
 
 ENV HOME=/home/nonroot \
 	RUST_LOG=nexus_sec_proxy=info \
@@ -130,6 +130,17 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
 ENTRYPOINT ["/usr/local/bin/nexus-sec-proxy"]
 
 FROM debian:${DEBIAN_VERSION}-slim AS scanner-db-updater
+
+ARG BUILD_DATE=unknown
+ARG VCS_REF=unknown
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.title="nexus-sec-proxy-scanner-db-updater" \
+	org.opencontainers.image.description="Scanner database updater for nexus-sec-proxy" \
+	org.opencontainers.image.version="${VERSION}" \
+	org.opencontainers.image.revision="${VCS_REF}" \
+	org.opencontainers.image.created="${BUILD_DATE}" \
+	org.opencontainers.image.source="https://github.com/Gridness/nexus-sec-proxy"
 
 RUN set -eux; \
 	apt-get update; \

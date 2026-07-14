@@ -1,55 +1,145 @@
 name: CI
 
 on:
-  push:
   pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  conventional-title:
+    name: Conventional PR title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|build|refactor|docs|test|ci|chore)(\([a-z0-9][a-z0-9._/-]*\))?(!)?: .+'
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "PR title must use Conventional Commits, for example: feat(proxy): add policy reload" >&2
+            exit 1
+          fi
+
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo test -p nexus-sec-proxy --no-default-features
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the repository toolchain
+        run: rustup toolchain install --profile minimal
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test minimal proxy features
+        run: cargo test -p nexus-sec-proxy --no-default-features --locked
 
-  lint:
-    name: Lint
+  quality:
+    name: Quality and configuration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the repository toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint minimal proxy features
+        run: cargo clippy -p nexus-sec-proxy --no-default-features --all-targets --locked -- -D warnings
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+      - name: Check generated policy schema
+        run: |
+          generated=$(mktemp)
+          cargo run --locked -p nexus-sec-proxy-security --features policy-schema --example policy_schema > "$generated"
+          diff -u schemas/policy.schema.json "$generated"
+      - name: Check scripts and Compose files
+        env:
+          NEXUS_SEC_PROXY_VERSION: 0.1.0
+          NEXUS_SEC_PROXY_NEXUS_BASE_URL: http://nexus.example.invalid:8081
+          NEXUS_SEC_PROXY_TRUST_BASE_URL: https://proxy.example.invalid
+        run: |
+          sh -n scripts/scanner-db-updater.sh
+          sh -n scripts/bootstrap-e2e.sh
+          docker compose config --quiet
+          docker compose -f e2e.compose.yaml config --quiet
+          git diff --exit-code
+
+  docker-smoke:
+    name: Docker smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: runtime
+            image: nexus-sec-proxy:ci-runtime
+          - target: scanner-db-updater
+            image: nexus-sec-proxy:ci-scanner-db-updater
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the repository toolchain
+        run: rustup toolchain install --profile minimal
+      - name: Read build versions from Cargo
+        id: versions
+        run: |
+          metadata=$(cargo metadata --format-version=1 --no-deps --locked)
+          version=$(jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end' <<<"$metadata")
+          rust_version=$(jq -er '[.packages[].rust_version] | unique | if length == 1 then .[0] else error("workspace Rust versions differ") end' <<<"$metadata")
+          test "$(rustc --version | awk '{print $2}')" = "$rust_version"
+          {
+            echo "version=$version"
+            echo "rust-version=$rust_version"
+            echo "build-date=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build target
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check --all
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p nexus-sec-proxy --no-default-features --all-targets -- -D warnings
-
-  docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
-
-  deploy-config:
-    name: Deployment Config
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sh -n scripts/scanner-db-updater.sh
-      - run: sh -n scripts/bootstrap-e2e.sh
-      - run: docker compose config
-      - run: docker compose -f e2e.compose.yaml config
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ matrix.image }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=smoke-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=smoke-${{ matrix.target }},ignore-error=true
+          build-args: |
+            VERSION=${{ steps.versions.outputs.version }}
+            RUST_VERSION=${{ steps.versions.outputs.rust-version }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.versions.outputs.build-date }}
+      - name: Verify proxy version
+        if: matrix.target == 'runtime'
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ steps.versions.outputs.version }}
+        run: test "$(docker run --rm "$IMAGE" --version)" = "nexus-sec-proxy $VERSION"
+      - name: Verify updater tools
+        if: matrix.target == 'scanner-db-updater'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker run --rm --entrypoint /usr/local/bin/trivy "$IMAGE" --version

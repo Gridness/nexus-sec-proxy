@@ -2705,6 +2705,7 @@ async fn admin_status_reports_yandex_config_without_token() {
 
 	assert_eq!(response.status(), StatusCode::OK);
 	let body = response_json(response).await;
+	assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 	let immutable_config = &body["immutable_config"];
 	assert_eq!(
 		immutable_config["yandex_messenger_available"],

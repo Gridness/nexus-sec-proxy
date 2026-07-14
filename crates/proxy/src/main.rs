@@ -16,6 +16,7 @@ mod tracing_setup;
 mod trust_reports;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -74,8 +75,15 @@ pub(crate) use crate::scan::handle_policy_evaluation;
 #[cfg(test)]
 pub(crate) use crate::scanner_db::scanner_db_summary_for_dir;
 
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--version")) {
+		println!("nexus-sec-proxy {VERSION}");
+		return Ok(());
+	}
+
 	init_tracing(env_log_json());
 
 	let config = AppConfig::from_env().map_err(|error| {
@@ -152,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
 	let repository_catalog = state.repository_catalog();
 
 	info!(
+		version = VERSION,
 		bind_addr = %bind_addr,
 		nexus_base_url = %state.config.nexus_base_url,
 		repository_count = repository_catalog.repositories.len(),

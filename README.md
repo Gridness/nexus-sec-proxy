@@ -49,6 +49,34 @@ Trust report storage, the configured Docker registry connector, and every
 active mapped scanner are healthy. It returns `503 Service Unavailable` when
 any required check fails. OSV is not probed.
 
+The binary reports the Cargo workspace version without loading runtime
+configuration:
+
+```bash
+nexus-sec-proxy --version
+```
+
+## Production Compose
+
+The root `compose.yaml` runs one proxy and one scanner database updater on a
+single Docker host. It pulls the two released GHCR images and never builds from
+the checkout. It is not a deployment workflow and does not use Docker Swarm.
+
+Choose an exact release and configure the required endpoints before starting:
+
+```bash
+cp .env.example .env
+# Edit .env, especially NEXUS_SEC_PROXY_VERSION and both required URLs.
+docker compose pull
+docker compose up -d
+```
+
+`NEXUS_SEC_PROXY_VERSION` has no default and selects the same exact version for
+both components. Credentials remain optional and may be supplied directly or
+through the corresponding `_FILE` variables. The `X`, `X.Y`, and `latest`
+image aliases are conveniences; production Compose intentionally requires a
+full `X.Y.Z` value.
+
 ## E2E Environment
 
 Bootstrap the local Docker-based e2e environment:
@@ -67,6 +95,16 @@ It enables the proxy admin UI with the default bearer token
 `NEXUS_SEC_PROXY_ADMIN_TOKEN` is set. When the environment is ready, the script
 prints the proxy admin URL, bearer token, and any Nexus test credentials it had
 to use or could discover.
+
+## Releases
+
+Merging a conventionally titled PR to `main` is the only release input. After
+CI succeeds, the release workflow prepares and validates a Release Please PR,
+runs the Docker/Nexus e2e gate, merges the version change, publishes and scans
+both multi-architecture images, adds SPDX SBOMs and GitHub-signed provenance,
+and finally creates the `vX.Y.Z` GitHub release. It does not deploy anything.
+
+See [the release process and one-time repository settings](docs/releases.md).
 
 ## Core Configuration
 
@@ -297,7 +335,7 @@ NEXUS_SEC_PROXY_ADMIN_TOKEN=change-me
 Read-only endpoints:
 
 - `GET /admin` serves a small built-in dashboard.
-- `GET /admin/api/status` returns uptime, immutable config, active policy
+- `GET /admin/api/status` returns the running version, uptime, immutable config, active policy
   generation/source, repository catalog status, cache summary, and scanner
   summary.
 - `GET /admin/api/policy` returns the active policy set and policy generation.

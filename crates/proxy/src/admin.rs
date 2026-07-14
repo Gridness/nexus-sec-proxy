@@ -15,6 +15,7 @@ use nexus_sec_proxy_security::{EnforcementMode, PolicyContext, PolicySet};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::VERSION;
 use crate::catalog::{NexusRepository, RepositoryCatalogSummary};
 use crate::decisions::RecentDecision;
 use crate::responses::{json_error, response_with_text};
@@ -75,6 +76,7 @@ pub(crate) struct ScannerSummary {
 }
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StatusResponse {
+	version: &'static str,
 	started_at: String,
 	uptime_seconds: u64,
 	immutable_config: ImmutableConfigSummary,
@@ -345,6 +347,7 @@ pub(crate) async fn admin_status(
 
 	let active_policy = state.active_policy();
 	Json(StatusResponse {
+		version: VERSION,
 		started_at: state.started_at_rfc3339.clone(),
 		uptime_seconds: state.started_at.elapsed().as_secs(),
 		immutable_config: immutable_config_summary(&state.config),

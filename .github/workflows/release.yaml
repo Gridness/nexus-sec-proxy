@@ -1,0 +1,434 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PROXY_IMAGE: ghcr.io/gridness/nexus-sec-proxy
+  UPDATER_IMAGE: ghcr.io/gridness/nexus-sec-proxy-scanner-db-updater
+
+jobs:
+  prepare:
+    name: Prepare release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.release-metadata.outputs.publish }}
+      sha: ${{ steps.release-metadata.outputs.sha }}
+      version: ${{ steps.release-metadata.outputs.version }}
+      rust-version: ${{ steps.release-metadata.outputs.rust-version }}
+      build-date: ${{ steps.release-metadata.outputs.build-date }}
+      release-pr: ${{ steps.candidate.outputs.number }}
+    steps:
+      - name: Reject a stale main run
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_sha" == "$CI_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping stale CI commit $CI_SHA; main is now $current_sha"
+          fi
+
+      - name: Find an interrupted release
+        if: steps.gate.outputs.current == 'true'
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --state merged \
+            --label "autorelease: pending" \
+            --limit 20 \
+            --json number,mergedAt \
+            --jq 'sort_by(.mergedAt) | last | .number // empty')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the Release Please PR
+        if: steps.gate.outputs.current == 'true' && steps.pending.outputs.number == ''
+        id: release-pr
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Select the release candidate
+        if: steps.gate.outputs.current == 'true'
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INTERRUPTED_PR: ${{ steps.pending.outputs.number }}
+          RELEASE_PR_JSON: ${{ steps.release-pr.outputs.pr }}
+        run: |
+          if [[ -n "$INTERRUPTED_PR" ]]; then
+            {
+              echo "mode=merged"
+              echo "number=$INTERRUPTED_PR"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          number=
+          if [[ -n "$RELEASE_PR_JSON" ]]; then
+            number=$(jq -r '.number // empty' <<<"$RELEASE_PR_JSON")
+          fi
+          if [[ -z "$number" ]]; then
+            number=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --state open \
+              --label "autorelease: pending" \
+              --limit 1 \
+              --json number \
+              --jq '.[0].number // empty')
+          fi
+
+          if [[ -n "$number" ]]; then
+            {
+              echo "mode=open"
+              echo "number=$number"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "mode=none"
+              echo "number="
+            } >> "$GITHUB_OUTPUT"
+            echo "No release-worthy commits found"
+          fi
+
+      - name: Checkout release candidate
+        if: steps.candidate.outputs.mode == 'open'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/pull/${{ steps.candidate.outputs.number }}/head
+          fetch-depth: 0
+
+      - name: Install the repository toolchain
+        if: steps.candidate.outputs.mode == 'open'
+        run: rustup toolchain install --profile minimal
+
+      - name: Validate release-only changes
+        if: steps.candidate.outputs.mode == 'open'
+        id: candidate-metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.candidate.outputs.number }}
+          EXPECTED_BASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          base_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .base.sha)
+          if [[ "$base_sha" != "$EXPECTED_BASE_SHA" ]]; then
+            echo "Release PR base $base_sha is not the validated main commit $EXPECTED_BASE_SHA" >&2
+            exit 1
+          fi
+
+          while IFS= read -r file; do
+            case "$file" in
+              Cargo.toml|Cargo.lock|CHANGELOG.md|.env.example|.release-please-manifest.json|e2e.compose.yaml|crates/*/Cargo.toml) ;;
+              *) echo "Unexpected release PR file: $file" >&2; exit 1 ;;
+            esac
+          done < <(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only)
+
+          metadata=$(cargo metadata --format-version=1 --no-deps --locked)
+          version=$(jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end' <<<"$metadata")
+          rust_version=$(jq -er '[.packages[].rust_version] | unique | if length == 1 then .[0] else error("workspace Rust versions differ") end' <<<"$metadata")
+          test "$(rustc --version | awk '{print $2}')" = "$rust_version"
+          manifest_version=$(jq -er '.["."]' .release-please-manifest.json)
+          test "$version" = "$manifest_version"
+          grep -Fq "## [$version]" CHANGELOG.md
+          git diff --check "origin/main...HEAD"
+
+          {
+            echo "version=$version"
+            echo "rust-version=$rust_version"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "build-date=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the release-candidate e2e gate
+        if: steps.candidate.outputs.mode == 'open'
+        env:
+          NEXUS_OSS_IMAGE_TAG: 3.94.0
+          NEXUS_SEC_PROXY_VERSION: ${{ steps.candidate-metadata.outputs.version }}
+          RUST_VERSION: ${{ steps.candidate-metadata.outputs.rust-version }}
+          NEXUS_SEC_PROXY_VCS_REF: ${{ steps.candidate-metadata.outputs.sha }}
+          NEXUS_SEC_PROXY_BUILD_DATE: ${{ steps.candidate-metadata.outputs.build-date }}
+        run: scripts/bootstrap-e2e.sh
+
+      - name: Tear down the e2e gate
+        if: always() && steps.candidate.outputs.mode == 'open'
+        run: docker compose -f e2e.compose.yaml down --volumes --remove-orphans
+
+      - name: Merge the validated release PR
+        if: steps.candidate.outputs.mode == 'open'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.candidate.outputs.number }}
+          EXPECTED_MAIN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_sha" != "$EXPECTED_MAIN_SHA" ]]; then
+            echo "Main advanced to $current_sha while preparing the release; a newer run will continue" >&2
+            exit 1
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+
+      - name: Resolve the release commit
+        if: steps.candidate.outputs.mode == 'open' || steps.candidate.outputs.mode == 'merged'
+        id: release-commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.candidate.outputs.number }}
+        run: |
+          for attempt in {1..10}; do
+            sha=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json mergeCommit --jq '.mergeCommit.oid // empty')
+            [[ -n "$sha" ]] && break
+            echo "Waiting for release PR merge commit ($attempt/10)"
+            sleep 2
+          done
+          if [[ -z "${sha:-}" ]]; then
+            echo "Could not resolve merge commit for release PR $PR_NUMBER" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release commit
+        if: steps.release-commit.outputs.sha != ''
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.release-commit.outputs.sha }}
+
+      - name: Read release metadata from Cargo
+        if: steps.release-commit.outputs.sha != ''
+        id: release-metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release-commit.outputs.sha }}
+        run: |
+          rustup toolchain install --profile minimal
+          metadata=$(cargo metadata --format-version=1 --no-deps --locked)
+          version=$(jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end' <<<"$metadata")
+          rust_version=$(jq -er '[.packages[].rust_version] | unique | if length == 1 then .[0] else error("workspace Rust versions differ") end' <<<"$metadata")
+          test "$(rustc --version | awk '{print $2}')" = "$rust_version"
+          manifest_version=$(jq -er '.["."]' .release-please-manifest.json)
+          test "$version" = "$manifest_version"
+
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$version already exists; nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "publish=true"
+            echo "sha=$RELEASE_SHA"
+            echo "version=$version"
+            echo "rust-version=$rust_version"
+            echo "build-date=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Publish ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: runtime
+            image: ghcr.io/gridness/nexus-sec-proxy
+          - target: scanner-db-updater
+            image: ghcr.io/gridness/nexus-sec-proxy-scanner-db-updater
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push exact image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ matrix.image }}:${{ needs.prepare.outputs.version }}
+          provenance: false
+          sbom: true
+          cache-from: type=gha,scope=release-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.target }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            RUST_VERSION=${{ needs.prepare.outputs.rust-version }}
+            VCS_REF=${{ needs.prepare.outputs.sha }}
+            BUILD_DATE=${{ needs.prepare.outputs.build-date }}
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+  finalize:
+    name: Verify and publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Verify both image architectures
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for image in "$PROXY_IMAGE" "$UPDATER_IMAGE"; do
+            manifest=$(docker buildx imagetools inspect "$image:$VERSION" --raw)
+            for architecture in amd64 arm64; do
+              jq -e --arg architecture "$architecture" \
+                'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $architecture)' \
+                <<<"$manifest" >/dev/null
+            done
+          done
+
+      - name: Report all high and critical vulnerabilities
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          chmod 777 "$RUNNER_TEMP/trivy-cache"
+          for image in "$PROXY_IMAGE" "$UPDATER_IMAGE"; do
+            for platform in linux/amd64 linux/arm64; do
+              docker run --rm --user 0:0 \
+                -e HOME=/root \
+                -v "$HOME/.docker:/root/.docker:ro" \
+                -v "$RUNNER_TEMP/trivy-cache:/var/cache/trivy" \
+                --entrypoint /usr/local/bin/trivy \
+                "$PROXY_IMAGE:$VERSION" image \
+                --cache-dir /var/cache/trivy \
+                --scanners vuln \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                --platform "$platform" \
+                "$image:$VERSION"
+            done
+          done
+
+      - name: Block fixable high and critical vulnerabilities
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for image in "$PROXY_IMAGE" "$UPDATER_IMAGE"; do
+            for platform in linux/amd64 linux/arm64; do
+              docker run --rm --user 0:0 \
+                -e HOME=/root \
+                -v "$HOME/.docker:/root/.docker:ro" \
+                -v "$RUNNER_TEMP/trivy-cache:/var/cache/trivy" \
+                --entrypoint /usr/local/bin/trivy \
+                "$PROXY_IMAGE:$VERSION" image \
+                --cache-dir /var/cache/trivy \
+                --scanners vuln \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --exit-code 1 \
+                --platform "$platform" \
+                "$image:$VERSION"
+            done
+          done
+
+      - name: Publish image aliases
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          major=${VERSION%%.*}
+          minor=${VERSION%.*}
+          for image in "$PROXY_IMAGE" "$UPDATER_IMAGE"; do
+            docker buildx imagetools create \
+              --tag "$image:$minor" \
+              --tag "$image:$major" \
+              --tag "$image:latest" \
+              "$image:$VERSION"
+          done
+
+      - name: Confirm the pending release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR: ${{ needs.prepare.outputs.release-pr }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          pending=$(gh pr view "$EXPECTED_PR" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json labels \
+            --jq 'any(.labels[]; .name == "autorelease: pending")')
+          release_sha=$(gh pr view "$EXPECTED_PR" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json mergeCommit \
+            --jq '.mergeCommit.oid // empty')
+          test "$pending" = true
+          test "$release_sha" = "$EXPECTED_SHA"
+
+      - name: Publish GitHub tag and release
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Verify published release
+        env:
+          CREATED: ${{ steps.release.outputs.release_created }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          test "$CREATED" = true
+          test "$RELEASE_SHA" = "$EXPECTED_SHA"
+          test "$RELEASE_VERSION" = "$EXPECTED_VERSION"
