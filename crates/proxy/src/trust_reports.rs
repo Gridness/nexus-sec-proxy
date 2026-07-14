@@ -268,6 +268,12 @@ fn with_security_headers(mut response: Response<Body>) -> Response<Body> {
 		"DENY".parse().expect("static header is valid"),
 	);
 	headers.insert(
+		axum::http::HeaderName::from_static("x-robots-tag"),
+		"noindex, nofollow, noarchive"
+			.parse()
+			.expect("static header is valid"),
+	);
+	headers.insert(
 		CONTENT_SECURITY_POLICY,
 		"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 			.parse()

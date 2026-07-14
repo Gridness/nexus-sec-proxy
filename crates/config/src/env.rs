@@ -96,6 +96,42 @@ pub(crate) fn optional_string_env(
 	})
 }
 
+pub(crate) fn secret_env(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	value_name: &'static str,
+	file_name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+	let value = optional_string_env(lookup, value_name);
+	let path = optional_string_env(lookup, file_name);
+
+	match (value, path) {
+		(Some(_), Some(_)) => Err(ConfigError::ConflictingSecretSources {
+			value_name,
+			file_name,
+		}),
+		(Some(value), None) => Ok(Some(value)),
+		(None, Some(path)) => {
+			let mut value =
+				std::fs::read_to_string(&path).map_err(|source| {
+					ConfigError::SecretFileRead {
+						name: file_name,
+						path,
+						source,
+					}
+				})?;
+			if value.ends_with('\n') {
+				value.pop();
+				if value.ends_with('\r') {
+					value.pop();
+				}
+			}
+
+			Ok((!value.is_empty()).then_some(value))
+		}
+		(None, None) => Ok(None),
+	}
+}
+
 pub(crate) fn bool_env(
 	lookup: &mut impl FnMut(&'static str) -> Option<String>,
 	name: &'static str,

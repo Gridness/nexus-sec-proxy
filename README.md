@@ -83,6 +83,7 @@ Common:
 NEXUS_SEC_PROXY_BIND_ADDR=127.0.0.1:3000
 NEXUS_SEC_PROXY_NEXUS_USERNAME=
 NEXUS_SEC_PROXY_NEXUS_PASSWORD=
+NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE=
 NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL=
 NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME=
 NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS=60
@@ -91,9 +92,10 @@ NEXUS_SEC_PROXY_OSV_API_URL=https://api.osv.dev/v1/query
 NEXUS_SEC_PROXY_POLICY_FILE=/etc/nexus-sec-proxy/policy.toml
 NEXUS_SEC_PROXY_ADMIN_TOKEN=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN=
+NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL=https://botapi.messenger.yandex.net
-NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=
+NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false
 NEXUS_SEC_PROXY_TRUST_REPORT_DIR=/var/lib/nexus-sec-proxy/trust-reports
 NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS=30
 NEXUS_SEC_PROXY_LOG_JSON=false
@@ -117,6 +119,8 @@ Configuration notes:
 - `NEXUS_SEC_PROXY_NEXUS_USERNAME` and
   `NEXUS_SEC_PROXY_NEXUS_PASSWORD` are used for repository catalog discovery
   and, when both are set, for the scanner's temporary Docker auth config.
+  Messenger also uses this account to call the Nexus Users API; grant the
+  least-privileged repository discovery permission plus `nx-users-read`.
 - `NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL` enables root `/v2/...` Docker
   registry mode. Set it to the Nexus Docker proxy connector origin, for
   example `http://nexus:5000`; do not set it to the Nexus UI URL.
@@ -136,12 +140,16 @@ Configuration notes:
 - `NEXUS_SEC_PROXY_ADMIN_TOKEN` enables `/admin` and `/admin/api/*` when set
   to a non-empty value. Admin API requests must include
   `Authorization: Bearer <token>`.
-- Yandex Messenger notifications are enabled by default only when both
-  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN` and
-  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE` are set. Set
-  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false` to force them off. Binaries
-  built with `--no-default-features` accept these variables but never send
-  Messenger notifications.
+- Yandex Messenger is off unless
+  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=true`. When enabled, the bot token,
+  template file, Nexus service username, and Nexus service password are all
+  required; invalid static configuration fails startup. A binary built with
+  `--no-default-features` rejects runtime activation instead of silently
+  ignoring it.
+- `NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE` and
+  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE` read Docker/Kubernetes-style
+  mounted secret files. Do not set a direct value and its `_FILE` form at the
+  same time. One trailing LF or CRLF is removed; other bytes are preserved.
 - `NEXUS_SEC_PROXY_TRUST_BASE_URL` is the public HTTP(S) origin or base path
   used in report links. Query strings and fragments are rejected.
 - `NEXUS_SEC_PROXY_TRUST_REPORT_DIR` must be writable. Startup fails if the
@@ -358,14 +366,50 @@ Default builds include Yandex Messenger support through the
 cargo build -p nexus-sec-proxy --no-default-features
 ```
 
-When the feature is not compiled in, Yandex Messenger environment variables are
-still accepted for configuration compatibility but notifications are ignored.
+The standard Docker image also includes the feature. Build a hardened image
+without it using
+`docker build --build-arg YANDEX_MESSENGER_FEATURE=false .`. In Compose, set
+`NEXUS_SEC_PROXY_YANDEX_MESSENGER_FEATURE=false` while building the image.
+Attempting to enable Messenger at runtime in that image fails startup.
 
-When configured, enforced `403 Forbidden` block decisions trigger a best-effort
-Yandex Messenger private message. The proxy uses the incoming Basic Auth
-username as the Messenger `login`; requests without Basic Auth still block as
-usual but do not notify. Notification failures do not change the client-visible
-403 response body.
+When enabled, enforced block decisions trigger a best-effort private message.
+For Basic authentication, the proxy first sends `HEAD` for the exact requested
+Nexus URL with the original credentials. A Nexus `2xx` establishes the
+Requester; Nexus `401`, `403`, or `404` is returned without creating a Trust
+Report or message. The service account then finds exactly one active Nexus user
+with that ID and sends to the user's full Nexus email address. With Nexus LDAP
+configured against corporate AD, that email comes from the LDAP email
+attribute; with local Nexus users, it comes from the local user profile.
+
+For Docker pulls, a successful manifest response establishes that Nexus
+accepted the Bearer token. The proxy decodes the accepted JWT `sub` as the
+Nexus user ID and performs the same email lookup. Anonymous, malformed,
+missing, ambiguous, inactive, or email-less identities skip only the message.
+There is no fallback to a client-supplied username.
+
+Delivery uses a bounded in-memory queue. Transient network, `429`, and `5xx`
+failures are retried a bounded number of times with the same Yandex
+`payload_id`; saturation drops the new message rather than delaying the block.
+The Trust Report and `403` remain independent of recipient lookup and Yandex
+delivery failures. `/admin/api/status` exposes aggregate sent, retried, failed,
+and skipped counters plus the last success/failure; `/healthz` does not fail on
+a Yandex outage.
+
+For Docker secrets, mount each secret and point `_FILE` at it, for example:
+
+```yaml
+services:
+  nexus-sec-proxy:
+    secrets: [nexus_password, yandex_token]
+    environment:
+      NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE: /run/secrets/nexus_password
+      NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE: /run/secrets/yandex_token
+secrets:
+  nexus_password:
+    file: ./secrets/nexus_password
+  yandex_token:
+    file: ./secrets/yandex_token
+```
 
 The template file is checked on every blocked notification and reloaded when
 its modification time changes. If reload fails, the last valid template remains
@@ -386,6 +430,16 @@ active. Supported placeholders:
 Unknown placeholders are left unchanged. If `{report_url}` is omitted, the
 notifier appends `Report: <url>`. Message truncation always reserves room for
 the complete report URL.
+
+Protocol and product references:
+
+- [Yandex Messenger `sendText`](https://yandex.ru/dev/messenger/doc/ru/api-requests/message-send-text)
+- [Nexus LDAP configuration](https://help.sonatype.com/en/ldap.html) and the
+  [Community/Pro feature matrix](https://help.sonatype.com/en/nexus-repository-feature-matrix.html)
+- [Nexus Security Management API](https://help.sonatype.com/en/security-management-api.html)
+  and [application privileges](https://help.sonatype.com/en/privileges.html)
+- [Nexus Docker authentication](https://help.sonatype.com/en/docker-authentication.html)
+  and the [Distribution JWT subject definition](https://distribution.github.io/distribution/spec/auth/jwt/)
 
 ## Cache
 

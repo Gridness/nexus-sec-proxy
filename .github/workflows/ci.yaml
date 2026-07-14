@@ -20,6 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - run: cargo test -p nexus-sec-proxy --no-default-features
 
   lint:
     name: Lint
@@ -32,6 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check --all
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p nexus-sec-proxy --no-default-features --all-targets -- -D warnings
 
   docs:
     name: Docs

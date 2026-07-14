@@ -18,6 +18,7 @@ use crate::gateway::{
 	build_nexus_url, copy_request_headers, forward_request_to_base,
 	response_from_nexus, response_headers,
 };
+use crate::requester::Requester;
 use crate::responses::response_with_text;
 use crate::scan::{
 	external_scanner_for_kind, handle_policy_evaluation, put_cache,
@@ -42,7 +43,6 @@ pub(crate) async fn handle_docker_registry_request(
 	uri: Uri,
 	headers: &HeaderMap,
 	body: Body,
-	requester_login: Option<&str>,
 ) -> Response<Body> {
 	let docker_base_url = docker_registry_base_url(state);
 
@@ -60,7 +60,6 @@ pub(crate) async fn handle_docker_registry_request(
 					docker_base_url: &docker_base_url,
 					repository,
 					headers,
-					requester_login,
 					scanner_kind: scanner,
 				};
 				return authorize_docker_manifest(
@@ -110,7 +109,6 @@ struct DockerManifestContext<'a> {
 	docker_base_url: &'a Url,
 	repository: NexusRepository,
 	headers: &'a HeaderMap,
-	requester_login: Option<&'a str>,
 	scanner_kind: ArtifactScannerKind,
 }
 
@@ -157,6 +155,7 @@ async fn authorize_docker_manifest_inner(
 			.await;
 		}
 	};
+	let requester = Requester::docker_bearer(context.headers);
 
 	match docker_manifest_kind(&prefetched.headers) {
 		DockerManifestKind::Index => return Ok(prefetched.into_response()),
@@ -210,7 +209,7 @@ async fn authorize_docker_manifest_inner(
 					&target,
 					scan.vulnerabilities,
 				),
-				context.requester_login,
+				requester.as_ref(),
 			)
 			.await?;
 			return Ok(prefetched.into_response());
@@ -316,7 +315,7 @@ async fn authorize_docker_manifest_inner(
 			&target,
 			vulnerabilities,
 		),
-		context.requester_login,
+		requester.as_ref(),
 	)
 	.await?;
 

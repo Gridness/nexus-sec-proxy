@@ -7,6 +7,8 @@ ARG HELM_VERSION=3.18.4
 
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
+ARG YANDEX_MESSENGER_FEATURE=true
+
 WORKDIR /workspace
 
 ENV CARGO_TERM_COLOR=never
@@ -35,7 +37,11 @@ COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
 	--mount=type=cache,target=/usr/local/cargo/git \
-	cargo build --release --locked -p nexus-sec-proxy && \
+	case "${YANDEX_MESSENGER_FEATURE}" in \
+		true) cargo build --release --locked -p nexus-sec-proxy ;; \
+		false) cargo build --release --locked -p nexus-sec-proxy --no-default-features ;; \
+		*) echo "YANDEX_MESSENGER_FEATURE must be true or false" >&2; exit 1 ;; \
+	esac && \
 	install -D -m 0755 target/release/nexus-sec-proxy /out/nexus-sec-proxy
 
 FROM --platform=$BUILDPLATFORM debian:${DEBIAN_VERSION}-slim AS scanners

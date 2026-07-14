@@ -1,21 +1,25 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
-use tracing::debug;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
 
 pub const DEFAULT_API_URL: &str = "https://botapi.messenger.yandex.net";
 
 const SEND_TEXT_PATH: &str = "/bot/v1/messages/sendText/";
 const MAX_TEXT_CHARS: usize = 6000;
+const QUEUE_CAPACITY: usize = 256;
+const MAX_SEND_ATTEMPTS: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YandexMessengerConfig {
@@ -41,11 +45,52 @@ impl YandexMessengerConfig {
 
 #[derive(Debug, Clone)]
 pub struct YandexMessengerNotifier {
+	sender: mpsc::Sender<WorkerCommand>,
+	status: Arc<DeliveryStatus>,
+	worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+#[derive(Debug)]
+struct DeliveryWorker {
 	http_client: reqwest::Client,
 	token: Arc<str>,
 	api_url: Arc<str>,
 	template_loader: TemplateLoader,
 	payload_sequence: Arc<AtomicU64>,
+	status: Arc<DeliveryStatus>,
+}
+
+#[derive(Debug)]
+enum WorkerCommand {
+	Notification(BlockNotification),
+	Shutdown,
+}
+
+#[derive(Debug, Default)]
+struct DeliveryStatus {
+	sent: AtomicU64,
+	retried: AtomicU64,
+	failed: AtomicU64,
+	skipped: std::sync::Mutex<BTreeMap<String, u64>>,
+	last: std::sync::Mutex<LastDelivery>,
+}
+
+#[derive(Debug, Default)]
+struct LastDelivery {
+	last_success_at: Option<String>,
+	last_failure_at: Option<String>,
+	last_failure_category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct YandexMessengerStatus {
+	pub sent: u64,
+	pub retried: u64,
+	pub failed: u64,
+	pub skipped_by_reason: BTreeMap<String, u64>,
+	pub last_success_at: Option<String>,
+	pub last_failure_at: Option<String>,
+	pub last_failure_category: Option<String>,
 }
 
 impl YandexMessengerNotifier {
@@ -54,43 +99,155 @@ impl YandexMessengerNotifier {
 		config: YandexMessengerConfig,
 		http_client: reqwest::Client,
 	) -> Self {
-		Self {
+		let status = Arc::new(DeliveryStatus::default());
+		let worker = DeliveryWorker {
 			http_client,
 			token: Arc::from(config.token),
 			api_url: Arc::from(config.api_url),
 			template_loader: TemplateLoader::new(config.template_file),
 			payload_sequence: Arc::new(AtomicU64::new(1)),
+			status: Arc::clone(&status),
+		};
+		let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+		let worker = tokio::spawn(worker.run(receiver));
+
+		Self {
+			sender,
+			status,
+			worker: Arc::new(Mutex::new(Some(worker))),
 		}
 	}
 
 	pub fn notify_blocked(&self, notification: BlockNotification) {
-		let notifier = self.clone();
-		let Ok(handle) = Handle::try_current() else {
-			debug!(
-				"yandex messenger notification skipped without tokio runtime"
-			);
-			return;
-		};
-
-		handle.spawn(async move {
-			if let Err(error) = notifier.send_blocked(notification).await {
-				debug!(%error, "yandex messenger notification failed");
+		match self
+			.sender
+			.try_send(WorkerCommand::Notification(notification))
+		{
+			Ok(()) => {}
+			Err(mpsc::error::TrySendError::Full(_)) => {
+				self.record_skipped("queue_full");
+				warn!("Yandex Messenger queue is full; notification dropped");
 			}
-		});
+			Err(mpsc::error::TrySendError::Closed(_)) => {
+				self.record_skipped("worker_closed");
+				warn!(
+					"Yandex Messenger worker is closed; notification dropped"
+				);
+			}
+		}
 	}
 
-	async fn send_blocked(
-		&self,
-		notification: BlockNotification,
-	) -> anyhow::Result<()> {
+	pub fn record_skipped(&self, reason: &'static str) {
+		let mut skipped = self
+			.status
+			.skipped
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		*skipped.entry(reason.to_owned()).or_default() += 1;
+	}
+
+	#[must_use]
+	pub fn status(&self) -> YandexMessengerStatus {
+		let skipped_by_reason = self
+			.status
+			.skipped
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+		let last = self
+			.status
+			.last
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+
+		YandexMessengerStatus {
+			sent: self.status.sent.load(Ordering::Relaxed),
+			retried: self.status.retried.load(Ordering::Relaxed),
+			failed: self.status.failed.load(Ordering::Relaxed),
+			skipped_by_reason,
+			last_success_at: last.last_success_at.clone(),
+			last_failure_at: last.last_failure_at.clone(),
+			last_failure_category: last.last_failure_category.clone(),
+		}
+	}
+
+	pub async fn shutdown(&self, timeout: Duration) {
+		if tokio::time::timeout(
+			timeout,
+			self.sender.send(WorkerCommand::Shutdown),
+		)
+		.await
+		.is_err()
+		{
+			warn!("Yandex Messenger shutdown signal timed out");
+			if let Some(worker) = self.worker.lock().await.take() {
+				worker.abort();
+				let _ = worker.await;
+			}
+			return;
+		}
+		let Some(mut worker) = self.worker.lock().await.take() else {
+			return;
+		};
+		if tokio::time::timeout(timeout, &mut worker).await.is_err() {
+			warn!("Yandex Messenger queue drain timed out");
+			worker.abort();
+			let _ = worker.await;
+		}
+	}
+}
+
+pub async fn validate_config(
+	config: &YandexMessengerConfig,
+) -> anyhow::Result<()> {
+	if config.token.is_empty() {
+		anyhow::bail!("Yandex Messenger token is empty");
+	}
+	let url = reqwest::Url::parse(&config.api_url)
+		.context("invalid Yandex Messenger API URL")?;
+	if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+		anyhow::bail!(
+			"Yandex Messenger API URL must be an HTTP(S) URL with a host"
+		);
+	}
+	let template = tokio::fs::read_to_string(&config.template_file)
+		.await
+		.with_context(|| {
+			format!(
+				"failed to read Yandex Messenger template {}",
+				config.template_file.display()
+			)
+		})?;
+	if template.is_empty() {
+		anyhow::bail!("Yandex Messenger template is empty");
+	}
+
+	Ok(())
+}
+
+impl DeliveryWorker {
+	async fn run(self, mut receiver: mpsc::Receiver<WorkerCommand>) {
+		while let Some(command) = receiver.recv().await {
+			match command {
+				WorkerCommand::Notification(notification) => {
+					self.deliver(notification).await;
+				}
+				WorkerCommand::Shutdown => break,
+			}
+		}
+	}
+
+	async fn deliver(&self, notification: BlockNotification) {
 		let timestamp = now_rfc3339();
 		let template_context = notification.template_context(timestamp);
 		let Some(text) = self.template_loader.render(&template_context).await
 		else {
-			return Ok(());
+			self.record_failure("template_unavailable");
+			return;
 		};
 		if text.is_empty() {
-			return Ok(());
+			self.record_failure("template_empty");
+			return;
 		}
 
 		let request = SendTextRequest {
@@ -98,29 +255,74 @@ impl YandexMessengerNotifier {
 			text: truncate_text(text, &notification.report_url),
 			payload_id: self.next_payload_id(),
 		};
+		for attempt in 1..=MAX_SEND_ATTEMPTS {
+			match self.send_attempt(&request).await {
+				Ok(()) => {
+					self.status.sent.fetch_add(1, Ordering::Relaxed);
+					let mut last = self
+						.status
+						.last
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner);
+					last.last_success_at = Some(now_rfc3339());
+					info!(attempt, "Yandex Messenger notification sent");
+					return;
+				}
+				Err(failure)
+					if failure.transient && attempt < MAX_SEND_ATTEMPTS =>
+				{
+					self.status.retried.fetch_add(1, Ordering::Relaxed);
+					warn!(
+						attempt,
+						category = failure.category,
+						"transient Yandex Messenger delivery failure; retrying"
+					);
+					tokio::time::sleep(Duration::from_millis(100 * attempt))
+						.await;
+				}
+				Err(failure) => {
+					self.record_failure(failure.category);
+					error!(
+						attempt,
+						category = failure.category,
+						"Yandex Messenger notification failed"
+					);
+					return;
+				}
+			}
+		}
+	}
+
+	async fn send_attempt(
+		&self,
+		request: &SendTextRequest,
+	) -> Result<(), SendFailure> {
 		let response = self
 			.http_client
 			.post(self.send_text_url())
 			.header(AUTHORIZATION, format!("OAuth {}", self.token))
-			.json(&request)
+			.json(request)
 			.send()
 			.await
-			.context("Yandex Messenger sendText request failed")?;
+			.map_err(|_| SendFailure::transient("network"))?;
 		let status = response.status();
+		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			return Err(SendFailure::transient("rate_limited"));
+		}
+		if status.is_server_error() {
+			return Err(SendFailure::transient("server_error"));
+		}
+		if !status.is_success() {
+			return Err(SendFailure::permanent("rejected"));
+		}
 		let body = response
 			.bytes()
 			.await
-			.context("Yandex Messenger response body read failed")?;
-
-		if !status.is_success() {
-			bail!("Yandex Messenger returned {status}");
-		}
-
-		if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
-			&& value.get("ok").and_then(serde_json::Value::as_bool)
-				== Some(false)
-		{
-			bail!("Yandex Messenger returned ok=false");
+			.map_err(|_| SendFailure::transient("network"))?;
+		let value = serde_json::from_slice::<serde_json::Value>(&body)
+			.map_err(|_| SendFailure::permanent("invalid_response"))?;
+		if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+			return Err(SendFailure::permanent("api_error"));
 		}
 
 		Ok(())
@@ -138,6 +340,39 @@ impl YandexMessengerNotifier {
 			.as_nanos();
 
 		format!("nexus-sec-proxy-{nanos}-{sequence}")
+	}
+
+	fn record_failure(&self, category: &'static str) {
+		self.status.failed.fetch_add(1, Ordering::Relaxed);
+		let mut last = self
+			.status
+			.last
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		last.last_failure_at = Some(now_rfc3339());
+		last.last_failure_category = Some(category.to_owned());
+	}
+}
+
+#[derive(Debug)]
+struct SendFailure {
+	transient: bool,
+	category: &'static str,
+}
+
+impl SendFailure {
+	fn transient(category: &'static str) -> Self {
+		Self {
+			transient: true,
+			category,
+		}
+	}
+
+	fn permanent(category: &'static str) -> Self {
+		Self {
+			transient: false,
+			category,
+		}
 	}
 }
 

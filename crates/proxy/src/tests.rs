@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::to_bytes;
+#[cfg(feature = "yandex-messenger")]
+use base64::Engine;
 use nexus_sec_proxy_security::{PackageCoordinate, Severity, Vulnerability};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -76,6 +78,13 @@ struct YandexMockState {
 	records: Arc<Mutex<Vec<RecordedRequest>>>,
 	response: Value,
 	status: StatusCode,
+}
+
+#[cfg(feature = "yandex-messenger")]
+#[derive(Clone)]
+struct YandexRetryMockState {
+	records: Arc<Mutex<Vec<RecordedRequest>>>,
+	attempts: Arc<AtomicUsize>,
 }
 
 async fn spawn_server(app: Router) -> Url {
@@ -176,6 +185,7 @@ async fn record_nexus_request(
 	headers: HeaderMap,
 	body: Body,
 ) -> Response<Body> {
+	let path = uri.path().to_owned();
 	let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
 	records.lock().unwrap().push(RecordedRequest {
 		method,
@@ -186,6 +196,18 @@ async fn record_nexus_request(
 		headers,
 		body,
 	});
+
+	if path == "/service/rest/v1/security/users" {
+		return (
+			StatusCode::OK,
+			Json(json!([{
+				"userId": "alice",
+				"emailAddress": "alice@example.com",
+				"status": "active"
+			}])),
+		)
+			.into_response();
+	}
 
 	response_with_text(StatusCode::OK, "nexus\n")
 }
@@ -273,6 +295,33 @@ async fn mock_yandex_messenger(
 	});
 
 	(state.status, Json(state.response)).into_response()
+}
+
+#[cfg(feature = "yandex-messenger")]
+async fn mock_retrying_yandex_messenger(
+	State(state): State<YandexRetryMockState>,
+	method: Method,
+	uri: Uri,
+	headers: HeaderMap,
+	body: Body,
+) -> Response<Body> {
+	let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+	state.records.lock().unwrap().push(RecordedRequest {
+		method,
+		path_and_query: uri.path().to_owned(),
+		headers,
+		body,
+	});
+	let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
+	if attempt < 2 {
+		(
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({ "ok": false })),
+		)
+			.into_response()
+	} else {
+		(StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+	}
 }
 
 #[test]
@@ -922,6 +971,10 @@ async fn blocked_package_returns_403_before_nexus() {
 	);
 	assert_eq!(report_response.headers()["referrer-policy"], "no-referrer");
 	assert_eq!(report_response.headers()["x-frame-options"], "DENY");
+	assert_eq!(
+		report_response.headers()["x-robots-tag"],
+		"noindex, nofollow, noarchive"
+	);
 	assert!(
 		report_response.headers()["content-security-policy"]
 			.to_str()
@@ -931,6 +984,74 @@ async fn blocked_package_returns_403_before_nexus() {
 	let report_html = response_text(report_response).await;
 	assert!(report_html.contains("Maven:com.example:demo@1.2.3"));
 	assert!(report_html.contains("CVE-2026-0001"));
+}
+
+#[cfg(feature = "yandex-messenger")]
+#[tokio::test]
+async fn yandex_transient_retries_reuse_payload_id_and_update_status() {
+	let records = Arc::new(Mutex::new(Vec::new()));
+	let url = spawn_server(
+		Router::new()
+			.route(
+				"/bot/v1/messages/sendText/",
+				post(mock_retrying_yandex_messenger),
+			)
+			.with_state(YandexRetryMockState {
+				records: Arc::clone(&records),
+				attempts: Arc::new(AtomicUsize::new(0)),
+			}),
+	)
+	.await;
+	let template = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(template.path(), "blocked {user}").unwrap();
+	let notifier =
+		nexus_sec_proxy_yandex_messenger::YandexMessengerNotifier::new(
+			nexus_sec_proxy_yandex_messenger::YandexMessengerConfig::new(
+				"bot-token",
+				template.path(),
+				url,
+			),
+			reqwest::Client::new(),
+		);
+	notifier.notify_blocked(
+		nexus_sec_proxy_yandex_messenger::BlockNotification {
+			login: "alice@example.com".to_owned(),
+			repository: "maven-central".to_owned(),
+			format: "maven2".to_owned(),
+			target: "Maven:com.example:demo@1.2.3".to_owned(),
+			reason: "blocked".to_owned(),
+			policy_id: Some("default".to_owned()),
+			vulnerability_ids: vec!["CVE-2026-0001".to_owned()],
+			report_url: "https://proxy.example.invalid/trust/reports/id"
+				.to_owned(),
+		},
+	);
+	tokio::time::timeout(Duration::from_secs(2), async {
+		while notifier.status().sent != 1 {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+
+	let status = notifier.status();
+	assert_eq!(status.sent, 1);
+	assert_eq!(status.retried, 2);
+	assert_eq!(status.failed, 0);
+	let payload_ids = records
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|record| {
+			serde_json::from_slice::<Value>(&record.body).unwrap()["payload_id"]
+				.as_str()
+				.unwrap()
+				.to_owned()
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(payload_ids.len(), 3);
+	assert!(payload_ids.windows(2).all(|pair| pair[0] == pair[1]));
+	notifier.shutdown(Duration::from_secs(1)).await;
 }
 
 #[cfg(feature = "yandex-messenger")]
@@ -983,6 +1104,8 @@ async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
 		Some(template_file.path().to_string_lossy().into_owned());
 	config.yandex_messenger_api_url = yandex_url.to_string();
 	config.yandex_messenger_enabled = true;
+	config.nexus_username = Some("service-user".to_owned());
+	config.nexus_password = Some("service-password".to_owned());
 	let state = test_state_from_config(
 		config,
 		PolicySet::default(),
@@ -1011,7 +1134,21 @@ async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
 	assert_block_body(&body);
 	let first_report_url = report_url_from_body(&body).to_owned();
 	wait_for_record_count(&yandex_records, 1).await;
-	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert_eq!(nexus_records.lock().unwrap().len(), 2);
+	{
+		let records = nexus_records.lock().unwrap();
+		assert_eq!(records[0].method, Method::HEAD);
+		assert_eq!(records[0].headers[AUTHORIZATION], "Basic YWxpY2U6c2VjcmV0");
+		assert_eq!(records[1].method, Method::GET);
+		assert_eq!(
+			records[1].path_and_query,
+			"/service/rest/v1/security/users?userId=alice"
+		);
+		assert_eq!(
+			records[1].headers[AUTHORIZATION],
+			"Basic c2VydmljZS11c2VyOnNlcnZpY2UtcGFzc3dvcmQ="
+		);
+	}
 	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
 
 	{
@@ -1020,7 +1157,7 @@ async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
 		assert_eq!(records[0].path_and_query, "/bot/v1/messages/sendText/");
 		assert_eq!(records[0].headers[AUTHORIZATION], "OAuth bot-token");
 		let body: Value = serde_json::from_slice(&records[0].body).unwrap();
-		assert_eq!(body["login"], "alice");
+		assert_eq!(body["login"], "alice@example.com");
 		assert!(
 			body["payload_id"]
 				.as_str()
@@ -1028,7 +1165,7 @@ async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
 				.starts_with("nexus-sec-proxy-")
 		);
 		let text = body["text"].as_str().unwrap();
-		assert!(text.contains("User=alice"));
+		assert!(text.contains("User=alice@example.com"));
 		assert!(text.contains("repo=maven-central"));
 		assert!(text.contains("format=maven2"));
 		assert!(text.contains("target=Maven:com.example:demo@1.2.3"));
@@ -1057,6 +1194,7 @@ async fn blocked_package_with_basic_auth_notifies_yandex_and_cached_blocks() {
 	let second_report_url = report_url_from_body(&second_body);
 	assert_ne!(first_report_url, second_report_url);
 	wait_for_record_count(&yandex_records, 2).await;
+	assert_eq!(nexus_records.lock().unwrap().len(), 4);
 	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
 }
 
@@ -1106,6 +1244,8 @@ async fn blocked_package_without_basic_auth_skips_yandex_notification() {
 		Some(template_file.path().to_string_lossy().into_owned());
 	config.yandex_messenger_api_url = yandex_url.to_string();
 	config.yandex_messenger_enabled = true;
+	config.nexus_username = Some("service-user".to_owned());
+	config.nexus_password = Some("service-password".to_owned());
 	let state = test_state_from_config(
 		config,
 		PolicySet::default(),
@@ -1177,6 +1317,8 @@ async fn yandex_failure_does_not_change_block_response() {
 		Some(template_file.path().to_string_lossy().into_owned());
 	config.yandex_messenger_api_url = yandex_url.to_string();
 	config.yandex_messenger_enabled = true;
+	config.nexus_username = Some("service-user".to_owned());
+	config.nexus_password = Some("service-password".to_owned());
 	let state = test_state_from_config(
 		config,
 		PolicySet::default(),
@@ -1203,7 +1345,84 @@ async fn yandex_failure_does_not_change_block_response() {
 	assert_eq!(status, StatusCode::FORBIDDEN);
 	assert_block_body(&body);
 	wait_for_record_count(&yandex_records, 1).await;
-	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert_eq!(nexus_records.lock().unwrap().len(), 2);
+}
+
+#[cfg(feature = "yandex-messenger")]
+#[tokio::test]
+async fn rejected_basic_credentials_return_nexus_response_without_report_or_message()
+ {
+	let nexus_url = spawn_server(
+		Router::new().fallback(any(|| async { StatusCode::UNAUTHORIZED })),
+	)
+	.await;
+	let osv_url =
+		spawn_server(Router::new().route("/osv", post(mock_osv)).with_state(
+			OsvMockState {
+				request_count: Arc::new(AtomicUsize::new(0)),
+				response: blocking_osv_response(),
+				status: StatusCode::OK,
+			},
+		))
+		.await;
+	let yandex_records = Arc::new(Mutex::new(Vec::new()));
+	let yandex_url = spawn_server(
+		Router::new()
+			.route("/bot/v1/messages/sendText/", post(mock_yandex_messenger))
+			.with_state(YandexMockState {
+				records: Arc::clone(&yandex_records),
+				response: json!({ "ok": true }),
+				status: StatusCode::OK,
+			}),
+	)
+	.await;
+	let template_file = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(template_file.path(), "blocked {user}").unwrap();
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		&format!("{osv_url}osv"),
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.yandex_messenger_token = Some("bot-token".to_owned());
+	config.yandex_messenger_template_file =
+		Some(template_file.path().to_string_lossy().into_owned());
+	config.yandex_messenger_api_url = yandex_url.to_string();
+	config.yandex_messenger_enabled = true;
+	config.nexus_username = Some("service-user".to_owned());
+	config.nexus_password = Some("service-password".to_owned());
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("maven-central", "maven2", None)],
+	);
+	let app = build_app(Arc::clone(&state));
+
+	let response = app
+		.oneshot(
+			Request::builder()
+				.uri(
+					"/repository/maven-central/com/example/demo/1.2.3/demo-1.2.3.jar",
+				)
+				.header(AUTHORIZATION, "Basic YWxpY2U6d3Jvbmc=")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+	assert!(state.decision_log.list(10).is_empty());
+	assert_eq!(
+		std::fs::read_dir(state.report_store.directory())
+			.unwrap()
+			.count(),
+		0
+	);
+	assert!(yandex_records.lock().unwrap().is_empty());
 }
 
 #[cfg(not(feature = "yandex-messenger"))]
@@ -1883,6 +2102,104 @@ async fn docker_blocked_manifest_creates_trust_report() {
 	);
 }
 
+#[cfg(all(unix, feature = "yandex-messenger"))]
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_docker_bearer_subject_resolves_nexus_email_for_yandex() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_trivy(
+		temp_dir.path(),
+		&scanner_record,
+		r#"{"Results":[{"Vulnerabilities":[{"VulnerabilityID":"CVE-2026-0001","PkgName":"openssl","Severity":"HIGH","References":[]}]}]}"#,
+	);
+	let docker = docker_registry_mock(docker_response(
+		Some("application/vnd.oci.image.manifest.v1+json"),
+		Some("sha256:blockme"),
+		r#"{"schemaVersion":2}"#,
+	));
+	let docker_url = spawn_server(
+		Router::new()
+			.fallback(any(mock_docker_registry))
+			.with_state(docker.clone()),
+	)
+	.await;
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let yandex_records = Arc::new(Mutex::new(Vec::new()));
+	let yandex_url = spawn_server(
+		Router::new()
+			.route("/bot/v1/messages/sendText/", post(mock_yandex_messenger))
+			.with_state(YandexMockState {
+				records: Arc::clone(&yandex_records),
+				response: json!({ "ok": true }),
+				status: StatusCode::OK,
+			}),
+	)
+	.await;
+	let template = tempfile::NamedTempFile::new().unwrap();
+	std::fs::write(template.path(), "blocked {user}").unwrap();
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.docker_registry_base_url = Some(docker_url.to_string());
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	config
+		.artifact_scanner_formats
+		.insert("docker".to_owned(), ArtifactScannerKind::Trivy);
+	config.fail_open = false;
+	config.yandex_messenger_enabled = true;
+	config.yandex_messenger_token = Some("bot-token".to_owned());
+	config.yandex_messenger_template_file =
+		Some(template.path().to_string_lossy().into_owned());
+	config.yandex_messenger_api_url = yandex_url.to_string();
+	config.nexus_username = Some("service-user".to_owned());
+	config.nexus_password = Some("service-password".to_owned());
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("docker-proxy", "docker", None)],
+	);
+	let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.encode(br#"{"sub":"alice"}"#);
+	let authorization = format!("Bearer e30.{payload}.signature");
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/v2/library/alpine/manifests/3.20")
+				.header(AUTHORIZATION, &authorization)
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	wait_for_record_count(&yandex_records, 1).await;
+	let yandex_body: Value =
+		serde_json::from_slice(&yandex_records.lock().unwrap()[0].body)
+			.unwrap();
+	assert_eq!(yandex_body["login"], "alice@example.com");
+	assert_eq!(nexus_records.lock().unwrap().len(), 1);
+	assert_eq!(nexus_records.lock().unwrap()[0].method, Method::GET);
+	assert_eq!(
+		docker.records.lock().unwrap()[0].headers[AUTHORIZATION],
+		authorization
+	);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn docker_scanner_failures_follow_fail_open() {
@@ -2407,6 +2724,17 @@ async fn admin_status_reports_yandex_config_without_token() {
 		"https://messenger.example.invalid"
 	);
 	assert_eq!(immutable_config["repository_refresh_interval_secs"], 60);
+	assert_eq!(
+		body["yandex_messenger"]["available"],
+		cfg!(feature = "yandex-messenger")
+	);
+	assert_eq!(
+		body["yandex_messenger"]["enabled"],
+		cfg!(feature = "yandex-messenger")
+	);
+	assert_eq!(body["yandex_messenger"]["sent"], 0);
+	assert_eq!(body["yandex_messenger"]["retried"], 0);
+	assert_eq!(body["yandex_messenger"]["failed"], 0);
 	assert!(!body.to_string().contains("bot-secret"));
 }
 
@@ -3584,7 +3912,18 @@ fn test_state_from_config(
 	let osv_api_url = config.osv_api_url.clone();
 	#[cfg(feature = "yandex-messenger")]
 	let yandex_messenger =
-		yandex_messenger_from_config(&config, http_client.clone());
+		if config.yandex_messenger_enabled {
+			Some(nexus_sec_proxy_yandex_messenger::YandexMessengerNotifier::new(
+			nexus_sec_proxy_yandex_messenger::YandexMessengerConfig::new(
+				config.yandex_messenger_token.clone().unwrap(),
+				config.yandex_messenger_template_file.clone().unwrap(),
+				config.yandex_messenger_api_url.clone(),
+			),
+			http_client.clone(),
+		))
+		} else {
+			None
+		};
 
 	Arc::new(AppState {
 		config: Arc::new(config),
