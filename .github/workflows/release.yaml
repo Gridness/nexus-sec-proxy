@@ -110,9 +110,11 @@ jobs:
           fi
 
           if [[ -n "$number" ]]; then
+            head_ref=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json headRefName --jq .headRefName)
             {
               echo "mode=open"
               echo "number=$number"
+              echo "head-ref=$head_ref"
             } >> "$GITHUB_OUTPUT"
           else
             {
@@ -126,7 +128,7 @@ jobs:
         if: steps.candidate.outputs.mode == 'open'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: refs/pull/${{ steps.candidate.outputs.number }}/head
+          ref: refs/heads/${{ steps.candidate.outputs.head-ref }}
           fetch-depth: 0
 
       - name: Install the repository toolchain
@@ -136,8 +138,7 @@ jobs:
       - name: Refresh Cargo lockfile
         if: steps.candidate.outputs.mode == 'open'
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.candidate.outputs.number }}
+          HEAD_REF: ${{ steps.candidate.outputs.head-ref }}
         run: |
           version=$(tr -d '\r\n' < .release-please-version)
           metadata=$(cargo metadata --format-version=1 --no-deps)
@@ -149,12 +150,11 @@ jobs:
             exit 0
           fi
 
-          head_ref=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName --jq .headRefName)
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add Cargo.lock
           git commit -m "chore: refresh Cargo.lock for release"
-          git push origin "HEAD:refs/heads/$head_ref"
+          git push origin "HEAD:refs/heads/$HEAD_REF"
 
       - name: Validate release-only changes
         if: steps.candidate.outputs.mode == 'open'
