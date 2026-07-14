@@ -164,9 +164,8 @@ jobs:
           PR_NUMBER: ${{ steps.candidate.outputs.number }}
           EXPECTED_BASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          base_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .base.sha)
-          if [[ "$base_sha" != "$EXPECTED_BASE_SHA" ]]; then
-            echo "Release PR base $base_sha is not the validated main commit $EXPECTED_BASE_SHA" >&2
+          if ! git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD; then
+            echo "Release candidate does not contain validated main commit $EXPECTED_BASE_SHA" >&2
             exit 1
           fi
 
