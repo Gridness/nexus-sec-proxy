@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_TIMEOUT_SECS: u64 = 5 * 60;
 pub(crate) const DEFAULT_ARTIFACT_SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const DEFAULT_ARTIFACT_SCANNER_CONCURRENCY: u64 = 2;
+pub(crate) const DEFAULT_HELM_BINARY: &str = "helm";
 pub(crate) const DEFAULT_TRUST_REPORT_DIR: &str =
 	"/var/lib/nexus-sec-proxy/trust-reports";
 pub(crate) const DEFAULT_TRUST_REPORT_RETENTION_DAYS: u64 = 30;
@@ -306,7 +307,7 @@ pub(crate) fn artifact_scanner_formats_env(
 			invalid_artifact_scanner_format_map(
 				name,
 				trimmed,
-				"scanner must be trivy or grype",
+				"scanner must be trivy",
 			)
 		})?;
 		if routes.insert(format.clone(), scanner).is_some() {

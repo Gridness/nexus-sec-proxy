@@ -11,14 +11,14 @@ use crate::env::{
 	DEFAULT_ARTIFACT_SCAN_MAX_BYTES, DEFAULT_ARTIFACT_SCANNER_CONCURRENCY,
 	DEFAULT_ARTIFACT_SCANNER_TIMEOUT_SECS, DEFAULT_BIND_ADDR,
 	DEFAULT_CACHE_ALLOWED_TTL_SECS, DEFAULT_CACHE_BLOCKED_TTL_SECS,
-	DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_OSV_API_URL, DEFAULT_REPOSITORY_FORMAT,
-	DEFAULT_REPOSITORY_NAME, DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS,
-	DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TRUST_REPORT_DIR,
-	DEFAULT_TRUST_REPORT_RETENTION_DAYS, DEFAULT_YANDEX_MESSENGER_API_URL,
-	artifact_scanner_formats_env, bool_env, normalize_artifact_format,
-	optional_bool_env, optional_string_env, osv_ecosystem_overrides_env,
-	required_string_env_with_fallbacks, socket_addr_env, string_env, u64_env,
-	unsupported_target_policy_env,
+	DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_HELM_BINARY, DEFAULT_OSV_API_URL,
+	DEFAULT_REPOSITORY_FORMAT, DEFAULT_REPOSITORY_NAME,
+	DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS, DEFAULT_REQUEST_TIMEOUT_SECS,
+	DEFAULT_TRUST_REPORT_DIR, DEFAULT_TRUST_REPORT_RETENTION_DAYS,
+	DEFAULT_YANDEX_MESSENGER_API_URL, artifact_scanner_formats_env, bool_env,
+	normalize_artifact_format, optional_bool_env, optional_string_env,
+	osv_ecosystem_overrides_env, required_string_env_with_fallbacks,
+	socket_addr_env, string_env, u64_env, unsupported_target_policy_env,
 };
 use crate::policy_file::load_policy;
 use crate::{ArtifactScannerKind, ConfigError, UnsupportedTargetPolicy};
@@ -64,6 +64,7 @@ pub struct AppConfig {
 	pub artifact_scan_max_bytes: u64,
 	pub artifact_scanner_concurrency: u64,
 	pub artifact_tmp_dir: Option<String>,
+	pub helm_binary: String,
 	pub security_policy: SecurityPolicy,
 	pub policy_set: PolicySet,
 }
@@ -245,6 +246,11 @@ impl AppConfig {
 			&mut lookup,
 			"NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR",
 		);
+		let helm_binary = string_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_HELM_BINARY",
+			DEFAULT_HELM_BINARY,
+		);
 		let (security_policy, policy_set) =
 			load_policy(&mut lookup, policy_file.as_deref())?;
 
@@ -285,6 +291,7 @@ impl AppConfig {
 			artifact_scan_max_bytes,
 			artifact_scanner_concurrency,
 			artifact_tmp_dir,
+			helm_binary,
 			security_policy,
 			policy_set,
 		})

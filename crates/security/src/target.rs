@@ -180,23 +180,11 @@ pub fn default_osv_ecosystem_for_format(
 	repository_format: &str,
 ) -> Option<&'static str> {
 	match normalize_repository_format(repository_format).as_str() {
-		"alpine" => Some("Alpine"),
-		"apk" => Some("Alpine"),
-		"cran" | "r" => Some("R"),
 		"cargo" | "rust" | "rustcargo" => Some("crates.io"),
-		"composer" | "phpcomposer" => Some("Packagist"),
-		"debian" => Some("Debian GNU/Linux"),
 		"go" | "golang" => Some("Go"),
 		"maven" | "maven2" => Some("Maven"),
 		"npm" | "node" => Some("npm"),
-		"nuget" => Some("NuGet"),
-		"packagist" => Some("Packagist"),
-		"pub" | "flutter" | "dart" => Some("Pub"),
 		"pypi" | "python" => Some("PyPI"),
-		"rockylinux" | "rocky" => Some("Rocky Linux"),
-		"rubygems" | "gem" | "ruby" => Some("RubyGems"),
-		"swift" => Some("SwiftURL"),
-		"ubuntu" => Some("Ubuntu OS"),
 		_ => None,
 	}
 }

@@ -11,7 +11,6 @@ use crate::{Reference, ScanTarget, SecurityError, Vulnerability};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalScannerKind {
 	Trivy,
-	Grype,
 }
 
 #[derive(Debug, Clone)]
@@ -71,9 +70,6 @@ impl ExternalScanner {
 
 				command.arg(path);
 			}
-			ExternalScannerKind::Grype => {
-				command.arg(path).arg("-o").arg("json");
-			}
 		}
 
 		let output = tokio_time::timeout(self.timeout, command.output())
@@ -91,9 +87,6 @@ impl ExternalScanner {
 		match self.kind {
 			ExternalScannerKind::Trivy => {
 				parse_trivy_output(target, &output.stdout)
-			}
-			ExternalScannerKind::Grype => {
-				parse_grype_output(target, &output.stdout)
 			}
 		}
 	}
@@ -139,20 +132,6 @@ impl ExternalScanner {
 
 				command.arg(image);
 			}
-			ExternalScannerKind::Grype => {
-				if insecure_registry {
-					command.env("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true");
-					command
-						.env("GRYPE_REGISTRY_INSECURE_SKIP_TLS_VERIFY", "true");
-				}
-
-				command
-					.arg(image)
-					.arg("-o")
-					.arg("json")
-					.arg("--from")
-					.arg("registry");
-			}
 		}
 
 		let output = tokio_time::timeout(self.timeout, command.output())
@@ -170,9 +149,6 @@ impl ExternalScanner {
 		match self.kind {
 			ExternalScannerKind::Trivy => {
 				parse_trivy_output(target, &output.stdout)
-			}
-			ExternalScannerKind::Grype => {
-				parse_grype_output(target, &output.stdout)
 			}
 		}
 	}
@@ -192,20 +168,6 @@ pub(crate) fn parse_trivy_output(
 				trivy_to_vulnerability(target, vulnerability)
 			})
 		})
-		.collect())
-}
-
-pub(crate) fn parse_grype_output(
-	target: &ScanTarget,
-	output: &[u8],
-) -> Result<Vec<Vulnerability>, SecurityError> {
-	let report: GrypeReport = serde_json::from_slice(output)
-		.map_err(|error| SecurityError::InvalidResponse(error.to_string()))?;
-
-	Ok(report
-		.matches
-		.into_iter()
-		.map(|matched| grype_to_vulnerability(target, matched))
 		.collect())
 }
 
@@ -266,50 +228,6 @@ fn trivy_to_vulnerability(
 	}
 }
 
-fn grype_to_vulnerability(
-	target: &ScanTarget,
-	matched: GrypeMatch,
-) -> Vulnerability {
-	let mut aliases = matched
-		.vulnerability
-		.aliases
-		.into_iter()
-		.map(|alias| alias.id)
-		.collect::<Vec<_>>();
-	aliases.extend(
-		matched
-			.related_vulnerabilities
-			.into_iter()
-			.map(|vulnerability| vulnerability.id),
-	);
-	aliases.sort();
-	aliases.dedup();
-
-	let references = matched
-		.vulnerability
-		.urls
-		.into_iter()
-		.map(|url| Reference {
-			url,
-			kind: Some("WEB".to_owned()),
-		})
-		.collect();
-
-	Vulnerability {
-		id: matched.vulnerability.id,
-		aliases,
-		summary: Some(format!(
-			"{} {} in {}",
-			matched.artifact.name,
-			matched.artifact.version.unwrap_or_default(),
-			target.display_name()
-		)),
-		details: matched.vulnerability.description,
-		severity: severity_from_text_or_score(&matched.vulnerability.severity),
-		references,
-	}
-}
-
 fn vulnerability_id_from_url(url: &str) -> Option<String> {
 	url.rsplit(['/', '#', '?'])
 		.find(|segment| {
@@ -350,40 +268,4 @@ struct TrivyVulnerability {
 	references: Vec<String>,
 	#[serde(default, rename = "CveIDs")]
 	cve_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrypeReport {
-	#[serde(default)]
-	matches: Vec<GrypeMatch>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrypeMatch {
-	vulnerability: GrypeVulnerability,
-	#[serde(default, rename = "relatedVulnerabilities")]
-	related_vulnerabilities: Vec<GrypeRelatedVulnerability>,
-	artifact: GrypeArtifact,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrypeVulnerability {
-	id: String,
-	severity: String,
-	description: Option<String>,
-	#[serde(default)]
-	urls: Vec<String>,
-	#[serde(default)]
-	aliases: Vec<GrypeRelatedVulnerability>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrypeRelatedVulnerability {
-	id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrypeArtifact {
-	name: String,
-	version: Option<String>,
 }

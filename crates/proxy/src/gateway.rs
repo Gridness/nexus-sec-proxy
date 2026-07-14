@@ -23,6 +23,7 @@ use crate::classifier::{
 	ClassificationContext, RequestClassification, classify_path,
 };
 use crate::docker::{handle_docker_registry_request, is_docker_registry_path};
+use crate::helm::scan_helm_chart;
 use crate::responses::{response_with_text, unknown_repository_response};
 use crate::scan::{
 	authorize_package_target, external_scanner_for_kind,
@@ -292,10 +293,22 @@ async fn authorize_artifact_target(
 	};
 
 	let scanner = external_scanner_for_kind(&state.config, scanner);
-	let vulnerabilities = match scanner
-		.scan_path(&target, prefetched.file.path())
-		.await
-	{
+	let is_helm = repository
+		.format
+		.chars()
+		.filter(|c| c.is_ascii_alphanumeric())
+		.flat_map(char::to_lowercase)
+		.collect::<String>()
+		== "helm";
+	let scan_result = if is_helm {
+		scan_helm_chart(state, scanner, &target, prefetched.file.path()).await
+	} else {
+		scanner
+			.scan_path(&target, prefetched.file.path())
+			.await
+			.map_err(|error| error.to_string())
+	};
+	let vulnerabilities = match scan_result {
 		Ok(vulnerabilities) => vulnerabilities,
 		Err(error) => {
 			drop(permit);

@@ -30,12 +30,9 @@ pub(crate) enum ScannerDbStatus {
 	Found,
 }
 pub(crate) fn scanner_db_summaries_from_env() -> Vec<ScannerDbSummary> {
-	[
-		scanner_db_summary_from_env("TRIVY_CACHE_DIR"),
-		scanner_db_summary_from_env("GRYPE_DB_CACHE_DIR"),
-	]
-	.into_iter()
-	.collect()
+	[scanner_db_summary_from_env("TRIVY_CACHE_DIR")]
+		.into_iter()
+		.collect()
 }
 
 pub(crate) fn scanner_db_summary_from_env(
