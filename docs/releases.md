@@ -7,8 +7,14 @@ hand.
 ## Version policy
 
 `[workspace.package].version` in `Cargo.toml` is authoritative. Release Please
-updates it, every workspace crate, `Cargo.lock`, deployment examples,
-`CHANGELOG.md`, and the release manifest in a small automated pull request.
+updates it, deployment examples, `CHANGELOG.md`, and its version-state files in
+a small automated pull request. The release workflow then refreshes
+`Cargo.lock`; workspace crates inherit the root version through Cargo.
+
+The `simple` Release Please strategy is intentional: its Rust updater cannot
+handle Cargo's `version.workspace = true` inheritance ([upstream issue #2111](https://github.com/googleapis/release-please/issues/2111)).
+The workflow verifies `.release-please-version`, the release manifest, and
+Cargo metadata all contain the same version.
 
 Pull request titles must follow Conventional Commits. Release-worthy changes
 are classified as follows:
