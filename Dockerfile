@@ -66,7 +66,7 @@ RUN set -eux; \
 	helm_archive="helm-v${HELM_VERSION}-linux-${helm_arch}.tar.gz"; \
 	helm_base_url="https://get.helm.sh"; \
 	curl -fsSLo "/tmp/${helm_archive}" "${helm_base_url}/${helm_archive}"; \
-	curl -fsSLo /tmp/helm_checksums.txt "${helm_base_url}/helm-v${HELM_VERSION}-checksums.txt"; \
+	curl -fsSLo /tmp/helm_checksums.txt "${helm_base_url}/${helm_archive}.sha256sum"; \
 	(cd /tmp && grep " ${helm_archive}$" helm_checksums.txt | sha256sum -c -); \
 	tar -xzf "/tmp/${helm_archive}" -C /tmp linux-${helm_arch}/helm; \
 	install -D -m 0755 /tmp/linux-${helm_arch}/helm /out/helm; \
