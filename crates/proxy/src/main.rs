@@ -6,6 +6,7 @@ mod decisions;
 mod docker;
 mod gateway;
 mod helm;
+mod requester;
 mod responses;
 mod scan;
 mod scanner_db;
@@ -15,6 +16,7 @@ mod tracing_setup;
 mod trust_reports;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -30,7 +32,7 @@ use nexus_sec_proxy_config::{AppConfig, ArtifactScannerKind};
 use nexus_sec_proxy_security::OsvClient;
 #[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::{
-	YandexMessengerConfig, YandexMessengerNotifier,
+	YandexMessengerConfig, YandexMessengerNotifier, validate_config,
 };
 use serde::Serialize;
 use tokio::process::Command;
@@ -63,7 +65,9 @@ pub(crate) use crate::catalog::{
 #[cfg(test)]
 pub(crate) use crate::decisions::{DecisionOutcome, RecentDecision};
 #[cfg(test)]
-pub(crate) use crate::gateway::{basic_auth_username, build_nexus_url};
+pub(crate) use crate::gateway::build_nexus_url;
+#[cfg(test)]
+pub(crate) use crate::requester::basic_auth_username;
 #[cfg(test)]
 pub(crate) use crate::responses::response_with_text;
 #[cfg(test)]
@@ -71,14 +75,27 @@ pub(crate) use crate::scan::handle_policy_evaluation;
 #[cfg(test)]
 pub(crate) use crate::scanner_db::scanner_db_summary_for_dir;
 
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--version")) {
+		println!("nexus-sec-proxy {VERSION}");
+		return Ok(());
+	}
+
 	init_tracing(env_log_json());
 
 	let config = AppConfig::from_env().map_err(|error| {
 		error!(%error, "failed to load configuration");
 		anyhow::Error::new(error).context("failed to load configuration")
 	})?;
+	#[cfg(not(feature = "yandex-messenger"))]
+	if config.yandex_messenger_enabled {
+		anyhow::bail!(
+			"Yandex Messenger is enabled but this binary was built without the yandex-messenger feature"
+		);
+	}
 	let bind_addr = config.bind_addr;
 	let report_store = ReportStore::initialize(
 		&config.trust_report_dir,
@@ -112,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
 	let osv = OsvClient::new(http_client.clone(), config.osv_api_url.clone());
 	#[cfg(feature = "yandex-messenger")]
 	let yandex_messenger =
-		yandex_messenger_from_config(&config, http_client.clone());
+		yandex_messenger_from_config(&config, http_client.clone()).await?;
 	let artifact_scanner_semaphore = Arc::new(Semaphore::new(
 		config.artifact_scanner_concurrency.max(1) as usize,
 	));
@@ -143,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
 	let repository_catalog = state.repository_catalog();
 
 	info!(
+		version = VERSION,
 		bind_addr = %bind_addr,
 		nexus_base_url = %state.config.nexus_base_url,
 		repository_count = repository_catalog.repositories.len(),
@@ -169,8 +187,10 @@ async fn main() -> anyhow::Result<()> {
 		.await
 		.with_context(|| format!("failed to bind {bind_addr}"))?;
 	let cancellation = CancellationToken::new();
-	let repository_refresh_task =
-		spawn_repository_catalog_refresh(state, cancellation.clone());
+	let repository_refresh_task = spawn_repository_catalog_refresh(
+		Arc::clone(&state),
+		cancellation.clone(),
+	);
 
 	let server_result = axum::serve(listener, app)
 		.with_graceful_shutdown({
@@ -186,29 +206,43 @@ async fn main() -> anyhow::Result<()> {
 		task.await
 			.context("repository catalog refresh task failed")?;
 	}
+	#[cfg(feature = "yandex-messenger")]
+	if let Some(notifier) = state.yandex_messenger.as_ref() {
+		notifier.shutdown(Duration::from_secs(10)).await;
+	}
 	server_result.context("server failed")?;
 
 	Ok(())
 }
 
 #[cfg(feature = "yandex-messenger")]
-fn yandex_messenger_from_config(
+async fn yandex_messenger_from_config(
 	config: &AppConfig,
 	http_client: reqwest::Client,
-) -> Option<YandexMessengerNotifier> {
+) -> anyhow::Result<Option<YandexMessengerNotifier>> {
 	if !config.yandex_messenger_enabled {
-		return None;
+		return Ok(None);
 	}
 
-	let token = config.yandex_messenger_token.as_deref()?;
-	let template_file = config.yandex_messenger_template_file.as_deref()?;
+	let token = config
+		.yandex_messenger_token
+		.as_deref()
+		.context("Yandex Messenger token is missing")?;
+	let template_file = config
+		.yandex_messenger_template_file
+		.as_deref()
+		.context("Yandex Messenger template file is missing")?;
 	let yandex_config = YandexMessengerConfig::new(
 		token,
 		template_file,
 		config.yandex_messenger_api_url.clone(),
 	);
+	validate_config(&yandex_config).await?;
 
-	Some(YandexMessengerNotifier::new(yandex_config, http_client))
+	Ok(Some(YandexMessengerNotifier::new(
+		yandex_config,
+		http_client,
+	)))
 }
 
 fn build_app(state: Arc<AppState>) -> Router {

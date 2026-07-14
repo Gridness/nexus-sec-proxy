@@ -5,25 +5,7 @@ x-scanner-cache-env: &scanner-cache-env
 
 services:
   nexus-sec-proxy:
-    image: nexus-sec-proxy:${NEXUS_SEC_PROXY_IMAGE_TAG:-local}
-    build:
-      context: .
-      target: runtime
-      args:
-        RUST_VERSION: ${RUST_VERSION:-1.95}
-        DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
-        TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
-        HELM_VERSION: ${HELM_VERSION:-3.18.4}
-        VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
-        VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
-        BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
-    deploy:
-      replicas: 2
-      update_config:
-        parallelism: 1
-        order: start-first
-        failure_action: rollback
-        delay: 10s
+    image: ghcr.io/gridness/nexus-sec-proxy:${NEXUS_SEC_PROXY_VERSION:?set NEXUS_SEC_PROXY_VERSION to an exact release such as 0.1.0}
     init: true
     restart: unless-stopped
     read_only: true
@@ -38,9 +20,10 @@ services:
       HOME: /home/nonroot
       RUST_LOG: ${RUST_LOG:-nexus_sec_proxy=info}
       NEXUS_SEC_PROXY_BIND_ADDR: 0.0.0.0:3000
-      NEXUS_SEC_PROXY_NEXUS_BASE_URL: ${NEXUS_SEC_PROXY_NEXUS_BASE_URL:-http://nexus:8081}
+      NEXUS_SEC_PROXY_NEXUS_BASE_URL: ${NEXUS_SEC_PROXY_NEXUS_BASE_URL:?set the Nexus base URL}
       NEXUS_SEC_PROXY_NEXUS_USERNAME: ${NEXUS_SEC_PROXY_NEXUS_USERNAME:-}
       NEXUS_SEC_PROXY_NEXUS_PASSWORD: ${NEXUS_SEC_PROXY_NEXUS_PASSWORD:-}
+      NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE: ${NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE:-}
       NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL: ${NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL:-}
       NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME: ${NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME:-}
       NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS: ${NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS:-60}
@@ -49,10 +32,11 @@ services:
       NEXUS_SEC_PROXY_POLICY_FILE: ${NEXUS_SEC_PROXY_POLICY_FILE:-}
       NEXUS_SEC_PROXY_ADMIN_TOKEN: ${NEXUS_SEC_PROXY_ADMIN_TOKEN:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN:-}
+      NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL:-https://botapi.messenger.yandex.net}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED:-}
-      NEXUS_SEC_PROXY_TRUST_BASE_URL: ${NEXUS_SEC_PROXY_TRUST_BASE_URL:-http://localhost:${NEXUS_SEC_PROXY_PORT:-3000}}
+      NEXUS_SEC_PROXY_TRUST_BASE_URL: ${NEXUS_SEC_PROXY_TRUST_BASE_URL:?set the public Trust report base URL}
       NEXUS_SEC_PROXY_TRUST_REPORT_DIR: /var/lib/nexus-sec-proxy/trust-reports
       NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS: ${NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS:-30}
       NEXUS_SEC_PROXY_LOG_JSON: ${NEXUS_SEC_PROXY_LOG_JSON:-false}
@@ -84,16 +68,7 @@ services:
       - trust-reports:/var/lib/nexus-sec-proxy/trust-reports
       - trivy-cache:/var/cache/trivy
     healthcheck:
-      test:
-        [
-          "CMD",
-          "/busybox",
-          "wget",
-          "-q",
-          "-O",
-          "-",
-          "http://127.0.0.1:3000/healthz",
-        ]
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -106,16 +81,7 @@ services:
         max-file: "5"
 
   scanner-db-updater:
-    image: nexus-sec-proxy-scanner-db-updater:${NEXUS_SEC_PROXY_IMAGE_TAG:-local}
-    build:
-      context: .
-      target: scanner-db-updater
-      args:
-        DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
-        TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
-        HELM_VERSION: ${HELM_VERSION:-3.18.4}
-    deploy:
-      replicas: 1
+    image: ghcr.io/gridness/nexus-sec-proxy-scanner-db-updater:${NEXUS_SEC_PROXY_VERSION:?set NEXUS_SEC_PROXY_VERSION to an exact release such as 0.1.0}
     init: true
     restart: unless-stopped
     read_only: true

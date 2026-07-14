@@ -63,6 +63,18 @@ pub enum ConfigError {
 	},
 	#[error("missing required environment variable: {name}")]
 	MissingRequired { name: &'static str },
+	#[error("{value_name} and {file_name} cannot both be set")]
+	ConflictingSecretSources {
+		value_name: &'static str,
+		file_name: &'static str,
+	},
+	#[error("failed to read secret file from {name}: {path}")]
+	SecretFileRead {
+		name: &'static str,
+		path: String,
+		#[source]
+		source: std::io::Error,
+	},
 	#[error("failed to read policy file {path}")]
 	PolicyFileRead {
 		path: String,

@@ -16,9 +16,10 @@ use crate::env::{
 	DEFAULT_REPOSITORY_REFRESH_INTERVAL_SECS, DEFAULT_REQUEST_TIMEOUT_SECS,
 	DEFAULT_TRUST_REPORT_DIR, DEFAULT_TRUST_REPORT_RETENTION_DAYS,
 	DEFAULT_YANDEX_MESSENGER_API_URL, artifact_scanner_formats_env, bool_env,
-	normalize_artifact_format, optional_bool_env, optional_string_env,
+	normalize_artifact_format, optional_string_env,
 	osv_ecosystem_overrides_env, required_string_env_with_fallbacks,
-	socket_addr_env, string_env, u64_env, unsupported_target_policy_env,
+	secret_env, socket_addr_env, string_env, u64_env,
+	unsupported_target_policy_env,
 };
 use crate::policy_file::load_policy;
 use crate::{ArtifactScannerKind, ConfigError, UnsupportedTargetPolicy};
@@ -128,8 +129,11 @@ impl AppConfig {
 		)?;
 		let nexus_username =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_USERNAME");
-		let nexus_password =
-			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_NEXUS_PASSWORD");
+		let nexus_password = secret_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_NEXUS_PASSWORD",
+			"NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE",
+		)?;
 		let repository_refresh_interval_secs = u64_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS",
@@ -144,10 +148,11 @@ impl AppConfig {
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_POLICY_FILE");
 		let admin_token =
 			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_ADMIN_TOKEN");
-		let yandex_messenger_token = optional_string_env(
+		let yandex_messenger_token = secret_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN",
-		);
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE",
+		)?;
 		let yandex_messenger_template_file = optional_string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
@@ -157,14 +162,29 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL",
 			DEFAULT_YANDEX_MESSENGER_API_URL,
 		);
-		let yandex_messenger_configured = yandex_messenger_token.is_some()
-			&& yandex_messenger_template_file.is_some();
-		let yandex_messenger_enabled = optional_bool_env(
+		let yandex_messenger_enabled = bool_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED",
-		)?
-		.unwrap_or(yandex_messenger_configured)
-			&& yandex_messenger_configured;
+			false,
+		)?;
+		if yandex_messenger_enabled {
+			for (name, present) in [
+				(
+					"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN",
+					yandex_messenger_token.is_some(),
+				),
+				(
+					"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+					yandex_messenger_template_file.is_some(),
+				),
+				("NEXUS_SEC_PROXY_NEXUS_USERNAME", nexus_username.is_some()),
+				("NEXUS_SEC_PROXY_NEXUS_PASSWORD", nexus_password.is_some()),
+			] {
+				if !present {
+					return Err(ConfigError::MissingRequired { name });
+				}
+			}
+		}
 		let trust_base_url =
 			trust_base_url(&mut lookup, "NEXUS_SEC_PROXY_TRUST_BASE_URL")?;
 		let trust_report_dir = string_env(

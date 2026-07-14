@@ -20,6 +20,9 @@ use crate::audit::vulnerability_ids;
 use crate::audit::{audit_policy_evaluation, audit_unsupported_block};
 use crate::catalog::NexusRepository;
 use crate::decisions::{DecisionOutcome, record_decision};
+use crate::requester::Requester;
+#[cfg(feature = "yandex-messenger")]
+use crate::requester::messenger_recipient;
 use crate::responses::response_with_text;
 use crate::state::AppState;
 
@@ -27,7 +30,7 @@ pub(crate) async fn authorize_package_target(
 	state: &AppState,
 	repository: &NexusRepository,
 	target: ScanTarget,
-	requester_login: Option<&str>,
+	requester: Option<&Requester>,
 ) -> Result<(), Box<Response<Body>>> {
 	let cache_key = cache_key_for_target(&target);
 
@@ -45,7 +48,7 @@ pub(crate) async fn authorize_package_target(
 					&target,
 					scan.vulnerabilities,
 				),
-				requester_login,
+				requester,
 			)
 			.await;
 		}
@@ -76,11 +79,7 @@ pub(crate) async fn authorize_package_target(
 		}
 		Err(SecurityError::UnsupportedTarget(reason)) => {
 			return handle_unsupported_target(
-				state,
-				repository,
-				target,
-				reason,
-				requester_login,
+				state, repository, target, reason, requester,
 			)
 			.await;
 		}
@@ -105,14 +104,8 @@ pub(crate) async fn authorize_package_target(
 		}
 	};
 
-	handle_policy_evaluation(
-		state,
-		&context,
-		&target,
-		decision,
-		requester_login,
-	)
-	.await
+	handle_policy_evaluation(state, &context, &target, decision, requester)
+		.await
 }
 
 pub(crate) async fn handle_unsupported_target(
@@ -120,7 +113,7 @@ pub(crate) async fn handle_unsupported_target(
 	repository: &NexusRepository,
 	target: ScanTarget,
 	reason: String,
-	requester_login: Option<&str>,
+	requester: Option<&Requester>,
 ) -> Result<(), Box<Response<Body>>> {
 	match state.config.unsupported_target_policy {
 		UnsupportedTargetPolicy::Allow => {
@@ -132,6 +125,8 @@ pub(crate) async fn handle_unsupported_target(
 			Ok(())
 		}
 		UnsupportedTargetPolicy::Block => {
+			let recipient =
+				messenger_recipient_for_block(state, requester).await?;
 			let report = BlockReport::unsupported(target, reason);
 			let active_policy = state.active_policy();
 			let context =
@@ -147,7 +142,7 @@ pub(crate) async fn handle_unsupported_target(
 			);
 			notify_blocked(
 				state,
-				requester_login,
+				recipient.as_deref(),
 				&context,
 				&report,
 				&created.url,
@@ -165,7 +160,7 @@ pub(crate) async fn handle_policy_evaluation(
 	context: &PolicyContext,
 	target: &ScanTarget,
 	evaluation: PolicyEvaluation,
-	requester_login: Option<&str>,
+	requester: Option<&Requester>,
 ) -> Result<(), Box<Response<Body>>> {
 	match &evaluation.outcome {
 		PolicyOutcome::Allowed => {
@@ -182,6 +177,8 @@ pub(crate) async fn handle_policy_evaluation(
 			);
 		}
 		PolicyOutcome::Blocked(report) => {
+			let recipient =
+				messenger_recipient_for_block(state, requester).await?;
 			let created = create_trust_report(state, context, report).await?;
 			audit_policy_evaluation(
 				context,
@@ -198,7 +195,7 @@ pub(crate) async fn handle_policy_evaluation(
 			);
 			notify_blocked(
 				state,
-				requester_login,
+				recipient.as_deref(),
 				context,
 				report,
 				&created.url,
@@ -216,13 +213,13 @@ pub(crate) async fn handle_policy_evaluation(
 #[cfg(feature = "yandex-messenger")]
 fn notify_blocked(
 	state: &AppState,
-	requester_login: Option<&str>,
+	recipient_login: Option<&str>,
 	context: &PolicyContext,
 	report: &BlockReport,
 	report_url: &str,
 ) {
 	let (Some(login), Some(notifier)) =
-		(requester_login, state.yandex_messenger.as_ref())
+		(recipient_login, state.yandex_messenger.as_ref())
 	else {
 		return;
 	};
@@ -242,11 +239,33 @@ fn notify_blocked(
 #[cfg(not(feature = "yandex-messenger"))]
 fn notify_blocked(
 	_state: &AppState,
-	_requester_login: Option<&str>,
+	_recipient_login: Option<&str>,
 	_context: &PolicyContext,
 	_report: &BlockReport,
 	_report_url: &str,
 ) {
+}
+
+#[cfg(feature = "yandex-messenger")]
+async fn messenger_recipient_for_block(
+	state: &AppState,
+	requester: Option<&Requester>,
+) -> Result<Option<String>, Box<Response<Body>>> {
+	let recipient = messenger_recipient(state, requester).await?;
+	if recipient.is_none()
+		&& let Some(notifier) = state.yandex_messenger.as_ref()
+	{
+		notifier.record_skipped("recipient_unavailable");
+	}
+	Ok(recipient)
+}
+
+#[cfg(not(feature = "yandex-messenger"))]
+async fn messenger_recipient_for_block(
+	_state: &AppState,
+	_requester: Option<&Requester>,
+) -> Result<Option<String>, Box<Response<Body>>> {
+	Ok(None)
 }
 
 async fn create_trust_report(

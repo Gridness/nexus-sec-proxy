@@ -118,6 +118,9 @@ fn parses_yandex_messenger_config_and_effective_enabled_state() {
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL",
 			" https://messenger.example.invalid ",
 		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
+		("NEXUS_SEC_PROXY_NEXUS_USERNAME", "service-user"),
+		("NEXUS_SEC_PROXY_NEXUS_PASSWORD", "service-password"),
 	]);
 
 	let config = config_from_env(&env).unwrap();
@@ -158,9 +161,14 @@ fn parses_yandex_messenger_config_and_effective_enabled_state() {
 		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
 	]);
 
-	let config = config_from_env(&env).unwrap();
+	let error = config_from_env(&env).unwrap_err();
 
-	assert!(!config.yandex_messenger_enabled);
+	assert!(matches!(
+		error,
+		ConfigError::MissingRequired {
+			name: "NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN"
+		}
+	));
 }
 
 #[test]
@@ -177,6 +185,8 @@ fn yandex_messenger_token_is_redacted_from_serialized_config() {
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
 			"/etc/nsp/yandex-message.txt",
 		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
+		("NEXUS_SEC_PROXY_NEXUS_USERNAME", "service-user"),
 	]);
 
 	let config = config_from_env(&env).unwrap();
@@ -190,6 +200,53 @@ fn yandex_messenger_token_is_redacted_from_serialized_config() {
 		"/etc/nsp/yandex-message.txt"
 	);
 	assert_eq!(value["yandex_messenger_enabled"], true);
+}
+
+#[test]
+fn reads_file_backed_secrets_and_rejects_conflicting_sources() {
+	let directory = tempfile::tempdir().unwrap();
+	let token_path = directory.path().join("yandex-token");
+	let password_path = directory.path().join("nexus-password");
+	std::fs::write(&token_path, " token with spaces \n").unwrap();
+	std::fs::write(&password_path, "password\r\n").unwrap();
+	let token_path = token_path.to_string_lossy().into_owned();
+	let password_path = password_path.to_string_lossy().into_owned();
+	let env = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+			"https://nexus.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_NEXUS_USERNAME", "service-user"),
+		(
+			"NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE",
+			password_path.as_str(),
+		),
+		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED", "true"),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE",
+			token_path.as_str(),
+		),
+		(
+			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
+			"/template",
+		),
+	]);
+
+	let config = config_from_env(&env).unwrap();
+
+	assert_eq!(
+		config.yandex_messenger_token.as_deref(),
+		Some(" token with spaces ")
+	);
+	assert_eq!(config.nexus_password.as_deref(), Some("password"));
+
+	let mut conflicting = env;
+	conflicting.insert("NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN", "token");
+	let error = config_from_env(&conflicting).unwrap_err();
+	assert!(matches!(
+		error,
+		ConfigError::ConflictingSecretSources { .. }
+	));
 }
 
 #[test]

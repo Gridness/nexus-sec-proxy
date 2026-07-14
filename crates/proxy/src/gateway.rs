@@ -3,12 +3,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{
-	AUTHORIZATION, CONNECTION, HOST, RANGE, TRANSFER_ENCODING,
-};
+use axum::http::header::{CONNECTION, HOST, RANGE, TRANSFER_ENCODING};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use nexus_sec_proxy_cache::{CacheKey, CachedScan, ScanCache};
 use nexus_sec_proxy_security::ScanTarget;
@@ -24,6 +20,7 @@ use crate::classifier::{
 };
 use crate::docker::{handle_docker_registry_request, is_docker_registry_path};
 use crate::helm::scan_helm_chart;
+use crate::requester::Requester;
 use crate::responses::{response_with_text, unknown_repository_response};
 use crate::scan::{
 	authorize_package_target, external_scanner_for_kind,
@@ -39,7 +36,7 @@ pub(crate) async fn proxy_handler(
 	let method = parts.method;
 	let uri = parts.uri;
 	let headers = parts.headers;
-	let requester_login = basic_auth_username(&headers);
+	let requester = Requester::basic(&uri, &headers);
 
 	if uri.path().starts_with("/admin") {
 		return if state.config.admin_token.is_some() {
@@ -58,12 +55,7 @@ pub(crate) async fn proxy_handler(
 		&& is_docker_registry_path(uri.path())
 	{
 		return handle_docker_registry_request(
-			&state,
-			method,
-			uri,
-			&headers,
-			body,
-			requester_login.as_deref(),
+			&state, method, uri, &headers, body,
 		)
 		.await;
 	}
@@ -92,7 +84,7 @@ pub(crate) async fn proxy_handler(
 						&state,
 						&repository,
 						ScanTarget::Package(package),
-						requester_login.as_deref(),
+						requester.as_ref(),
 					)
 					.await
 					{
@@ -115,7 +107,7 @@ pub(crate) async fn proxy_handler(
 								target,
 								"artifact range requests cannot be scanned"
 									.to_owned(),
-								requester_login.as_deref(),
+								requester.as_ref(),
 							)
 							.await
 							{
@@ -129,7 +121,7 @@ pub(crate) async fn proxy_handler(
 								scanner,
 								&uri,
 								&headers,
-								requester_login.as_deref(),
+								requester.as_ref(),
 							)
 							.await
 							{
@@ -146,7 +138,7 @@ pub(crate) async fn proxy_handler(
 							"artifact format {} is not mapped to a scanner",
 							repository.format
 						),
-						requester_login.as_deref(),
+						requester.as_ref(),
 					)
 					.await
 					{
@@ -219,7 +211,7 @@ async fn authorize_artifact_target(
 	scanner: nexus_sec_proxy_config::ArtifactScannerKind,
 	uri: &Uri,
 	headers: &HeaderMap,
-	requester_login: Option<&str>,
+	requester: Option<&Requester>,
 ) -> Result<Option<Response<Body>>, Box<Response<Body>>> {
 	let cache_key = artifact_cache_key(repository, &target, uri);
 
@@ -237,7 +229,7 @@ async fn authorize_artifact_target(
 					&target,
 					scan.vulnerabilities,
 				),
-				requester_login,
+				requester,
 			)
 			.await?;
 			return Ok(None);
@@ -278,7 +270,7 @@ async fn authorize_artifact_target(
 				repository,
 				target,
 				nexus_response,
-				requester_login,
+				requester,
 			)
 			.await;
 		}
@@ -351,7 +343,7 @@ async fn authorize_artifact_target(
 			&target,
 			vulnerabilities,
 		),
-		requester_login,
+		requester,
 	)
 	.await?;
 
@@ -499,7 +491,7 @@ async fn oversized_artifact_response(
 	repository: &crate::catalog::NexusRepository,
 	target: ScanTarget,
 	nexus_response: Option<reqwest::Response>,
-	requester_login: Option<&str>,
+	requester: Option<&Requester>,
 ) -> Result<Option<Response<Body>>, Box<Response<Body>>> {
 	let result = handle_unsupported_target(
 		state,
@@ -509,7 +501,7 @@ async fn oversized_artifact_response(
 			"artifact exceeds NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES ({})",
 			state.config.artifact_scan_max_bytes
 		),
-		requester_login,
+		requester,
 	)
 	.await;
 
@@ -657,26 +649,4 @@ fn is_conditional_header(name: &str) -> bool {
 		|| name.eq_ignore_ascii_case("if-modified-since")
 		|| name.eq_ignore_ascii_case("if-unmodified-since")
 		|| name.eq_ignore_ascii_case("if-range")
-}
-
-pub(crate) fn basic_auth_username(headers: &HeaderMap) -> Option<String> {
-	let header = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
-	let mut parts = header.split_ascii_whitespace();
-	let scheme = parts.next()?;
-	let credentials = parts.next()?;
-	if parts.next().is_some() {
-		return None;
-	}
-	if !scheme.eq_ignore_ascii_case("Basic") {
-		return None;
-	}
-
-	let decoded = STANDARD.decode(credentials).ok()?;
-	let decoded = String::from_utf8(decoded).ok()?;
-	let (username, _) = decoded.split_once(':')?;
-	if username.is_empty() {
-		return None;
-	}
-
-	Some(username.to_owned())
 }

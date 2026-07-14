@@ -10,20 +10,14 @@ services:
       context: .
       target: runtime
       args:
-        RUST_VERSION: ${RUST_VERSION:-1.95}
+        RUST_VERSION: ${RUST_VERSION:-1.95.0}
         DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
         TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
         HELM_VERSION: ${HELM_VERSION:-3.18.4}
-        VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
+        YANDEX_MESSENGER_FEATURE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_FEATURE:-true}
+        VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0} # x-release-please-version
         VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
         BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
-    deploy:
-      replicas: 1
-      update_config:
-        parallelism: 1
-        order: start-first
-        failure_action: rollback
-        delay: 10s
     init: true
     restart: unless-stopped
     depends_on:
@@ -44,6 +38,7 @@ services:
       NEXUS_SEC_PROXY_NEXUS_BASE_URL: ${NEXUS_SEC_PROXY_NEXUS_BASE_URL:-http://nexus:8081}
       NEXUS_SEC_PROXY_NEXUS_USERNAME: ${NEXUS_SEC_PROXY_NEXUS_USERNAME:-}
       NEXUS_SEC_PROXY_NEXUS_PASSWORD: ${NEXUS_SEC_PROXY_NEXUS_PASSWORD:-}
+      NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE: ${NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE:-}
       NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL: ${NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL:-}
       NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME: ${NEXUS_SEC_PROXY_DOCKER_REPOSITORY_NAME:-}
       NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS: ${NEXUS_SEC_PROXY_REPOSITORY_REFRESH_INTERVAL_SECS:-60}
@@ -52,6 +47,7 @@ services:
       NEXUS_SEC_PROXY_POLICY_FILE: ${NEXUS_SEC_PROXY_POLICY_FILE:-}
       NEXUS_SEC_PROXY_ADMIN_TOKEN: ${NEXUS_SEC_PROXY_ADMIN_TOKEN:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN:-}
+      NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL:-https://botapi.messenger.yandex.net}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED:-}
@@ -117,8 +113,6 @@ services:
         DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
         TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
         HELM_VERSION: ${HELM_VERSION:-3.18.4}
-    deploy:
-      replicas: 1
     init: true
     restart: unless-stopped
     read_only: true
@@ -143,7 +137,7 @@ services:
         max-file: "5"
 
   nexus:
-    image: sonatype/nexus3:${NEXUS_OSS_IMAGE_TAG:-latest}
+    image: sonatype/nexus3:${NEXUS_OSS_IMAGE_TAG:-3.94.0}
     init: true
     restart: unless-stopped
     ports:

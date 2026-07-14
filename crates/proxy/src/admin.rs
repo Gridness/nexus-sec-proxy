@@ -15,6 +15,7 @@ use nexus_sec_proxy_security::{EnforcementMode, PolicyContext, PolicySet};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::VERSION;
 use crate::catalog::{NexusRepository, RepositoryCatalogSummary};
 use crate::decisions::RecentDecision;
 use crate::responses::{json_error, response_with_text};
@@ -75,6 +76,7 @@ pub(crate) struct ScannerSummary {
 }
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StatusResponse {
+	version: &'static str,
 	started_at: String,
 	uptime_seconds: u64,
 	immutable_config: ImmutableConfigSummary,
@@ -82,6 +84,20 @@ pub(crate) struct StatusResponse {
 	repositories: RepositoryCatalogSummary,
 	cache: CacheSummary,
 	scanner: ScannerSummary,
+	yandex_messenger: YandexMessengerRuntimeSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct YandexMessengerRuntimeSummary {
+	available: bool,
+	enabled: bool,
+	sent: u64,
+	retried: u64,
+	failed: u64,
+	skipped_by_reason: BTreeMap<String, u64>,
+	last_success_at: Option<String>,
+	last_failure_at: Option<String>,
+	last_failure_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,6 +347,7 @@ pub(crate) async fn admin_status(
 
 	let active_policy = state.active_policy();
 	Json(StatusResponse {
+		version: VERSION,
 		started_at: state.started_at_rfc3339.clone(),
 		uptime_seconds: state.started_at.elapsed().as_secs(),
 		immutable_config: immutable_config_summary(&state.config),
@@ -338,8 +355,41 @@ pub(crate) async fn admin_status(
 		repositories: state.repository_catalog().summary(),
 		cache: cache_summary(&state).await,
 		scanner: scanner_summary(&state),
+		yandex_messenger: yandex_messenger_summary(&state),
 	})
 	.into_response()
+}
+
+fn yandex_messenger_summary(
+	_state: &AppState,
+) -> YandexMessengerRuntimeSummary {
+	#[cfg(feature = "yandex-messenger")]
+	if let Some(notifier) = _state.yandex_messenger.as_ref() {
+		let status = notifier.status();
+		return YandexMessengerRuntimeSummary {
+			available: true,
+			enabled: true,
+			sent: status.sent,
+			retried: status.retried,
+			failed: status.failed,
+			skipped_by_reason: status.skipped_by_reason,
+			last_success_at: status.last_success_at,
+			last_failure_at: status.last_failure_at,
+			last_failure_category: status.last_failure_category,
+		};
+	}
+
+	YandexMessengerRuntimeSummary {
+		available: cfg!(feature = "yandex-messenger"),
+		enabled: false,
+		sent: 0,
+		retried: 0,
+		failed: 0,
+		skipped_by_reason: BTreeMap::new(),
+		last_success_at: None,
+		last_failure_at: None,
+		last_failure_category: None,
+	}
 }
 
 pub(crate) async fn admin_policy(
