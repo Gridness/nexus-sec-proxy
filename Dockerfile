@@ -3,7 +3,7 @@
 ARG RUST_VERSION=1.95
 ARG DEBIAN_VERSION=bookworm
 ARG TRIVY_VERSION=0.71.0
-ARG GRYPE_VERSION=0.112.0
+ARG HELM_VERSION=3.18.4
 
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
@@ -42,7 +42,7 @@ FROM --platform=$BUILDPLATFORM debian:${DEBIAN_VERSION}-slim AS scanners
 
 ARG TARGETARCH
 ARG TRIVY_VERSION
-ARG GRYPE_VERSION
+ARG HELM_VERSION
 
 RUN set -eux; \
 	apt-get update; \
@@ -51,8 +51,8 @@ RUN set -eux; \
 
 RUN set -eux; \
 	case "${TARGETARCH}" in \
-		amd64) trivy_arch="64bit"; grype_arch="amd64" ;; \
-		arm64) trivy_arch="ARM64"; grype_arch="arm64" ;; \
+		amd64) trivy_arch="64bit"; helm_arch="amd64" ;; \
+		arm64) trivy_arch="ARM64"; helm_arch="arm64" ;; \
 		*) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
 	esac; \
 	trivy_archive="trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz"; \
@@ -62,15 +62,15 @@ RUN set -eux; \
 	(cd /tmp && grep " ${trivy_archive}$" trivy_checksums.txt | sha256sum -c -); \
 	tar -xzf "/tmp/${trivy_archive}" -C /tmp trivy; \
 	install -D -m 0755 /tmp/trivy /out/trivy; \
-	grype_archive="grype_${GRYPE_VERSION}_linux_${grype_arch}.tar.gz"; \
-	grype_base_url="https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}"; \
-	curl -fsSLo "/tmp/${grype_archive}" "${grype_base_url}/${grype_archive}"; \
-	curl -fsSLo /tmp/grype_checksums.txt "${grype_base_url}/grype_${GRYPE_VERSION}_checksums.txt"; \
-	(cd /tmp && grep " ${grype_archive}$" grype_checksums.txt | sha256sum -c -); \
-	tar -xzf "/tmp/${grype_archive}" -C /tmp grype; \
-	install -D -m 0755 /tmp/grype /out/grype; \
 	/out/trivy --version; \
-	/out/grype version
+	helm_archive="helm-v${HELM_VERSION}-linux-${helm_arch}.tar.gz"; \
+	helm_base_url="https://get.helm.sh"; \
+	curl -fsSLo "/tmp/${helm_archive}" "${helm_base_url}/${helm_archive}"; \
+	curl -fsSLo /tmp/helm_checksums.txt "${helm_base_url}/helm-v${HELM_VERSION}-checksums.txt"; \
+	(cd /tmp && grep " ${helm_archive}$" helm_checksums.txt | sha256sum -c -); \
+	tar -xzf "/tmp/${helm_archive}" -C /tmp linux-${helm_arch}/helm; \
+	install -D -m 0755 /tmp/linux-${helm_arch}/helm /out/helm; \
+	/out/helm version --short
 
 FROM busybox:1.36.1-musl AS healthcheck
 
@@ -80,7 +80,6 @@ RUN set -eux; \
 	mkdir -p \
 		/layout/etc/nexus-sec-proxy \
 		/layout/home/nonroot \
-		/layout/var/cache/grype/db \
 		/layout/var/cache/trivy \
 		/layout/var/lib/nexus-sec-proxy/trust-reports \
 		/layout/var/tmp/nexus-sec-proxy; \
@@ -105,15 +104,14 @@ ENV HOME=/home/nonroot \
 	NEXUS_SEC_PROXY_LOG_JSON=false \
 	NEXUS_SEC_PROXY_TRUST_REPORT_DIR=/var/lib/nexus-sec-proxy/trust-reports \
 	NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy \
-	TRIVY_CACHE_DIR=/var/cache/trivy \
-	GRYPE_DB_CACHE_DIR=/var/cache/grype/db
+	TRIVY_CACHE_DIR=/var/cache/trivy
 
 COPY --from=runtime-layout --chown=65532:65532 /layout/etc /etc
 COPY --from=runtime-layout --chown=65532:65532 /layout/home /home
 COPY --from=runtime-layout --chown=65532:65532 /layout/var /var
 COPY --from=builder /out/nexus-sec-proxy /usr/local/bin/nexus-sec-proxy
 COPY --from=scanners /out/trivy /usr/local/bin/trivy
-COPY --from=scanners /out/grype /usr/local/bin/grype
+COPY --from=scanners /out/helm /usr/local/bin/helm
 COPY --from=healthcheck /bin/busybox /busybox
 
 USER nonroot:nonroot
@@ -131,17 +129,16 @@ RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends ca-certificates; \
 	rm -rf /var/lib/apt/lists/*; \
-	mkdir -p /home/nonroot /var/cache/grype/db /var/cache/trivy; \
-	chown -R 65532:65532 /home/nonroot /var/cache/grype /var/cache/trivy
+	mkdir -p /home/nonroot /var/cache/trivy; \
+	chown -R 65532:65532 /home/nonroot /var/cache/trivy
 
 ENV HOME=/home/nonroot \
 	TRIVY_CACHE_DIR=/var/cache/trivy \
-	GRYPE_DB_CACHE_DIR=/var/cache/grype/db \
 	NEXUS_SEC_PROXY_SCANNER_DB_UPDATE_INTERVAL_SECS=21600 \
 	NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS=300
 
 COPY --from=scanners /out/trivy /usr/local/bin/trivy
-COPY --from=scanners /out/grype /usr/local/bin/grype
+COPY --from=scanners /out/helm /usr/local/bin/helm
 COPY scripts/scanner-db-updater.sh /usr/local/bin/scanner-db-updater
 
 RUN chmod 0755 /usr/local/bin/scanner-db-updater

@@ -1,108 +1,6 @@
 use nexus_sec_proxy_security::{ArtifactTarget, ScanTarget};
 
-use super::{
-	ClassificationContext, default_linux_ecosystem, is_probable_artifact,
-	is_sidecar, normalize_pypi_name, package_or_artifact_target,
-	package_target, package_version_from_path, semantic_version_like,
-	strip_archive_suffix,
-};
-
-pub(super) fn classify_alpine(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	if !file.ends_with(".apk") {
-		return None;
-	}
-
-	let stem = file.strip_suffix(".apk")?;
-	let (name_and_version, release) = stem.rsplit_once('-')?;
-	let (name, version) = name_and_version.rsplit_once('-')?;
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		Some("Alpine"),
-		name.to_owned(),
-		format!("{version}-{release}"),
-	))
-}
-
-pub(super) fn classify_apt(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	if !file.ends_with(".deb") {
-		return None;
-	}
-
-	let stem = file.strip_suffix(".deb")?;
-	let (name_and_version, _architecture) = stem.rsplit_once('_')?;
-	let (name, version) = name_and_version.rsplit_once('_')?;
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		default_linux_ecosystem(context),
-		name.to_owned(),
-		version.to_owned(),
-	))
-}
-
-pub(super) fn classify_composer(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-
-	if file.ends_with(".json") {
-		return None;
-	}
-
-	if let Some((name, version)) = package_version_from_path(segments) {
-		return Some(package_or_artifact_target(
-			context,
-			path,
-			Some("Packagist"),
-			name,
-			version,
-		));
-	}
-
-	classify_dash_archive_optional_package(
-		context,
-		path,
-		segments,
-		&[".zip", ".tar.gz", ".tgz"],
-		Some("Packagist"),
-	)
-}
-
-pub(super) fn classify_conda(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	let stem = file
-		.strip_suffix(".tar.bz2")
-		.or_else(|| file.strip_suffix(".conda"))?;
-	let (name_and_version, _build) = stem.rsplit_once('-')?;
-	let (name, version) = name_and_version.rsplit_once('-')?;
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		None,
-		name.to_owned(),
-		version.to_owned(),
-	))
-}
+use super::{ClassificationContext, package_target, strip_archive_suffix};
 
 pub(super) fn classify_maven(
 	context: &ClassificationContext,
@@ -202,29 +100,6 @@ pub(super) fn classify_pypi(
 	))
 }
 
-pub(super) fn classify_nuget(
-	context: &ClassificationContext,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let container_index = segments
-		.iter()
-		.position(|segment| segment.eq_ignore_ascii_case("v3-flatcontainer"))?;
-	let name = segments.get(container_index + 1)?;
-	let version = segments.get(container_index + 2)?;
-	let file = segments.last()?;
-
-	if !file.ends_with(".nupkg") {
-		return None;
-	}
-
-	Some(package_target(
-		context,
-		"NuGet",
-		name.clone(),
-		version.clone(),
-	))
-}
-
 pub(super) fn classify_cargo(
 	context: &ClassificationContext,
 	segments: &[String],
@@ -250,25 +125,6 @@ pub(super) fn classify_cargo(
 	))
 }
 
-pub(super) fn classify_rubygems(
-	context: &ClassificationContext,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	if segments.first().is_none_or(|segment| segment != "gems") {
-		return None;
-	}
-
-	let stem = segments.last()?.strip_suffix(".gem")?;
-	let (name, version) = stem.rsplit_once('-')?;
-
-	Some(package_target(
-		context,
-		"RubyGems",
-		name.to_owned(),
-		version.to_owned(),
-	))
-}
-
 pub(super) fn classify_go(
 	context: &ClassificationContext,
 	segments: &[String],
@@ -288,25 +144,6 @@ pub(super) fn classify_go(
 	Some(package_target(context, "Go", module, version.to_owned()))
 }
 
-pub(super) fn classify_git_lfs(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	if let Some(index) =
-		segments.iter().position(|segment| segment == "objects")
-		&& let Some(digest) = segments.get(index + 1)
-	{
-		return Some(ScanTarget::Artifact(ArtifactTarget::with_digest(
-			&context.repository_format,
-			path,
-			digest.clone(),
-		)));
-	}
-
-	classify_generic_artifact(context, path, segments)
-}
-
 pub(super) fn classify_docker(
 	_context: &ClassificationContext,
 	_path: &str,
@@ -315,204 +152,28 @@ pub(super) fn classify_docker(
 	None
 }
 
-pub(super) fn classify_p2(
+pub(super) fn classify_helm(
 	context: &ClassificationContext,
 	path: &str,
 	segments: &[String],
 ) -> Option<ScanTarget> {
 	let file = segments.last()?;
-
-	if file == "content.xml"
-		|| file == "artifacts.xml"
-		|| file.ends_with(".xml.xz")
-		|| file.ends_with(".xml.gz")
-	{
+	if !file.ends_with(".tgz") && !file.ends_with(".tar.gz") {
 		return None;
 	}
 
-	let stem = strip_archive_suffix(file, &[".jar", ".zip"])?;
-	let (name, version) = stem.rsplit_once('_')?;
-
-	Some(package_or_artifact_target(
-		context,
+	Some(ScanTarget::Artifact(ArtifactTarget::new(
+		&context.repository_format,
 		path,
-		None,
-		name.to_owned(),
-		version.to_owned(),
-	))
+	)))
 }
 
-pub(super) fn classify_pub(
-	context: &ClassificationContext,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let packages_index =
-		segments.iter().position(|segment| segment == "packages")?;
-	let name = segments.get(packages_index + 1)?;
-	let versions_marker = segments.get(packages_index + 2)?;
-	if versions_marker != "versions" {
-		return None;
-	}
-
-	let version = strip_archive_suffix(
-		segments.get(packages_index + 3)?,
-		&[".tar.gz", ".tgz", ".zip"],
-	)?;
-
-	Some(package_target(
-		context,
-		"Pub",
-		name.clone(),
-		version.to_owned(),
-	))
+fn is_sidecar(file: &str) -> bool {
+	[".asc", ".md5", ".sha1", ".sha256", ".sha512", ".sig"]
+		.iter()
+		.any(|suffix| file.ends_with(suffix))
 }
 
-pub(super) fn classify_r(
-	context: &ClassificationContext,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	let stem = strip_archive_suffix(file, &[".tar.gz", ".tgz", ".zip"])?;
-	let (name, version) = stem.rsplit_once('_')?;
-
-	Some(package_target(
-		context,
-		"R",
-		name.to_owned(),
-		version.to_owned(),
-	))
-}
-
-pub(super) fn classify_swift(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	let version = strip_archive_suffix(file, &[".zip", ".tar.gz", ".tgz"])
-		.or_else(|| semantic_version_like(file))?;
-
-	let name = if segments.len() >= 3 {
-		format!(
-			"{}/{}",
-			segments.get(segments.len() - 3)?,
-			segments.get(segments.len() - 2)?
-		)
-	} else if segments.len() >= 2 {
-		segments.get(segments.len() - 2)?.clone()
-	} else {
-		return None;
-	};
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		Some("SwiftURL"),
-		name,
-		version.to_owned(),
-	))
-}
-
-pub(super) fn classify_terraform(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	if let Some(index) =
-		segments.iter().position(|segment| segment == "providers")
-		&& segments.len() > index + 5
-	{
-		let namespace = segments.get(index + 1)?;
-		let provider_type = segments.get(index + 2)?;
-		let version = segments.get(index + 3)?;
-
-		return Some(package_or_artifact_target(
-			context,
-			path,
-			None,
-			format!("{namespace}/{provider_type}"),
-			version.clone(),
-		));
-	}
-
-	if let Some(index) =
-		segments.iter().position(|segment| segment == "modules")
-		&& segments.len() > index + 5
-	{
-		let namespace = segments.get(index + 1)?;
-		let name = segments.get(index + 2)?;
-		let provider = segments.get(index + 3)?;
-		let version = segments.get(index + 4)?;
-
-		return Some(package_or_artifact_target(
-			context,
-			path,
-			None,
-			format!("{namespace}/{name}/{provider}"),
-			version.clone(),
-		));
-	}
-
-	classify_generic_artifact(context, path, segments)
-}
-
-pub(super) fn classify_yum(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	if !file.ends_with(".rpm") {
-		return None;
-	}
-
-	let stem = file.strip_suffix(".rpm")?;
-	let without_arch = stem.rsplit_once('.').map_or(stem, |(stem, _arch)| stem);
-	let (name_and_version, release) = without_arch.rsplit_once('-')?;
-	let (name, version) = name_and_version.rsplit_once('-')?;
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		default_linux_ecosystem(context),
-		name.to_owned(),
-		format!("{version}-{release}"),
-	))
-}
-
-pub(super) fn classify_generic_artifact(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-
-	if is_probable_artifact(file) {
-		Some(ScanTarget::Artifact(ArtifactTarget::new(
-			&context.repository_format,
-			path,
-		)))
-	} else {
-		None
-	}
-}
-
-pub(super) fn classify_dash_archive_optional_package(
-	context: &ClassificationContext,
-	path: &str,
-	segments: &[String],
-	suffixes: &[&str],
-	default_ecosystem: Option<&str>,
-) -> Option<ScanTarget> {
-	let file = segments.last()?;
-	let stem = strip_archive_suffix(file, suffixes)?;
-	let (name, version) = stem.rsplit_once('-')?;
-
-	Some(package_or_artifact_target(
-		context,
-		path,
-		default_ecosystem,
-		name.to_owned(),
-		version.to_owned(),
-	))
+fn normalize_pypi_name(name: &str) -> String {
+	name.replace(['_', '.'], "-").to_ascii_lowercase()
 }

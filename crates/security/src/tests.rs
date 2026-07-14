@@ -1,5 +1,5 @@
 use super::*;
-use crate::external::{parse_grype_output, parse_trivy_output};
+use crate::external::parse_trivy_output;
 use crate::osv::severity_from_text_or_score;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -466,43 +466,6 @@ fn parses_trivy_json_output() {
 	assert_eq!(vulnerabilities[0].id, "CVE-2026-0001");
 	assert_eq!(vulnerabilities[0].severity, Some(Severity::Critical));
 	assert_eq!(vulnerabilities[0].references.len(), 2);
-}
-
-#[test]
-fn parses_grype_json_output() {
-	let target = artifact_target();
-	let output = br#"{
-		"matches": [{
-			"vulnerability": {
-				"id": "GHSA-0000",
-				"severity": "High",
-				"description": "bad library",
-				"urls": ["https://github.com/advisories/GHSA-0000"],
-				"aliases": [{"id": "CVE-2026-0002"}]
-			},
-			"relatedVulnerabilities": [{"id": "CVE-2026-0003"}],
-			"artifact": {
-				"name": "demo",
-				"version": "1.0.0"
-			}
-		}]
-	}"#;
-
-	let vulnerabilities = parse_grype_output(&target, output).unwrap();
-
-	assert_eq!(vulnerabilities.len(), 1);
-	assert_eq!(vulnerabilities[0].id, "GHSA-0000");
-	assert_eq!(vulnerabilities[0].severity, Some(Severity::High));
-	assert!(
-		vulnerabilities[0]
-			.aliases
-			.contains(&"CVE-2026-0002".to_owned())
-	);
-	assert!(
-		vulnerabilities[0]
-			.aliases
-			.contains(&"CVE-2026-0003".to_owned())
-	);
 }
 
 #[cfg(feature = "policy-schema")]

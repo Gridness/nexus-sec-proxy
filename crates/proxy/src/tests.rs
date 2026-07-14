@@ -1942,50 +1942,6 @@ async fn docker_scanner_failures_follow_fail_open() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
-async fn docker_grype_scans_image_reference() {
-	let temp_dir = tempfile::tempdir().unwrap();
-	let scanner_record = temp_dir.path().join("grype-images.txt");
-	let _path_guard = prepend_path(temp_dir.path());
-	write_fake_grype(temp_dir.path(), &scanner_record, r#"{"matches":[]}"#);
-	let digest = "sha256:grype";
-	let docker = docker_registry_mock(docker_response(
-		Some("application/vnd.docker.distribution.manifest.v2+json"),
-		Some(digest),
-		"manifest",
-	));
-	let docker_url = spawn_server(
-		Router::new()
-			.fallback(any(mock_docker_registry))
-			.with_state(docker),
-	)
-	.await;
-	let state =
-		docker_test_state(&docker_url, Some(ArtifactScannerKind::Grype));
-
-	let response = build_app(state)
-		.oneshot(
-			Request::builder()
-				.uri("/v2/library/alpine/manifests/latest")
-				.body(Body::empty())
-				.unwrap(),
-		)
-		.await
-		.unwrap();
-
-	assert_eq!(response.status(), StatusCode::OK);
-	let images = std::fs::read_to_string(scanner_record).unwrap();
-	assert_eq!(
-		images.trim(),
-		format!(
-			"{}:{}/library/alpine@{digest}",
-			docker_url.host_str().unwrap(),
-			docker_url.port().unwrap()
-		)
-	);
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
 async fn docker_scanner_auth_config_is_temporary() {
 	let temp_dir = tempfile::tempdir().unwrap();
 	let scanner_record = temp_dir.path().join("scanner-auth.txt");
@@ -2157,8 +2113,9 @@ async fn cached_artifact_block_is_re_evaluated_before_nexus() {
 async fn mapped_artifact_prefetches_once_strips_conditionals_and_reuses_cache()
 {
 	let temp_dir = tempfile::tempdir().unwrap();
-	let scanner_record = temp_dir.path().join("scanner-paths.txt");
+	let scanner_record = temp_dir.path().join("scanner-images.txt");
 	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_helm(temp_dir.path(), "image: nginx:1.25\n");
 	write_fake_trivy(temp_dir.path(), &scanner_record, r#"{"Results":[]}"#);
 	let nexus_records = Arc::new(Mutex::new(Vec::new()));
 	let nexus_url = spawn_server(
@@ -2176,6 +2133,9 @@ async fn mapped_artifact_prefetches_once_strips_conditionals_and_reuses_cache()
 		UnsupportedTargetPolicy::Allow,
 	);
 	config.fail_open = false;
+	config.docker_registry_base_url =
+		Some(format!("http://{}", nexus_url.host_str().unwrap()));
+	config.docker_repository_name = Some("docker-proxy".to_owned());
 	config
 		.artifact_scanner_formats
 		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
@@ -2224,10 +2184,107 @@ async fn mapped_artifact_prefetches_once_strips_conditionals_and_reuses_cache()
 	);
 	drop(records);
 
-	let scanner_paths = std::fs::read_to_string(scanner_record).unwrap();
-	let scanner_paths = scanner_paths.lines().collect::<Vec<_>>();
-	assert_eq!(scanner_paths.len(), 1);
-	assert!(scanner_paths[0].ends_with(".tgz"));
+	// The scanner is called once (cached on the second request). The recorded
+	// argument is the resolved image reference, not the chart file path.
+	let scanner_args = std::fs::read_to_string(scanner_record).unwrap();
+	let scanner_args = scanner_args.lines().collect::<Vec<_>>();
+	assert_eq!(scanner_args.len(), 1);
+	assert!(scanner_args[0].contains("nginx:1.25"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn helm_chart_blocked_when_image_has_vulnerabilities() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let _path_guard = prepend_path(temp_dir.path());
+	write_fake_helm(temp_dir.path(), "image: nginx:1.25\n");
+	write_fake_trivy(
+		temp_dir.path(),
+		&temp_dir.path().join("unused-record.txt"),
+		r#"{"Results":[{"Vulnerabilities":[{"VulnerabilityID":"CVE-2026-0001","PkgName":"nginx","Severity":"CRITICAL","Description":"bad nginx"}]}]}"#,
+	);
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Block,
+	);
+	config.docker_registry_base_url =
+		Some(format!("http://{}", nexus_url.host_str().unwrap()));
+	config.docker_repository_name = Some("docker-proxy".to_owned());
+	config
+		.artifact_scanner_formats
+		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
+	config.artifact_tmp_dir =
+		Some(temp_dir.path().to_string_lossy().into_owned());
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/repository/helm-proxy/charts/demo-1.2.3.tgz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	let body = response_text(response).await;
+	assert!(body.contains("CVE-2026-0001"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn helm_chart_passes_through_when_no_scanner_configured() {
+	let nexus_records = Arc::new(Mutex::new(Vec::new()));
+	let nexus_url = spawn_server(
+		Router::new()
+			.fallback(any(record_nexus_request))
+			.with_state(Arc::clone(&nexus_records)),
+	)
+	.await;
+	let config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		nexus_url.as_str(),
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	let state = test_state_from_config(
+		config,
+		PolicySet::default(),
+		None,
+		vec![test_repository("helm-proxy", "helm", None)],
+	);
+
+	let response = build_app(state)
+		.oneshot(
+			Request::builder()
+				.uri("/repository/helm-proxy/charts/demo-1.2.3.tgz")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(response.status(), StatusCode::OK);
+	assert_eq!(response_text(response).await, "nexus\n");
 }
 
 #[tokio::test]
@@ -2366,9 +2423,6 @@ async fn admin_scanner_reports_format_routes_and_limits() {
 	config
 		.artifact_scanner_formats
 		.insert("helm".to_owned(), ArtifactScannerKind::Trivy);
-	config
-		.artifact_scanner_formats
-		.insert("p2".to_owned(), ArtifactScannerKind::Grype);
 	config.artifact_scanner_timeout_secs = 120;
 	config.artifact_scan_max_bytes = 1024;
 	config.artifact_scanner_concurrency = 3;
@@ -2394,7 +2448,6 @@ async fn admin_scanner_reports_format_routes_and_limits() {
 	let body = response_json(response).await;
 	assert_eq!(body["enabled"], true);
 	assert_eq!(body["routes"]["helm"], "trivy");
-	assert_eq!(body["routes"]["p2"], "grype");
 	assert_eq!(body["docker_registry_configured"], false);
 	assert_eq!(body["docker_repository_name"], Value::Null);
 	assert_eq!(body["docker_scanner"], Value::Null);
@@ -2402,7 +2455,7 @@ async fn admin_scanner_reports_format_routes_and_limits() {
 	assert_eq!(body["max_bytes"], 1024);
 	assert_eq!(body["concurrency"], 3);
 	assert_eq!(body["available_permits"], 2);
-	assert!(body["db_files"].as_array().unwrap().len() >= 2);
+	assert!(!body["db_files"].as_array().unwrap().is_empty());
 }
 
 #[cfg(not(feature = "yandex-messenger"))]
@@ -2793,19 +2846,6 @@ fn scanner_db_age_reports_missing_empty_and_db_files() {
 	);
 	assert!(summary.modified_at.is_some());
 	assert!(summary.age_seconds.is_some());
-
-	let grype_dir = tempfile::tempdir().unwrap();
-	let db_path = grype_dir.path().join("vulnerability.db");
-	std::fs::write(&db_path, "db").unwrap();
-
-	let summary =
-		scanner_db_summary_for_dir("GRYPE_DB_CACHE_DIR", grype_dir.path());
-
-	assert_eq!(summary.status, ScannerDbStatus::Found);
-	assert_eq!(
-		summary.db_file.as_deref(),
-		Some(db_path.to_string_lossy().as_ref())
-	);
 }
 
 #[tokio::test]
@@ -2846,7 +2886,6 @@ async fn healthz_reports_live_checks_and_unused_scanners() {
 	assert_eq!(body["checks"]["trust_reports"], "ok");
 	assert_eq!(body["checks"]["docker_registry"], "unused");
 	assert_eq!(body["checks"]["trivy"], "unused");
-	assert_eq!(body["checks"]["grype"], "unused");
 }
 
 #[tokio::test]
@@ -3015,7 +3054,6 @@ async fn healthz_fails_when_used_scanner_database_is_missing() {
 	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	let body = response_json(response).await;
 	assert_eq!(body["checks"]["trivy"], "failed");
-	assert_eq!(body["checks"]["grype"], "unused");
 }
 
 #[cfg(unix)]
@@ -3073,7 +3111,6 @@ async fn healthz_fails_when_used_scanner_executable_is_missing() {
 	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	let body = response_json(response).await;
 	assert_eq!(body["checks"]["trivy"], "failed");
-	assert_eq!(body["checks"]["grype"], "unused");
 }
 
 #[cfg(unix)]
@@ -3229,28 +3266,18 @@ JSON
 }
 
 #[cfg(unix)]
-fn write_fake_grype(
-	directory: &std::path::Path,
-	record_path: &std::path::Path,
-	output: &str,
-) {
+fn write_fake_helm(directory: &std::path::Path, rendered: &str) {
 	use std::os::unix::fs::PermissionsExt;
 
 	let script = format!(
 		r#"#!/bin/sh
-if [ "$1" = "version" ]; then
-	echo "Application: fake"
-	exit 0
-fi
-printf '%s\n' "$1" >> "{}"
-cat <<'JSON'
-{}
-JSON
+# fake helm: ignore args, print rendered manifests
+cat <<'YAML'
+{rendered}
+YAML
 "#,
-		record_path.display(),
-		output
 	);
-	let path = directory.join("grype");
+	let path = directory.join("helm");
 	std::fs::write(&path, script).unwrap();
 	let mut permissions = std::fs::metadata(&path).unwrap().permissions();
 	permissions.set_mode(0o755);
@@ -3509,6 +3536,7 @@ fn test_config(
 		artifact_scan_max_bytes: 512 * 1024 * 1024,
 		artifact_scanner_concurrency: 2,
 		artifact_tmp_dir: None,
+		helm_binary: "helm".to_owned(),
 		security_policy,
 		policy_set,
 	}

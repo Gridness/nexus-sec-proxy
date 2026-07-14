@@ -106,6 +106,7 @@ NEXUS_SEC_PROXY_ARTIFACT_SCANNER_TIMEOUT_SECS=300
 NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES=536870912
 NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY=2
 NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR=/var/tmp/nexus-sec-proxy
+NEXUS_SEC_PROXY_HELM_BINARY=helm
 ```
 
 Configuration notes:
@@ -156,13 +157,12 @@ Configuration notes:
 - `NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY=allow` allows targets that cannot
   be checked. Set it to `block` to deny them and create Trust reports.
 - `NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS` maps normalized Nexus repository
-  formats to `trivy` or `grype`, for example
-  `helm=trivy,p2=grype,docker=trivy`.
+  formats to `trivy`, for example `helm=trivy,docker=trivy`.
   Empty/unset means no artifact formats are scanned. Malformed entries,
   unknown scanners, and duplicate normalized formats fail startup.
 - Docker scanning is active only when Docker registry mode is configured, the
   configured repository format is `docker`, and this map includes
-  `docker=trivy` or `docker=grype`.
+  `docker=trivy`.
 - Artifact scanning contacts Nexus and buffers one complete `200 OK` response
   before releasing bytes to the client. Conditional request headers are
   stripped from uncached artifact prefetches so Nexus returns bytes to scan.
@@ -196,7 +196,7 @@ Behavior:
 - `GET /v2/{image}/manifests/{reference}` is the enforcement point for
   concrete image manifests. The proxy first asks Nexus to resolve/cache the
   image, resolves `Docker-Content-Digest` or a digest reference, scans
-  `{registry-host}/{image}@{digest}` with Trivy or Grype image mode, then
+  `{registry-host}/{image}@{digest}` with Trivy image mode, then
   releases the already-fetched manifest only when policy allows or reports it.
 - Raw vulnerabilities are cached as `docker:{repository}/{image}@{digest}` and
   re-evaluated against the current policy on every pull. Tag changes do not
@@ -405,46 +405,60 @@ image scan keys use `docker:{repository}/{image}@{digest}`.
 
 ## Current Format Handling
 
-Coordinate scans are implemented by default for:
+Coordinate scans (OSV) are implemented for:
 
-- Alpine
 - Cargo / Rust
-- Composer / Packagist, when the package version is present in the path
 - Go proxy-style downloads
-- Maven
+- Java / Maven
 - npm
-- NuGet
-- Pub / Flutter / Dart
-- PyPI
-- R / CRAN
-- RubyGems
-- Swift
+- Python / PyPI
 
-These formats need `NEXUS_SEC_PROXY_OSV_ECOSYSTEM_OVERRIDES` when the Nexus
-repository format alone does not identify the operating system or package
-database precisely enough:
+These are checked against OSV **before** the request reaches Nexus, so
+known-vulnerable packages never enter the Nexus cache.
 
-- APT / Debian / Ubuntu
-- Yum / RPM
+Docker image scanning is active when Docker registry mode is configured and
+`docker=trivy` is set. Docker blobs are pass-through; concrete image manifest
+requests are scanned by image digest. See [Docker Pull Safety](#docker-pull-safety).
 
-These formats are classified as artifact targets by default. They are scanned
-only when their Nexus format is explicitly mapped in
-`NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS`; otherwise they are controlled by
-`NEXUS_SEC_PROXY_UNSUPPORTED_TARGET_POLICY`:
+Helm chart scanning is active when `helm=trivy` is set. The proxy renders the
+chart with `helm template`, extracts container image references, and scans each
+referenced image by tag with Trivy. Results are merged and evaluated against
+the active policy. Images without a registry host are resolved against the
+configured Docker registry. This requires `NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL`
+to be set. See [Helm Chart Scanning](#helm-chart-scanning).
+
+These formats pass through to Nexus without vulnerability scanning because no
+database exists that can be queried by a proxy tier:
 
 - Ansible Galaxy collections
-- Bower
-- CocoaPods
-- Conan
-- Conda
-- Git LFS objects
-- Helm charts
-- Hugging Face assets
-- Eclipse p2
-- Raw repositories
+- Conan packages
 - Terraform modules/providers
-- unknown binary archives
 
-Docker is handled separately through root `/v2` registry mode. Docker blobs
-are pass-through; concrete image manifest requests are scanned in image mode
-when `docker=trivy` or `docker=grype` is configured.
+All other repository formats pass through without classification.
+
+## Helm Chart Scanning
+
+When a Helm chart download is requested and `helm=trivy` is configured, the
+proxy:
+
+1. Prefetches the chart `.tgz` from Nexus.
+2. Renders the chart with `helm template` to produce Kubernetes manifests.
+3. Extracts all `image:` references from the rendered manifests.
+4. Resolves each image reference against the configured Docker registry
+   (images without a registry host are prefixed with the Nexus Docker
+   connector authority).
+5. Scans each image **by tag** with `trivy image`.
+6. Merges all vulnerability findings into a single list and evaluates it
+   against the active policy.
+
+Images are scanned by tag, not by digest. A tag is mutable — the same tag can
+resolve to a different image over time. Cache entries for Helm charts are keyed
+on the chart's repository name and request path, not on image content.
+
+`NEXUS_SEC_PROXY_HELM_BINARY` (default `helm`) configures the Helm CLI binary
+path used for chart rendering.
+
+If the chart contains no image references, the scan returns no vulnerabilities
+and the chart is allowed. If an individual image scan fails and
+`NEXUS_SEC_PROXY_FAIL_OPEN=true`, that image's findings are skipped; with
+`fail_open=false` the entire chart download is denied with `503`.

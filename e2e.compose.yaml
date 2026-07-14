@@ -2,7 +2,6 @@ name: nexus-sec-proxy-e2e
 
 x-scanner-cache-env: &scanner-cache-env
   TRIVY_CACHE_DIR: /var/cache/trivy
-  GRYPE_DB_CACHE_DIR: /var/cache/grype/db
 
 services:
   nexus-sec-proxy:
@@ -14,7 +13,7 @@ services:
         RUST_VERSION: ${RUST_VERSION:-1.95}
         DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
         TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
-        GRYPE_VERSION: ${GRYPE_VERSION:-0.112.0}
+        HELM_VERSION: ${HELM_VERSION:-3.18.4}
         VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0}
         VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
         BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
@@ -85,7 +84,6 @@ services:
     volumes:
       - ${NEXUS_SEC_PROXY_POLICY_DIR:-./policy}:/etc/nexus-sec-proxy:ro
       - artifact-tmp:/var/tmp/nexus-sec-proxy
-      - grype-cache:/var/cache/grype
       - trust-reports:/var/lib/nexus-sec-proxy/trust-reports
       - trivy-cache:/var/cache/trivy
     healthcheck:
@@ -118,7 +116,7 @@ services:
       args:
         DEBIAN_VERSION: ${DEBIAN_VERSION:-bookworm}
         TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
-        GRYPE_VERSION: ${GRYPE_VERSION:-0.112.0}
+        HELM_VERSION: ${HELM_VERSION:-3.18.4}
     deploy:
       replicas: 1
     init: true
@@ -137,7 +135,6 @@ services:
       NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS: ${NEXUS_SEC_PROXY_SCANNER_DB_RETRY_INTERVAL_SECS:-300}
     volumes:
       - trivy-cache:/var/cache/trivy
-      - grype-cache:/var/cache/grype
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -174,7 +171,6 @@ services:
 
 volumes:
   artifact-tmp:
-  grype-cache:
   nexus-data:
   trust-reports:
   trivy-cache:

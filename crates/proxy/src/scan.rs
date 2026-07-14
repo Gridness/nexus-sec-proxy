@@ -297,7 +297,6 @@ pub(crate) fn external_scanner_for_kind(
 ) -> ExternalScanner {
 	let external_kind = match kind {
 		ArtifactScannerKind::Trivy => ExternalScannerKind::Trivy,
-		ArtifactScannerKind::Grype => ExternalScannerKind::Grype,
 	};
 
 	ExternalScanner::new(

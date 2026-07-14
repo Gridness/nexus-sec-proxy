@@ -315,7 +315,7 @@ fn parses_artifact_scanner_config() {
 		),
 		(
 			"NEXUS_SEC_PROXY_ARTIFACT_SCANNER_FORMATS",
-			" helm = trivy, P2 = grype, docker = trivy ",
+			" helm = trivy, docker = trivy ",
 		),
 		(
 			"NEXUS_SEC_PROXY_DOCKER_REGISTRY_BASE_URL",
@@ -335,10 +335,6 @@ fn parses_artifact_scanner_config() {
 	assert_eq!(
 		config.artifact_scanner_formats.get("helm"),
 		Some(&ArtifactScannerKind::Trivy)
-	);
-	assert_eq!(
-		config.artifact_scanner_formats.get("p2"),
-		Some(&ArtifactScannerKind::Grype)
 	);
 	assert_eq!(
 		config.artifact_scanner_for_format(" Helm "),
@@ -422,8 +418,8 @@ fn rejects_invalid_artifact_scanner_format_map() {
 		"=trivy",
 		"helm=clair",
 		"helm=disabled",
-		"helm=trivy,Helm=grype",
-		"helm=trivy,,p2=grype",
+		"helm=trivy,Helm=trivy",
+		"helm=trivy,,docker=trivy",
 	] {
 		let env = BTreeMap::from([
 			(

@@ -5,6 +5,7 @@ mod classifier;
 mod decisions;
 mod docker;
 mod gateway;
+mod helm;
 mod responses;
 mod scan;
 mod scanner_db;
@@ -278,19 +279,14 @@ async fn health_checks(
 		ArtifactScannerKind::Trivy,
 		scanners.contains(&ArtifactScannerKind::Trivy),
 	);
-	let grype = check_scanner(
-		ArtifactScannerKind::Grype,
-		scanners.contains(&ArtifactScannerKind::Grype),
-	);
-	let (nexus, trust_reports, docker_registry, trivy, grype) =
-		tokio::join!(nexus, trust_reports, docker_registry, trivy, grype);
+	let (nexus, trust_reports, docker_registry, trivy) =
+		tokio::join!(nexus, trust_reports, docker_registry, trivy);
 
 	BTreeMap::from([
 		("nexus", nexus),
 		("trust_reports", trust_reports),
 		("docker_registry", docker_registry),
 		("trivy", trivy),
-		("grype", grype),
 	])
 }
 
@@ -313,14 +309,6 @@ fn timed_out_health_checks(
 		(
 			"trivy",
 			if scanners.contains(&ArtifactScannerKind::Trivy) {
-				"failed"
-			} else {
-				"unused"
-			},
-		),
-		(
-			"grype",
-			if scanners.contains(&ArtifactScannerKind::Grype) {
 				"failed"
 			} else {
 				"unused"
@@ -429,14 +417,7 @@ async fn check_scanner(
 
 async fn scanner_version_ok(scanner: ArtifactScannerKind) -> bool {
 	let mut command = Command::new(scanner.command());
-	match scanner {
-		ArtifactScannerKind::Trivy => {
-			command.arg("--version");
-		}
-		ArtifactScannerKind::Grype => {
-			command.arg("version");
-		}
-	}
+	command.arg("--version");
 	command.kill_on_drop(true);
 
 	match command.output().await {
@@ -460,7 +441,6 @@ async fn scanner_version_ok(scanner: ArtifactScannerKind) -> bool {
 fn scanner_db_env(scanner: ArtifactScannerKind) -> &'static str {
 	match scanner {
 		ArtifactScannerKind::Trivy => "TRIVY_CACHE_DIR",
-		ArtifactScannerKind::Grype => "GRYPE_DB_CACHE_DIR",
 	}
 }
 
