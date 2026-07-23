@@ -126,7 +126,7 @@ jobs:
 
       - name: Checkout release candidate
         if: steps.candidate.outputs.mode == 'open'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/heads/${{ steps.candidate.outputs.head-ref }}
           fetch-depth: 0
@@ -242,7 +242,7 @@ jobs:
 
       - name: Checkout release commit
         if: steps.release-commit.outputs.sha != ''
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.release-commit.outputs.sha }}
 
@@ -291,7 +291,7 @@ jobs:
             image: ghcr.io/gridness/nexus-sec-proxy-scanner-db-updater
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - name: Set up QEMU
@@ -336,7 +336,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - name: Set up Buildx
