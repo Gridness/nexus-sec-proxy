@@ -49,6 +49,12 @@ pub enum ConfigError {
 		value: String,
 		reason: String,
 	},
+	#[error("invalid DefectDojo base URL in {name}: {value} ({reason})")]
+	InvalidDefectDojoBaseUrl {
+		name: &'static str,
+		value: String,
+		reason: String,
+	},
 	#[error("invalid Docker registry base URL in {name}: {value} ({reason})")]
 	InvalidDockerRegistryBaseUrl {
 		name: &'static str,

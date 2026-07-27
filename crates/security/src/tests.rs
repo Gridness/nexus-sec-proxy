@@ -400,6 +400,9 @@ fn block_report_includes_references() {
 				url: "https://osv.dev/vulnerability/CVE-2026-0001".to_owned(),
 				kind: Some("WEB".to_owned()),
 			}],
+			component_name: None,
+			component_version: None,
+			fixed_versions: Vec::new(),
 		}],
 	};
 
@@ -451,6 +454,7 @@ fn parses_trivy_json_output() {
 				"VulnerabilityID": "CVE-2026-0001",
 				"PkgName": "openssl",
 				"InstalledVersion": "1.0.0",
+				"FixedVersion": " 1.0.1, 1.0.1, 1.1.0 ",
 				"Title": "openssl issue",
 				"Description": "bad crypto",
 				"Severity": "CRITICAL",
@@ -462,10 +466,29 @@ fn parses_trivy_json_output() {
 
 	let vulnerabilities = parse_trivy_output(&target, output).unwrap();
 
-	assert_eq!(vulnerabilities.len(), 1);
-	assert_eq!(vulnerabilities[0].id, "CVE-2026-0001");
-	assert_eq!(vulnerabilities[0].severity, Some(Severity::Critical));
-	assert_eq!(vulnerabilities[0].references.len(), 2);
+	assert_eq!(
+		vulnerabilities,
+		vec![Vulnerability {
+			id: "CVE-2026-0001".to_owned(),
+			aliases: Vec::new(),
+			summary: Some("openssl issue".to_owned()),
+			details: Some("bad crypto".to_owned()),
+			severity: Some(Severity::Critical),
+			references: vec![
+				Reference {
+					url: "https://avd.aquasec.com/nvd/cve-2026-0001".to_owned(),
+					kind: Some("WEB".to_owned()),
+				},
+				Reference {
+					url: "https://example.invalid/CVE-2026-0001".to_owned(),
+					kind: Some("WEB".to_owned()),
+				},
+			],
+			component_name: Some("openssl".to_owned()),
+			component_version: Some("1.0.0".to_owned()),
+			fixed_versions: vec!["1.0.1".to_owned(), "1.1.0".to_owned()],
+		}]
+	);
 }
 
 #[cfg(feature = "policy-schema")]
@@ -649,5 +672,8 @@ fn vulnerability<const N: usize>(
 		details: None,
 		severity: Some(severity),
 		references: Vec::new(),
+		component_name: None,
+		component_version: None,
+		fixed_versions: Vec::new(),
 	}
 }

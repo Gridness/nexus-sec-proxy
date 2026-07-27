@@ -8,7 +8,7 @@ use nexus_sec_proxy_config::{
 };
 use nexus_sec_proxy_security::{
 	BlockReport, ExternalScanner, ExternalScannerKind, PolicyContext,
-	PolicyEvaluation, PolicyOutcome, ScanTarget, SecurityError,
+	PolicyEvaluation, PolicyOutcome, ScanTarget, SecurityError, TrustReport,
 	VulnerabilitySource,
 };
 #[cfg(feature = "yandex-messenger")]
@@ -23,6 +23,7 @@ use crate::decisions::{DecisionOutcome, record_decision};
 use crate::requester::Requester;
 #[cfg(feature = "yandex-messenger")]
 use crate::requester::messenger_recipient;
+use crate::requester::verify_requester;
 use crate::responses::response_with_text;
 use crate::state::AppState;
 
@@ -125,31 +126,39 @@ pub(crate) async fn handle_unsupported_target(
 			Ok(())
 		}
 		UnsupportedTargetPolicy::Block => {
-			let recipient =
-				messenger_recipient_for_block(state, requester).await?;
-			let report = BlockReport::unsupported(target, reason);
+			let requester = verify_requester(state, requester).await?;
+			let block = BlockReport::unsupported(target, reason);
 			let active_policy = state.active_policy();
 			let context =
 				active_policy.context_for(&repository.name, &repository.format);
-			let created = create_trust_report(state, &context, &report).await?;
-			audit_unsupported_block(&context, &report, &created.url);
+			let mut report = TrustReport::new(context.clone(), block);
+			if let Some(requester) = requester {
+				report = report.with_requester(requester);
+			}
+			let created = create_trust_report(state, &report).await?;
+			audit_unsupported_block(&context, &report.block, &created.url);
 			record_decision(
 				state,
 				&context,
 				DecisionOutcome::Blocked,
-				&report,
+				&report.block,
 				Some(&created.url),
 			);
+			let recipient = messenger_recipient_for_block(
+				state,
+				report.requester.as_deref(),
+			)
+			.await;
 			notify_blocked(
 				state,
 				recipient.as_deref(),
 				&context,
-				&report,
+				&report.block,
 				&created.url,
 			);
 			Err(Box::new(response_with_text(
 				StatusCode::FORBIDDEN,
-				block_response_body(&report, &created.url),
+				block_response_body(&report.block, &created.url),
 			)))
 		}
 	}
@@ -177,9 +186,13 @@ pub(crate) async fn handle_policy_evaluation(
 			);
 		}
 		PolicyOutcome::Blocked(report) => {
-			let recipient =
-				messenger_recipient_for_block(state, requester).await?;
-			let created = create_trust_report(state, context, report).await?;
+			let requester = verify_requester(state, requester).await?;
+			let mut trust_report =
+				TrustReport::new(context.clone(), report.clone());
+			if let Some(requester) = requester {
+				trust_report = trust_report.with_requester(requester);
+			}
+			let created = create_trust_report(state, &trust_report).await?;
 			audit_policy_evaluation(
 				context,
 				target,
@@ -193,6 +206,11 @@ pub(crate) async fn handle_policy_evaluation(
 				report,
 				Some(&created.url),
 			);
+			let recipient = messenger_recipient_for_block(
+				state,
+				trust_report.requester.as_deref(),
+			)
+			.await;
 			notify_blocked(
 				state,
 				recipient.as_deref(),
@@ -249,46 +267,41 @@ fn notify_blocked(
 #[cfg(feature = "yandex-messenger")]
 async fn messenger_recipient_for_block(
 	state: &AppState,
-	requester: Option<&Requester>,
-) -> Result<Option<String>, Box<Response<Body>>> {
-	let recipient = messenger_recipient(state, requester).await?;
+	requester: Option<&str>,
+) -> Option<String> {
+	let recipient = messenger_recipient(state, requester).await;
 	if recipient.is_none()
 		&& let Some(notifier) = state.yandex_messenger.as_ref()
 	{
 		notifier.record_skipped("recipient_unavailable");
 	}
-	Ok(recipient)
+	recipient
 }
 
 #[cfg(not(feature = "yandex-messenger"))]
 async fn messenger_recipient_for_block(
 	_state: &AppState,
-	_requester: Option<&Requester>,
-) -> Result<Option<String>, Box<Response<Body>>> {
-	Ok(None)
+	_requester: Option<&str>,
+) -> Option<String> {
+	None
 }
 
 async fn create_trust_report(
 	state: &AppState,
-	context: &PolicyContext,
-	report: &BlockReport,
+	report: &TrustReport,
 ) -> Result<crate::trust_reports::CreatedReport, Box<Response<Body>>> {
-	state
-		.report_store
-		.create(context, report)
-		.await
-		.map_err(|error| {
-			error!(
-				%error,
-				target = %report.target.display_name(),
-				repository = %context.repository,
-				"Trust report creation failed; denying download"
-			);
-			Box::new(response_with_text(
-				StatusCode::SERVICE_UNAVAILABLE,
-				"Package download denied because the Trust report could not be created\n",
-			))
-		})
+	state.report_backend.create(report).await.map_err(|error| {
+		error!(
+			%error,
+			target = %report.block.target.display_name(),
+			repository = %report.context.repository,
+			"Trust report creation failed; denying download"
+		);
+		Box::new(response_with_text(
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Package download denied because the Trust report could not be created\n",
+		))
+	})
 }
 
 fn block_response_body(report: &BlockReport, report_url: &str) -> String {

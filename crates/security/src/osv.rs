@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::vulnerability::normalized_fixed_versions;
 use crate::{
 	PackageCoordinate, PackageIdentity, Reference, ScanTarget, SecurityError,
 	Severity, Vulnerability, VulnerabilitySource,
@@ -52,12 +53,9 @@ impl OsvClient {
 					SecurityError::InvalidResponse(error.to_string())
 				})?;
 
-			vulnerabilities.extend(
-				response
-					.vulns
-					.into_iter()
-					.map(OsvVulnerability::into_vulnerability),
-			);
+			vulnerabilities.extend(response.vulns.into_iter().map(
+				|vulnerability| vulnerability.into_vulnerability(package),
+			));
 
 			match response.next_page_token {
 				Some(next_page_token) if !next_page_token.is_empty() => {
@@ -175,8 +173,22 @@ struct OsvVulnerability {
 }
 
 impl OsvVulnerability {
-	fn into_vulnerability(self) -> Vulnerability {
+	fn into_vulnerability(self, package: &PackageCoordinate) -> Vulnerability {
 		let severity = severity_from_osv(&self);
+		let affected = self
+			.affected
+			.iter()
+			.find(|affected| affected.matches(package));
+		let component_name = affected
+			.and_then(|affected| affected.package.as_ref())
+			.and_then(|package| package.name.clone());
+		let fixed_versions = normalized_fixed_versions(
+			affected
+				.into_iter()
+				.flat_map(|affected| &affected.ranges)
+				.flat_map(|range| &range.events)
+				.filter_map(|event| event.fixed.as_deref()),
+		);
 		let references = self
 			.references
 			.into_iter()
@@ -193,6 +205,9 @@ impl OsvVulnerability {
 			details: self.details,
 			severity,
 			references,
+			component_name,
+			component_version: package.version.clone(),
+			fixed_versions,
 		}
 	}
 }
@@ -213,10 +228,50 @@ struct OsvReference {
 
 #[derive(Debug, Deserialize)]
 struct OsvAffected {
+	package: Option<OsvAffectedPackage>,
+	#[serde(default)]
+	ranges: Vec<OsvRange>,
 	#[serde(default)]
 	ecosystem_specific: Value,
 	#[serde(default)]
 	database_specific: Value,
+}
+
+impl OsvAffected {
+	fn matches(&self, target: &PackageCoordinate) -> bool {
+		let Some(package) = self.package.as_ref() else {
+			return false;
+		};
+
+		match &target.identity {
+			PackageIdentity::Osv { ecosystem, name } => {
+				package.name.as_deref() == Some(name)
+					&& package.ecosystem.as_deref() == Some(ecosystem)
+			}
+			PackageIdentity::Purl { purl } => {
+				package.purl.as_deref() == Some(purl)
+			}
+			PackageIdentity::GitCommit { .. } => false,
+		}
+	}
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvAffectedPackage {
+	name: Option<String>,
+	ecosystem: Option<String>,
+	purl: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvRange {
+	#[serde(default)]
+	events: Vec<OsvEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvEvent {
+	fixed: Option<String>,
 }
 fn severity_from_osv(vulnerability: &OsvVulnerability) -> Option<Severity> {
 	severity_from_json(&vulnerability.database_specific)
@@ -280,3 +335,7 @@ fn purl_contains_version(purl: &str) -> bool {
 		.next()
 		.is_some_and(|tail| tail.contains('@'))
 }
+
+#[cfg(test)]
+#[path = "osv_tests.rs"]
+mod tests;

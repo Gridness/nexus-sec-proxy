@@ -10,6 +10,9 @@ PRIME_SCANNER_DB=1
 START_SCANNER_DB_UPDATER=1
 NEXUS_BASE_URL=
 PROXY_BASE_URL=
+DEFECTDOJO_BASE_URL=
+DEFECTDOJO_API_TOKEN=
+DEFECTDOJO_ENGAGEMENT_ID=
 NEXUS_CATALOG_FILE=
 TRUST_BLOCK_BODY_FILE=
 TRUST_REPORT_FILE=
@@ -50,11 +53,15 @@ Environment:
   NEXUS_SEC_PROXY_E2E_COMPOSE_FILE           Compose file path.
   NEXUS_SEC_PROXY_E2E_NEXUS_TIMEOUT_SECS     Nexus health timeout.
   NEXUS_SEC_PROXY_E2E_CATALOG_TIMEOUT_SECS   Nexus catalog timeout.
+  NEXUS_SEC_PROXY_E2E_DEFECTDOJO_TIMEOUT_SECS DefectDojo health timeout.
   NEXUS_SEC_PROXY_E2E_PROXY_TIMEOUT_SECS     Proxy health timeout.
   NEXUS_SEC_PROXY_E2E_ADMIN_TOKEN            Proxy admin token. Default: e2e-admin-token.
   NEXUS_SEC_PROXY_ADMIN_TOKEN                Proxy admin token override.
   NEXUS_SEC_PROXY_NEXUS_USERNAME             Optional Nexus catalog username.
   NEXUS_SEC_PROXY_NEXUS_PASSWORD             Optional Nexus catalog password.
+  DEFECTDOJO_VERSION                         DefectDojo image tag. Default: 3.1.200.
+  DEFECTDOJO_ADMIN_USER                      DefectDojo admin user. Default: admin.
+  DEFECTDOJO_ADMIN_PASSWORD                  DefectDojo admin password. Default: e2e-admin-password.
 EOF
 }
 
@@ -129,11 +136,14 @@ load_dotenv_defaults() {
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_PORT
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_E2E_NEXUS_TIMEOUT_SECS
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_E2E_CATALOG_TIMEOUT_SECS
+	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_E2E_DEFECTDOJO_TIMEOUT_SECS
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_E2E_PROXY_TIMEOUT_SECS
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_E2E_ADMIN_TOKEN
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_ADMIN_TOKEN
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_NEXUS_USERNAME
 	set_env_from_dotenv_if_empty NEXUS_SEC_PROXY_NEXUS_PASSWORD
+	set_env_from_dotenv_if_empty DEFECTDOJO_ADMIN_USER
+	set_env_from_dotenv_if_empty DEFECTDOJO_ADMIN_PASSWORD
 }
 
 configure_proxy_admin_token() {
@@ -213,8 +223,13 @@ refresh_nexus_base_url() {
 }
 
 refresh_proxy_base_url() {
-	host_port=$(service_host_port nexus-sec-proxy 3000 "$NEXUS_SEC_PROXY_PORT")
+	host_port=$(service_host_port defectdojo 3000 "$NEXUS_SEC_PROXY_PORT")
 	PROXY_BASE_URL="http://127.0.0.1:${host_port}"
+}
+
+refresh_defectdojo_base_url() {
+	host_port=$(service_host_port defectdojo 8080 8080)
+	DEFECTDOJO_BASE_URL="http://127.0.0.1:${host_port}"
 }
 
 wait_for_healthy() {
@@ -364,11 +379,73 @@ wait_for_nexus_catalog_access() {
 	done
 }
 
+configure_defectdojo_integration() {
+	log "configuring DefectDojo reporting integration"
+
+	if ! setup_output=$(compose exec -T defectdojo-uwsgi python manage.py shell -c '
+from datetime import timedelta
+import os
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from dojo.models import Engagement, Product, Product_Type
+from rest_framework.authtoken.models import Token
+
+user = get_user_model().objects.get(username=os.environ["DD_ADMIN_USER"])
+user.set_password(os.environ["DD_ADMIN_PASSWORD"])
+user.save(update_fields=["password"])
+product_type, _ = Product_Type.objects.get_or_create(name="Nexus Security Proxy E2E")
+product, _ = Product.objects.get_or_create(
+    name="Nexus Security Proxy E2E",
+    defaults={
+        "description": "Local Nexus Security Proxy end-to-end environment",
+        "prod_type": product_type,
+    },
+)
+today = timezone.localdate()
+engagement, _ = Engagement.objects.get_or_create(
+    name="Nexus Security Proxy E2E",
+    product=product,
+    defaults={
+        "target_start": today,
+        "target_end": today + timedelta(days=3650),
+        "engagement_type": "CI/CD",
+    },
+)
+token, _ = Token.objects.get_or_create(user=user)
+print(f"DEFECTDOJO_SETUP:{token.key}:{engagement.id}")
+'); then
+		print_service_debug defectdojo-uwsgi
+		die "failed to configure DefectDojo reporting integration"
+	fi
+
+	setup=$(printf '%s\n' "$setup_output" \
+		| sed -n 's/^DEFECTDOJO_SETUP://p' \
+		| tail -n 1)
+	DEFECTDOJO_API_TOKEN=${setup%%:*}
+	DEFECTDOJO_ENGAGEMENT_ID=${setup##*:}
+	if [ -z "$DEFECTDOJO_API_TOKEN" ] \
+		|| ! is_positive_integer "$DEFECTDOJO_ENGAGEMENT_ID"; then
+		die "DefectDojo setup did not return an API token and Engagement ID"
+	fi
+
+	NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED=true
+	NEXUS_SEC_PROXY_DEFECTDOJO_URL=http://127.0.0.1:8080
+	NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN=$DEFECTDOJO_API_TOKEN
+	NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID=$DEFECTDOJO_ENGAGEMENT_ID
+	export NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED
+	export NEXUS_SEC_PROXY_DEFECTDOJO_URL
+	export NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN
+	export NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID
+
+	log "DefectDojo Reporting Engagement ${DEFECTDOJO_ENGAGEMENT_ID} is ready"
+}
+
 print_access_summary() {
 	printf '\n'
 	printf 'Access:\n'
 	printf '  Nexus: %s\n' "$NEXUS_BASE_URL"
 	printf '  Proxy: %s\n' "$PROXY_BASE_URL"
+	printf '  DefectDojo: %s\n' "$DEFECTDOJO_BASE_URL"
 	printf '  Proxy admin UI: %s/admin\n' "$PROXY_BASE_URL"
 	printf '  Proxy admin bearer token: %s\n' "$NEXUS_SEC_PROXY_ADMIN_TOKEN"
 	printf '  Proxy admin auth header: Authorization: Bearer %s\n' "$NEXUS_SEC_PROXY_ADMIN_TOKEN"
@@ -384,6 +461,13 @@ print_access_summary() {
 			printf '  Proxy admin token source: NEXUS_SEC_PROXY_ADMIN_TOKEN\n'
 			;;
 	esac
+
+	printf '\n'
+	printf 'DefectDojo integration:\n'
+	printf '  Username: %s\n' "$DEFECTDOJO_ADMIN_USER"
+	printf '  Password: %s\n' "$DEFECTDOJO_ADMIN_PASSWORD"
+	printf '  API token: %s\n' "$DEFECTDOJO_API_TOKEN"
+	printf '  Reporting Engagement ID: %s\n' "$DEFECTDOJO_ENGAGEMENT_ID"
 
 	if [ -n "$NEXUS_ADMIN_PASSWORD" ]; then
 		printf '\n'
@@ -449,12 +533,29 @@ verify_trust_report_block() {
 		die "blocked response did not include a Trust report URL"
 	fi
 
-	curl -fsS -o "$TRUST_REPORT_FILE" "$report_url"
-	grep -Fq '<span>Trust</span>' "$TRUST_REPORT_FILE" \
-		|| die "Trust report page does not contain the Trust header"
+	case "$report_url" in
+		"$NEXUS_SEC_PROXY_DEFECTDOJO_URL"/test/*) ;;
+		*) die "blocked response did not include a DefectDojo Test URL" ;;
+	esac
+	test_id=${report_url%/}
+	test_id=${test_id##*/}
+	if ! is_positive_integer "$test_id"; then
+		die "DefectDojo report URL did not include a Test ID"
+	fi
+
+	curl -fsS \
+		-H "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+		-o "$TRUST_REPORT_FILE" \
+		"${DEFECTDOJO_BASE_URL}/api/v2/tests/${test_id}/"
+	grep -Fq 'Nexus Security Proxy block' "$TRUST_REPORT_FILE" \
+		|| die "DefectDojo Test does not contain the proxy report title"
+	curl -fsS \
+		-H "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+		-o "$TRUST_REPORT_FILE" \
+		"${DEFECTDOJO_BASE_URL}/api/v2/findings/?test=${test_id}&limit=100"
 	grep -Fq 'log4j-core@2.14.1' "$TRUST_REPORT_FILE" \
-		|| die "Trust report page does not contain the blocked target"
-	log "Trust report is reachable at ${report_url}"
+		|| die "DefectDojo Test does not contain the blocked target"
+	log "DefectDojo Trust report is reachable at ${report_url}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -487,9 +588,15 @@ cd "$REPO_ROOT"
 load_dotenv_defaults
 configure_proxy_admin_token
 
+DEFECTDOJO_ADMIN_USER="${DEFECTDOJO_ADMIN_USER:-admin}"
+DEFECTDOJO_ADMIN_PASSWORD="${DEFECTDOJO_ADMIN_PASSWORD:-e2e-admin-password}"
+export DEFECTDOJO_ADMIN_USER
+export DEFECTDOJO_ADMIN_PASSWORD
+
 COMPOSE_FILE="${NEXUS_SEC_PROXY_E2E_COMPOSE_FILE:-$REPO_ROOT/e2e.compose.yaml}"
 NEXUS_TIMEOUT_SECS="${NEXUS_SEC_PROXY_E2E_NEXUS_TIMEOUT_SECS:-600}"
 CATALOG_TIMEOUT_SECS="${NEXUS_SEC_PROXY_E2E_CATALOG_TIMEOUT_SECS:-180}"
+DEFECTDOJO_TIMEOUT_SECS="${NEXUS_SEC_PROXY_E2E_DEFECTDOJO_TIMEOUT_SECS:-600}"
 PROXY_TIMEOUT_SECS="${NEXUS_SEC_PROXY_E2E_PROXY_TIMEOUT_SECS:-180}"
 NEXUS_OSS_PORT="${NEXUS_OSS_PORT:-8081}"
 NEXUS_SEC_PROXY_PORT="${NEXUS_SEC_PROXY_PORT:-3000}"
@@ -498,6 +605,7 @@ PROXY_BASE_URL="http://127.0.0.1:${NEXUS_SEC_PROXY_PORT}"
 
 validate_timeout NEXUS_SEC_PROXY_E2E_NEXUS_TIMEOUT_SECS "$NEXUS_TIMEOUT_SECS"
 validate_timeout NEXUS_SEC_PROXY_E2E_CATALOG_TIMEOUT_SECS "$CATALOG_TIMEOUT_SECS"
+validate_timeout NEXUS_SEC_PROXY_E2E_DEFECTDOJO_TIMEOUT_SECS "$DEFECTDOJO_TIMEOUT_SECS"
 validate_timeout NEXUS_SEC_PROXY_E2E_PROXY_TIMEOUT_SECS "$PROXY_TIMEOUT_SECS"
 
 if [ ! -f "$COMPOSE_FILE" ]; then
@@ -512,11 +620,18 @@ if [ "$BUILD_IMAGES" -eq 1 ]; then
 	compose build nexus-sec-proxy scanner-db-updater
 fi
 
-log "starting Nexus"
-compose up -d nexus
+log "starting Nexus and DefectDojo"
+compose up -d \
+	nexus \
+	defectdojo \
+	defectdojo-celerybeat \
+	defectdojo-celeryworker
 wait_for_healthy nexus "$NEXUS_TIMEOUT_SECS"
 refresh_nexus_base_url
 wait_for_nexus_catalog_access
+wait_for_healthy defectdojo "$DEFECTDOJO_TIMEOUT_SECS"
+refresh_defectdojo_base_url
+configure_defectdojo_integration
 
 if [ "$PRIME_SCANNER_DB" -eq 1 ]; then
 	log "priming scanner database volumes"

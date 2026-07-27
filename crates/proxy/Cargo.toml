@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["yandex-messenger"]
+default = ["defectdojo", "yandex-messenger"]
+defectdojo = ["dep:nexus-sec-proxy-defectdojo"]
 yandex-messenger = ["dep:nexus-sec-proxy-yandex-messenger"]
 
 [dependencies]
@@ -15,6 +16,7 @@ base64.workspace = true
 futures-util.workspace = true
 nexus-sec-proxy-cache = { path = "../cache" }
 nexus-sec-proxy-config = { path = "../config" }
+nexus-sec-proxy-defectdojo = { path = "../defectdojo", optional = true }
 nexus-sec-proxy-security = { path = "../security" }
 nexus-sec-proxy-yandex-messenger = { path = "../yandex-messenger", optional = true }
 percent-encoding.workspace = true

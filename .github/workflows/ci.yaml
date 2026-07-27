@@ -46,6 +46,10 @@ jobs:
         run: cargo test --workspace --locked
       - name: Test minimal proxy features
         run: cargo test -p nexus-sec-proxy --no-default-features --locked
+      - name: Test Yandex-only proxy features
+        run: cargo test -p nexus-sec-proxy --no-default-features --features yandex-messenger --locked
+      - name: Test DefectDojo-only proxy features
+        run: cargo test -p nexus-sec-proxy --no-default-features --features defectdojo --locked
 
   quality:
     name: Quality and configuration
@@ -65,6 +69,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Lint minimal proxy features
         run: cargo clippy -p nexus-sec-proxy --no-default-features --all-targets --locked -- -D warnings
+      - name: Lint single-integration proxy features
+        run: |
+          cargo clippy -p nexus-sec-proxy --no-default-features --features yandex-messenger --all-targets --locked -- -D warnings
+          cargo clippy -p nexus-sec-proxy --no-default-features --features defectdojo --all-targets --locked -- -D warnings
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
       - name: Check generated policy schema

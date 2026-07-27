@@ -35,7 +35,12 @@ pub(crate) struct ImmutableConfigSummary {
 	yandex_messenger_token_configured: bool,
 	yandex_messenger_template_file: Option<String>,
 	yandex_messenger_api_url: String,
-	trust_base_url: String,
+	defectdojo_available: bool,
+	defectdojo_enabled: bool,
+	defectdojo_url: Option<String>,
+	defectdojo_token_configured: bool,
+	defectdojo_engagement_id: Option<u64>,
+	trust_base_url: Option<String>,
 	trust_report_dir: String,
 	trust_report_retention_days: u64,
 	legacy_repository_name: String,
@@ -85,6 +90,7 @@ pub(crate) struct StatusResponse {
 	cache: CacheSummary,
 	scanner: ScannerSummary,
 	yandex_messenger: YandexMessengerRuntimeSummary,
+	defectdojo: DefectDojoRuntimeSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +101,17 @@ pub(crate) struct YandexMessengerRuntimeSummary {
 	retried: u64,
 	failed: u64,
 	skipped_by_reason: BTreeMap<String, u64>,
+	last_success_at: Option<String>,
+	last_failure_at: Option<String>,
+	last_failure_category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DefectDojoRuntimeSummary {
+	available: bool,
+	enabled: bool,
+	submitted: u64,
+	failed: u64,
 	last_success_at: Option<String>,
 	last_failure_at: Option<String>,
 	last_failure_category: Option<String>,
@@ -356,8 +373,35 @@ pub(crate) async fn admin_status(
 		cache: cache_summary(&state).await,
 		scanner: scanner_summary(&state),
 		yandex_messenger: yandex_messenger_summary(&state),
+		defectdojo: defectdojo_summary(&state),
 	})
 	.into_response()
+}
+
+fn defectdojo_summary(_state: &AppState) -> DefectDojoRuntimeSummary {
+	#[cfg(feature = "defectdojo")]
+	if let Some(client) = _state.report_backend.defectdojo() {
+		let status = client.status();
+		return DefectDojoRuntimeSummary {
+			available: true,
+			enabled: true,
+			submitted: status.submitted,
+			failed: status.failed,
+			last_success_at: status.last_success_at,
+			last_failure_at: status.last_failure_at,
+			last_failure_category: status.last_failure_category,
+		};
+	}
+
+	DefectDojoRuntimeSummary {
+		available: cfg!(feature = "defectdojo"),
+		enabled: false,
+		submitted: 0,
+		failed: 0,
+		last_success_at: None,
+		last_failure_at: None,
+		last_failure_category: None,
+	}
 }
 
 fn yandex_messenger_summary(
@@ -636,6 +680,12 @@ fn immutable_config_summary(config: &AppConfig) -> ImmutableConfigSummary {
 			.yandex_messenger_template_file
 			.clone(),
 		yandex_messenger_api_url: config.yandex_messenger_api_url.clone(),
+		defectdojo_available: cfg!(feature = "defectdojo"),
+		defectdojo_enabled: cfg!(feature = "defectdojo")
+			&& config.defectdojo_enabled,
+		defectdojo_url: config.defectdojo_url.clone(),
+		defectdojo_token_configured: config.defectdojo_token.is_some(),
+		defectdojo_engagement_id: config.defectdojo_engagement_id,
 		trust_base_url: config.trust_base_url.clone(),
 		trust_report_dir: config.trust_report_dir.clone(),
 		trust_report_retention_days: config.trust_report_retention_days,

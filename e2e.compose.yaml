@@ -3,6 +3,14 @@ name: nexus-sec-proxy-e2e
 x-scanner-cache-env: &scanner-cache-env
   TRIVY_CACHE_DIR: /var/cache/trivy
 
+x-defectdojo-env: &defectdojo-env
+  DD_DATABASE_URL: postgresql://defectdojo:defectdojo@defectdojo-postgres:5432/defectdojo
+  DD_CELERY_BROKER_URL: redis://defectdojo-valkey:6379/0
+  DD_SECRET_KEY: ${DEFECTDOJO_SECRET_KEY:-e2e-defectdojo-secret-key-do-not-use-in-production}
+  DD_CREDENTIAL_AES_256_KEY: ${DEFECTDOJO_CREDENTIAL_AES_256_KEY:-0123456789abcdef0123456789abcdef}
+  DD_DATABASE_READINESS_TIMEOUT: 60
+  DD_DEDUPLICATION_ALGORITHM_PER_PARSER: '{"Nexus Security Proxy Scan (Generic Findings Import)":"unique_id_from_tool"}'
+
 services:
   nexus-sec-proxy:
     image: nexus-sec-proxy:${NEXUS_SEC_PROXY_IMAGE_TAG:-local}
@@ -15,14 +23,18 @@ services:
         TRIVY_VERSION: ${TRIVY_VERSION:-0.71.0}
         HELM_VERSION: ${HELM_VERSION:-3.18.4}
         YANDEX_MESSENGER_FEATURE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_FEATURE:-true}
+        DEFECTDOJO_FEATURE: ${NEXUS_SEC_PROXY_DEFECTDOJO_FEATURE:-true}
         VERSION: ${NEXUS_SEC_PROXY_VERSION:-0.1.0} # x-release-please-version
         VCS_REF: ${NEXUS_SEC_PROXY_VCS_REF:-unknown}
         BUILD_DATE: ${NEXUS_SEC_PROXY_BUILD_DATE:-unknown}
     init: true
     restart: unless-stopped
     depends_on:
+      defectdojo:
+        condition: service_healthy
       nexus:
         condition: service_healthy
+    network_mode: service:defectdojo
     read_only: true
     cap_drop:
       - ALL
@@ -51,6 +63,11 @@ services:
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE:-}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL:-https://botapi.messenger.yandex.net}
       NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED: ${NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED:-}
+      NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED: ${NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED:-false}
+      NEXUS_SEC_PROXY_DEFECTDOJO_URL: ${NEXUS_SEC_PROXY_DEFECTDOJO_URL:-}
+      NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN: ${NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN:-}
+      NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN_FILE: ${NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN_FILE:-}
+      NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID: ${NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID:-}
       NEXUS_SEC_PROXY_TRUST_BASE_URL: ${NEXUS_SEC_PROXY_TRUST_BASE_URL:-http://localhost:${NEXUS_SEC_PROXY_PORT:-3000}}
       NEXUS_SEC_PROXY_TRUST_REPORT_DIR: /var/lib/nexus-sec-proxy/trust-reports
       NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS: ${NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS:-30}
@@ -75,8 +92,6 @@ services:
       NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES: ${NEXUS_SEC_PROXY_ARTIFACT_SCAN_MAX_BYTES:-536870912}
       NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY: ${NEXUS_SEC_PROXY_ARTIFACT_SCANNER_CONCURRENCY:-2}
       NEXUS_SEC_PROXY_ARTIFACT_TMP_DIR: /var/tmp/nexus-sec-proxy
-    ports:
-      - "${NEXUS_SEC_PROXY_PORT:-3000}:3000"
     volumes:
       - ${NEXUS_SEC_PROXY_POLICY_DIR:-./policy}:/etc/nexus-sec-proxy:ro
       - artifact-tmp:/var/tmp/nexus-sec-proxy
@@ -136,6 +151,187 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  defectdojo:
+    image: defectdojo/defectdojo-nginx:${DEFECTDOJO_VERSION:-3.1.200}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      defectdojo-uwsgi:
+        condition: service_started
+    environment:
+      DD_UWSGI_HOST: defectdojo-uwsgi
+      DD_UWSGI_PORT: 3031
+    ports:
+      - "8080:8080"
+      - "${NEXUS_SEC_PROXY_PORT:-3000}:3000"
+    volumes:
+      - defectdojo-media:/usr/share/nginx/html/media
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:8080/login",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-uwsgi:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-3.1.200}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+      defectdojo-postgres:
+        condition: service_started
+      defectdojo-valkey:
+        condition: service_started
+    entrypoint:
+      [
+        "/wait-for-it.sh",
+        "defectdojo-postgres:5432",
+        "-t",
+        "60",
+        "--",
+        "/entrypoint-uwsgi.sh",
+      ]
+    environment:
+      <<: *defectdojo-env
+      DD_ALLOWED_HOSTS: "*"
+      DD_ADMIN_USER: ${DEFECTDOJO_ADMIN_USER:-admin}
+      DD_ADMIN_PASSWORD: ${DEFECTDOJO_ADMIN_PASSWORD:-e2e-admin-password}
+    volumes:
+      - defectdojo-media:/app/media
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-celerybeat:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-3.1.200}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+      defectdojo-postgres:
+        condition: service_started
+      defectdojo-valkey:
+        condition: service_started
+    entrypoint:
+      [
+        "/wait-for-it.sh",
+        "defectdojo-postgres:5432",
+        "-t",
+        "60",
+        "--",
+        "/entrypoint-celery-beat.sh",
+      ]
+    environment:
+      <<: *defectdojo-env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-celeryworker:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-3.1.200}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+      defectdojo-postgres:
+        condition: service_started
+      defectdojo-valkey:
+        condition: service_started
+    entrypoint:
+      [
+        "/wait-for-it.sh",
+        "defectdojo-postgres:5432",
+        "-t",
+        "60",
+        "--",
+        "/entrypoint-celery-worker.sh",
+      ]
+    environment:
+      <<: *defectdojo-env
+    volumes:
+      - defectdojo-media:/app/media
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-initializer:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-3.1.200}
+    depends_on:
+      defectdojo-postgres:
+        condition: service_started
+    entrypoint:
+      [
+        "/wait-for-it.sh",
+        "defectdojo-postgres:5432",
+        "-t",
+        "60",
+        "--",
+        "/entrypoint-initializer.sh",
+      ]
+    environment:
+      <<: *defectdojo-env
+      DD_ADMIN_USER: ${DEFECTDOJO_ADMIN_USER:-admin}
+      DD_ADMIN_MAIL: ${DEFECTDOJO_ADMIN_EMAIL:-admin@defectdojo.local}
+      DD_ADMIN_FIRST_NAME: E2E
+      DD_ADMIN_LAST_NAME: Admin
+      DD_ADMIN_PASSWORD: ${DEFECTDOJO_ADMIN_PASSWORD:-e2e-admin-password}
+      DD_INITIALIZE: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-postgres:
+    image: postgres:${DEFECTDOJO_POSTGRES_VERSION:-18.4-alpine}
+    restart: unless-stopped
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: defectdojo
+      POSTGRES_USER: defectdojo
+      POSTGRES_PASSWORD: defectdojo
+    volumes:
+      - defectdojo-postgres:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  defectdojo-valkey:
+    image: valkey/valkey:${DEFECTDOJO_VALKEY_VERSION:-9.1.0-alpine}
+    restart: unless-stopped
+    volumes:
+      - defectdojo-valkey:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   nexus:
     image: sonatype/nexus3:${NEXUS_OSS_IMAGE_TAG:-3.94.0}
     init: true
@@ -165,6 +361,9 @@ services:
 
 volumes:
   artifact-tmp:
+  defectdojo-media:
+  defectdojo-postgres:
+  defectdojo-valkey:
   nexus-data:
   trust-reports:
   trivy-cache:

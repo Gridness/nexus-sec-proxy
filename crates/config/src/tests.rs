@@ -43,7 +43,12 @@ fn default_config_uses_strict_high_and_critical_policy() {
 		config.yandex_messenger_api_url,
 		"https://botapi.messenger.yandex.net"
 	);
-	assert_eq!(config.trust_base_url, "https://proxy.example.invalid");
+	assert_eq!(
+		config.trust_base_url.as_deref(),
+		Some("https://proxy.example.invalid")
+	);
+	assert!(!config.defectdojo_enabled);
+	assert_eq!(config.defectdojo_url, None);
 	assert_eq!(
 		config.trust_report_dir,
 		"/var/lib/nexus-sec-proxy/trust-reports"
@@ -181,6 +186,7 @@ fn yandex_messenger_token_is_redacted_from_serialized_config() {
 		("NEXUS_SEC_PROXY_ADMIN_TOKEN", "admin-secret"),
 		("NEXUS_SEC_PROXY_NEXUS_PASSWORD", "nexus-secret"),
 		("NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN", "bot-secret"),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN", "dojo-secret"),
 		(
 			"NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE",
 			"/etc/nsp/yandex-message.txt",
@@ -195,6 +201,7 @@ fn yandex_messenger_token_is_redacted_from_serialized_config() {
 	assert!(value.get("admin_token").is_none());
 	assert!(value.get("nexus_password").is_none());
 	assert!(value.get("yandex_messenger_token").is_none());
+	assert!(value.get("defectdojo_token").is_none());
 	assert_eq!(
 		value["yandex_messenger_template_file"],
 		"/etc/nsp/yandex-message.txt"
@@ -552,7 +559,10 @@ fn validates_trust_report_configuration() {
 		valid.get(name).map(ToString::to_string)
 	})
 	.unwrap();
-	assert_eq!(config.trust_base_url, "https://proxy.example.invalid/base");
+	assert_eq!(
+		config.trust_base_url.as_deref(),
+		Some("https://proxy.example.invalid/base")
+	);
 	assert_eq!(config.trust_report_dir, "/srv/shared/trust-reports");
 	assert_eq!(config.trust_report_retention_days, 7);
 
@@ -592,6 +602,83 @@ fn validates_trust_report_configuration() {
 	})
 	.unwrap_err();
 	assert!(matches!(error, ConfigError::ValueBelowMinimum { .. }));
+}
+
+#[test]
+fn validates_defectdojo_activation_without_local_report_configuration() {
+	let valid = BTreeMap::from([
+		(
+			"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+			"https://repo.example.invalid",
+		),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED", "true"),
+		(
+			"NEXUS_SEC_PROXY_DEFECTDOJO_URL",
+			"http://127.0.0.1:8080/dojo/",
+		),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN", "token"),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID", "17"),
+		("NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS", "0"),
+	]);
+	let config = AppConfig::from_env_vars(|name| {
+		valid.get(name).map(ToString::to_string)
+	})
+	.unwrap();
+
+	assert!(config.defectdojo_enabled);
+	assert_eq!(
+		config.defectdojo_url.as_deref(),
+		Some("http://127.0.0.1:8080/dojo")
+	);
+	assert_eq!(config.defectdojo_token.as_deref(), Some("token"));
+	assert_eq!(config.defectdojo_engagement_id, Some(17));
+	assert_eq!(config.trust_base_url, None);
+
+	for (name, value) in [
+		("NEXUS_SEC_PROXY_DEFECTDOJO_URL", ""),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN", ""),
+		("NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID", ""),
+	] {
+		let mut missing = valid.clone();
+		missing.insert(name, value);
+		let error = AppConfig::from_env_vars(|name| {
+			missing.get(name).map(ToString::to_string)
+		})
+		.unwrap_err();
+		assert!(matches!(error, ConfigError::MissingRequired { .. }));
+	}
+}
+
+#[test]
+fn rejects_insecure_or_invalid_active_defectdojo_configuration() {
+	for url in [
+		"http://defectdojo.example.invalid",
+		"ftp://defectdojo.example.invalid",
+		"https://user:secret@defectdojo.example.invalid",
+		"https://defectdojo.example.invalid/?token=secret",
+		"not a URL",
+	] {
+		let env = BTreeMap::from([
+			(
+				"NEXUS_SEC_PROXY_NEXUS_BASE_URL",
+				"https://repo.example.invalid",
+			),
+			("NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED", "true"),
+			("NEXUS_SEC_PROXY_DEFECTDOJO_URL", url),
+			("NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN", "token"),
+			("NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID", "17"),
+		]);
+
+		let error = AppConfig::from_env_vars(|name| {
+			env.get(name).map(ToString::to_string)
+		})
+		.unwrap_err();
+
+		assert!(matches!(
+			error,
+			ConfigError::InvalidDefectDojoBaseUrl { .. }
+		));
+	}
 }
 
 #[test]
