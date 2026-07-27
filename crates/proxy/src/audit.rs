@@ -162,6 +162,9 @@ mod tests {
 				details: None,
 				severity: Some(Severity::High),
 				references: Vec::new(),
+				component_name: None,
+				component_version: None,
+				fixed_versions: Vec::new(),
 			}],
 		);
 		let report_url = "https://proxy.example.invalid/trust/reports/123";

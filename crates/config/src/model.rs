@@ -48,7 +48,12 @@ pub struct AppConfig {
 	pub yandex_messenger_template_file: Option<String>,
 	pub yandex_messenger_api_url: String,
 	pub yandex_messenger_enabled: bool,
-	pub trust_base_url: String,
+	pub defectdojo_enabled: bool,
+	pub defectdojo_url: Option<String>,
+	#[serde(skip_serializing)]
+	pub defectdojo_token: Option<String>,
+	pub defectdojo_engagement_id: Option<u64>,
+	pub trust_base_url: Option<String>,
 	pub trust_report_dir: String,
 	pub trust_report_retention_days: u64,
 	pub log_json: bool,
@@ -185,8 +190,54 @@ impl AppConfig {
 				}
 			}
 		}
-		let trust_base_url =
-			trust_base_url(&mut lookup, "NEXUS_SEC_PROXY_TRUST_BASE_URL")?;
+		let defectdojo_enabled =
+			bool_env(&mut lookup, "NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED", false)?;
+		let defectdojo_token = secret_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN",
+			"NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN_FILE",
+		)?;
+		let defectdojo_engagement_id = optional_u64_env(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID",
+		)?;
+		let defectdojo_url = defectdojo_base_url(
+			&mut lookup,
+			"NEXUS_SEC_PROXY_DEFECTDOJO_URL",
+			defectdojo_enabled,
+		)?;
+		if defectdojo_enabled {
+			for (name, present) in [
+				("NEXUS_SEC_PROXY_DEFECTDOJO_URL", defectdojo_url.is_some()),
+				(
+					"NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN",
+					defectdojo_token.is_some(),
+				),
+				(
+					"NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID",
+					defectdojo_engagement_id.is_some(),
+				),
+			] {
+				if !present {
+					return Err(ConfigError::MissingRequired { name });
+				}
+			}
+		}
+		if defectdojo_enabled && defectdojo_engagement_id == Some(0) {
+			return Err(ConfigError::ValueBelowMinimum {
+				name: "NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID",
+				value: 0,
+				minimum: 1,
+			});
+		}
+		let trust_base_url = if defectdojo_enabled {
+			optional_string_env(&mut lookup, "NEXUS_SEC_PROXY_TRUST_BASE_URL")
+		} else {
+			Some(trust_base_url(
+				&mut lookup,
+				"NEXUS_SEC_PROXY_TRUST_BASE_URL",
+			)?)
+		};
 		let trust_report_dir = string_env(
 			&mut lookup,
 			"NEXUS_SEC_PROXY_TRUST_REPORT_DIR",
@@ -197,7 +248,7 @@ impl AppConfig {
 			"NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS",
 			DEFAULT_TRUST_REPORT_RETENTION_DAYS,
 		)?;
-		if trust_report_retention_days < 1 {
+		if !defectdojo_enabled && trust_report_retention_days < 1 {
 			return Err(ConfigError::ValueBelowMinimum {
 				name: "NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS",
 				value: trust_report_retention_days,
@@ -294,6 +345,10 @@ impl AppConfig {
 			yandex_messenger_template_file,
 			yandex_messenger_api_url,
 			yandex_messenger_enabled,
+			defectdojo_enabled,
+			defectdojo_url,
+			defectdojo_token,
+			defectdojo_engagement_id,
 			trust_base_url,
 			trust_report_dir,
 			trust_report_retention_days,
@@ -419,4 +474,77 @@ fn trust_base_url(
 	}
 
 	Ok(value.trim_end_matches('/').to_owned())
+}
+
+fn defectdojo_base_url(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+	enabled: bool,
+) -> Result<Option<String>, ConfigError> {
+	let Some(value) = optional_string_env(lookup, name) else {
+		return Ok(None);
+	};
+	if !enabled {
+		return Ok(Some(value));
+	}
+	let parsed = url::Url::parse(&value).map_err(|error| {
+		ConfigError::InvalidDefectDojoBaseUrl {
+			name,
+			value: value.clone(),
+			reason: error.to_string(),
+		}
+	})?;
+	let loopback = parsed.host().is_some_and(|host| match host {
+		url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+		url::Host::Ipv4(host) => host.is_loopback(),
+		url::Host::Ipv6(host) => host.is_loopback(),
+	});
+
+	if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+		return Err(ConfigError::InvalidDefectDojoBaseUrl {
+			name,
+			value,
+			reason: "scheme must be https except for loopback HTTP".to_owned(),
+		});
+	}
+	if parsed.host_str().is_none() || parsed.cannot_be_a_base() {
+		return Err(ConfigError::InvalidDefectDojoBaseUrl {
+			name,
+			value,
+			reason: "URL must include a host".to_owned(),
+		});
+	}
+	if parsed.query().is_some() || parsed.fragment().is_some() {
+		return Err(ConfigError::InvalidDefectDojoBaseUrl {
+			name,
+			value,
+			reason: "query and fragment are not allowed".to_owned(),
+		});
+	}
+	if !parsed.username().is_empty() || parsed.password().is_some() {
+		return Err(ConfigError::InvalidDefectDojoBaseUrl {
+			name,
+			value,
+			reason: "credentials are not allowed".to_owned(),
+		});
+	}
+
+	Ok(Some(value.trim_end_matches('/').to_owned()))
+}
+
+fn optional_u64_env(
+	lookup: &mut impl FnMut(&'static str) -> Option<String>,
+	name: &'static str,
+) -> Result<Option<u64>, ConfigError> {
+	optional_string_env(lookup, name)
+		.map(|value| {
+			value.parse().map(Some).map_err(|source| {
+				ConfigError::InvalidUnsignedInt {
+					name,
+					value,
+					source,
+				}
+			})
+		})
+		.unwrap_or(Ok(None))
 }

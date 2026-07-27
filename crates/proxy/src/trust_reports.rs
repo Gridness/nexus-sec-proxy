@@ -14,10 +14,8 @@ use axum::http::header::{
 };
 use axum::http::{Response, StatusCode};
 use nexus_sec_proxy_security::{
-	BlockReport, PolicyContext, Reference, Severity, Vulnerability,
+	Reference, Severity, TrustReport, Vulnerability,
 };
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use url::Url;
@@ -35,9 +33,53 @@ pub(crate) struct ReportStore {
 	last_cleanup: Arc<Mutex<Instant>>,
 }
 
+#[derive(Clone)]
+pub(crate) enum ReportBackend {
+	Local(ReportStore),
+	#[cfg(feature = "defectdojo")]
+	DefectDojo(nexus_sec_proxy_defectdojo::DefectDojoClient),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreatedReport {
 	pub(crate) url: String,
+}
+
+impl ReportBackend {
+	pub(crate) async fn create(
+		&self,
+		report: &TrustReport,
+	) -> anyhow::Result<CreatedReport> {
+		match self {
+			Self::Local(store) => {
+				store.create(report).await.map_err(Into::into)
+			}
+			#[cfg(feature = "defectdojo")]
+			Self::DefectDojo(client) => client
+				.submit(report)
+				.await
+				.map(|created| CreatedReport { url: created.url })
+				.map_err(Into::into),
+		}
+	}
+
+	pub(crate) fn local_store(&self) -> Option<&ReportStore> {
+		match self {
+			Self::Local(store) => Some(store),
+			#[cfg(feature = "defectdojo")]
+			Self::DefectDojo(_) => None,
+		}
+	}
+
+	#[cfg(feature = "defectdojo")]
+	pub(crate) fn defectdojo(
+		&self,
+	) -> Option<&nexus_sec_proxy_defectdojo::DefectDojoClient> {
+		match self {
+			Self::Local(_) => None,
+			Self::DefectDojo(client) => Some(client),
+		}
+	}
 }
 
 impl ReportStore {
@@ -65,20 +107,14 @@ impl ReportStore {
 
 	pub(crate) async fn create(
 		&self,
-		context: &PolicyContext,
-		report: &BlockReport,
+		report: &TrustReport,
 	) -> io::Result<CreatedReport> {
 		self.cleanup_if_due().await?;
 
-		let id = Uuid::new_v4();
-		let timestamp = OffsetDateTime::now_utc()
-			.format(&Rfc3339)
-			.unwrap_or_else(|_| {
-				OffsetDateTime::now_utc().unix_timestamp().to_string()
-			});
-		let html = render_report(&timestamp, context, report);
-		let final_path = self.report_path(id);
-		let temporary_path = self.directory.join(format!(".{id}.html.tmp"));
+		let html = render_report(report);
+		let final_path = self.report_path(report.id);
+		let temporary_path =
+			self.directory.join(format!(".{}.html.tmp", report.id));
 
 		let write_result = async {
 			let mut file = tokio::fs::OpenOptions::new()
@@ -100,8 +136,9 @@ impl ReportStore {
 
 		Ok(CreatedReport {
 			url: format!(
-				"{}/trust/reports/{id}",
-				self.base_url.trim_end_matches('/')
+				"{}/trust/reports/{}",
+				self.base_url.trim_end_matches('/'),
+				report.id
 			),
 		})
 	}
@@ -222,7 +259,16 @@ pub(crate) async fn serve_report(
 	State(state): State<Arc<AppState>>,
 	AxumPath(id): AxumPath<String>,
 ) -> Response<Body> {
-	let response = match state.report_store.read(&id).await {
+	let Some(store) = state.report_backend.local_store() else {
+		return with_security_headers(
+			Response::builder()
+				.status(StatusCode::NOT_FOUND)
+				.header(CONTENT_TYPE, "text/plain; charset=utf-8")
+				.body(Body::from("Trust report not found\n"))
+				.expect("static Trust not-found response is valid"),
+		);
+	};
+	let response = match store.read(&id).await {
 		Ok(Some(contents)) => Response::builder()
 			.status(StatusCode::OK)
 			.header(CONTENT_TYPE, "text/html; charset=utf-8")
@@ -296,12 +342,10 @@ fn is_expired(modified: SystemTime, retention: Duration) -> bool {
 		.is_ok_and(|age| age >= retention)
 }
 
-fn render_report(
-	timestamp: &str,
-	context: &PolicyContext,
-	report: &BlockReport,
-) -> String {
-	let counts = SeverityCounts::from_vulnerabilities(&report.vulnerabilities);
+fn render_report(report: &TrustReport) -> String {
+	let block = &report.block;
+	let context = &report.context;
+	let counts = report.severity_counts;
 	let mut html = String::with_capacity(12_000);
 	html.push_str(
 		r#"<!doctype html>
@@ -327,8 +371,14 @@ fn render_report(
 <main><h1>Download blocked</h1><p class="lede">This report explains the enforced security decision.</p>
 <section class="panel" aria-labelledby="decision-heading"><h2 id="decision-heading">Decision</h2><dl class="facts">"#,
 	);
-	fact(&mut html, "Blocked at", timestamp);
-	fact(&mut html, "Target", &report.target.display_name());
+	fact(&mut html, "Blocked at", &report.created_at);
+	fact(&mut html, "Report UUID", &report.id.to_string());
+	fact(
+		&mut html,
+		"Requester",
+		report.requester.as_deref().unwrap_or("Unavailable"),
+	);
+	fact(&mut html, "Target", &block.target.display_name());
 	fact(&mut html, "Repository", &context.repository);
 	fact(&mut html, "Format", &context.format);
 	fact(
@@ -339,13 +389,13 @@ fn render_report(
 	fact(
 		&mut html,
 		"Policy",
-		report
+		block
 			.policy_id
 			.as_deref()
 			.unwrap_or("Unsupported target policy"),
 	);
 	html.push_str("</dl><p class=\"reason\">");
-	escape_into(&mut html, &report.reason);
+	escape_into(&mut html, &block.reason);
 	html.push_str("</p></section>");
 
 	html.push_str(
@@ -362,13 +412,13 @@ fn render_report(
 	html.push_str(
 		"<section class=\"panel\" aria-labelledby=\"violations-heading\"><h2 id=\"violations-heading\">Policy violations</h2>",
 	);
-	if report.policy_violations.is_empty() {
+	if block.policy_violations.is_empty() {
 		html.push_str(
 			"<p class=\"empty\">No policy violation details were provided.</p>",
 		);
 	} else {
 		html.push_str("<ul class=\"violations\">");
-		for violation in &report.policy_violations {
+		for violation in &block.policy_violations {
 			html.push_str("<li>");
 			escape_into(&mut html, &violation.reason);
 			html.push_str("</li>");
@@ -380,13 +430,14 @@ fn render_report(
 	html.push_str(
 		"<section class=\"panel\" aria-labelledby=\"vulnerabilities-heading\"><h2 id=\"vulnerabilities-heading\">Block-relevant vulnerabilities</h2>",
 	);
-	if report.vulnerabilities.is_empty() {
+	if block.vulnerabilities.is_empty() {
 		html.push_str(
 			"<p class=\"empty\">No vulnerabilities are associated with this block.</p>",
 		);
 	} else {
-		for vulnerability in &report.vulnerabilities {
-			vulnerability_details(&mut html, vulnerability);
+		let target = block.target.display_name();
+		for vulnerability in &block.vulnerabilities {
+			vulnerability_details(&mut html, vulnerability, &target);
 		}
 	}
 	html.push_str(
@@ -414,7 +465,11 @@ fn count(html: &mut String, label: &str, value: usize) {
 	html.push_str("</span></div>");
 }
 
-fn vulnerability_details(html: &mut String, vulnerability: &Vulnerability) {
+fn vulnerability_details(
+	html: &mut String,
+	vulnerability: &Vulnerability,
+	target: &str,
+) {
 	let severity = vulnerability.severity.map_or("UNKNOWN", Severity::as_str);
 	html.push_str("<details><summary>");
 	escape_into(html, &vulnerability.id);
@@ -433,6 +488,25 @@ fn vulnerability_details(html: &mut String, vulnerability: &Vulnerability) {
 		html,
 		"Summary",
 		vulnerability.summary.as_deref().unwrap_or("Not provided"),
+	);
+	fact_row(
+		html,
+		"Component",
+		vulnerability.component_name.as_deref().unwrap_or(target),
+	);
+	fact_row(
+		html,
+		"Component version",
+		vulnerability
+			.component_version
+			.as_deref()
+			.unwrap_or("Not provided"),
+	);
+	let mitigation = vulnerability.mitigation(target);
+	fact_row(
+		html,
+		"Mitigation",
+		mitigation.as_deref().unwrap_or("Unknown"),
 	);
 	html.push_str("<dt>Description</dt><dd class=\"description\">");
 	escape_into(
@@ -497,42 +571,12 @@ fn escape_into(output: &mut String, value: &str) {
 	}
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SeverityCounts {
-	total: usize,
-	critical: usize,
-	high: usize,
-	medium: usize,
-	low: usize,
-	unknown: usize,
-}
-
-impl SeverityCounts {
-	fn from_vulnerabilities(vulnerabilities: &[Vulnerability]) -> Self {
-		let mut counts = Self {
-			total: vulnerabilities.len(),
-			..Self::default()
-		};
-
-		for vulnerability in vulnerabilities {
-			match vulnerability.severity {
-				Some(Severity::Critical) => counts.critical += 1,
-				Some(Severity::High) => counts.high += 1,
-				Some(Severity::Medium) => counts.medium += 1,
-				Some(Severity::Low) => counts.low += 1,
-				None => counts.unknown += 1,
-			}
-		}
-
-		counts
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use nexus_sec_proxy_security::{
-		PackageCoordinate, PolicyViolation, ScanTarget,
+		BlockReport, PackageCoordinate, PolicyContext, PolicyViolation,
+		ScanTarget, SeverityCounts,
 	};
 
 	fn report() -> BlockReport {
@@ -564,6 +608,9 @@ mod tests {
 							kind: None,
 						},
 					],
+					component_name: Some("unsafe-package".to_owned()),
+					component_version: Some("1.0.0".to_owned()),
+					fixed_versions: vec!["1.0.1".to_owned()],
 				},
 				Vulnerability {
 					id: "UNKNOWN-1".to_owned(),
@@ -572,6 +619,9 @@ mod tests {
 					details: None,
 					severity: None,
 					references: Vec::new(),
+					component_name: None,
+					component_version: None,
+					fixed_versions: Vec::new(),
 				},
 			],
 		}
@@ -580,7 +630,9 @@ mod tests {
 	#[test]
 	fn renders_complete_safe_responsive_report() {
 		let context = PolicyContext::new("npm-proxy", "npm", Some("platform"));
-		let html = render_report("2026-06-25T00:00:00Z", &context, &report());
+		let report =
+			TrustReport::new(context, report()).with_requester("alice");
+		let html = render_report(&report);
 
 		assert!(html.contains("Shield with lock"));
 		assert!(html.contains("<span>Trust</span>"));
@@ -596,6 +648,10 @@ mod tests {
 		assert!(html.contains("<strong>2</strong><span>Total"));
 		assert!(html.contains("<strong>1</strong><span>Critical"));
 		assert!(html.contains("<strong>1</strong><span>Unknown"));
+		assert!(html.contains("alice"));
+		assert!(
+			html.contains("Upgrade unsafe-package to a fixed version: 1.0.1")
+		);
 	}
 
 	#[test]
@@ -625,6 +681,9 @@ mod tests {
 			details: None,
 			severity,
 			references: Vec::new(),
+			component_name: None,
+			component_version: None,
+			fixed_versions: Vec::new(),
 		})
 		.collect::<Vec<_>>();
 
@@ -653,8 +712,10 @@ mod tests {
 		.unwrap();
 		let context = PolicyContext::new("npm-proxy", "npm", None::<String>);
 
-		let first = store.create(&context, &report()).await.unwrap();
-		let second = store.create(&context, &report()).await.unwrap();
+		let first_report = TrustReport::new(context.clone(), report());
+		let second_report = TrustReport::new(context, report());
+		let first = store.create(&first_report).await.unwrap();
+		let second = store.create(&second_report).await.unwrap();
 
 		assert_ne!(first.url, second.url);
 		let first_id = first.url.rsplit('/').next().unwrap();
@@ -682,7 +743,8 @@ mod tests {
 		assert!(!stale_path.exists());
 
 		let context = PolicyContext::new("npm-proxy", "npm", None::<String>);
-		let created = store.create(&context, &report()).await.unwrap();
+		let report = TrustReport::new(context, report());
+		let created = store.create(&report).await.unwrap();
 		let id = created.url.rsplit('/').next().unwrap();
 		assert!(store.read(id).await.unwrap().is_none());
 		assert_eq!(std::fs::read_dir(store.directory()).unwrap().count(), 0);

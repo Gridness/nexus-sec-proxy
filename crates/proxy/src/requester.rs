@@ -1,24 +1,17 @@
-#[cfg(feature = "yandex-messenger")]
 use axum::body::Body;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, Uri};
-#[cfg(feature = "yandex-messenger")]
 use axum::http::{Response, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde::Deserialize;
-#[cfg(feature = "yandex-messenger")]
 use tracing::{error, warn};
 
-#[cfg(feature = "yandex-messenger")]
 use crate::gateway::{build_nexus_url, response_from_nexus};
-#[cfg(feature = "yandex-messenger")]
 use crate::responses::response_with_text;
-#[cfg(feature = "yandex-messenger")]
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "yandex-messenger"), allow(dead_code))]
 pub(crate) enum Requester {
 	Basic {
 		user_id: Option<String>,
@@ -96,14 +89,10 @@ pub(crate) fn basic_auth_username(headers: &HeaderMap) -> Option<String> {
 	Some(username.to_owned())
 }
 
-#[cfg(feature = "yandex-messenger")]
-pub(crate) async fn messenger_recipient(
+pub(crate) async fn verify_requester(
 	state: &AppState,
 	requester: Option<&Requester>,
 ) -> Result<Option<String>, Box<Response<Body>>> {
-	if state.yandex_messenger.is_none() {
-		return Ok(None);
-	}
 	let Some(requester) = requester else {
 		return Ok(None);
 	};
@@ -165,7 +154,18 @@ pub(crate) async fn messenger_recipient(
 		Requester::DockerBearer { user_id } => user_id,
 	};
 
-	Ok(resolve_nexus_email(state, user_id).await)
+	Ok(Some(user_id.to_owned()))
+}
+
+#[cfg(feature = "yandex-messenger")]
+pub(crate) async fn messenger_recipient(
+	state: &AppState,
+	requester: Option<&str>,
+) -> Option<String> {
+	state.yandex_messenger.as_ref()?;
+	let requester = requester?;
+
+	resolve_nexus_email(state, requester).await
 }
 
 #[cfg(feature = "yandex-messenger")]

@@ -157,6 +157,9 @@ fn vulnerability(id: &str) -> Vulnerability {
 		details: None,
 		severity: None,
 		references: Vec::new(),
+		component_name: None,
+		component_version: None,
+		fixed_versions: Vec::new(),
 	}
 }
 
@@ -168,5 +171,8 @@ fn vulnerability_with_severity(id: &str, severity: Severity) -> Vulnerability {
 		details: None,
 		severity: Some(severity),
 		references: Vec::new(),
+		component_name: None,
+		component_version: None,
+		fixed_versions: Vec::new(),
 	}
 }

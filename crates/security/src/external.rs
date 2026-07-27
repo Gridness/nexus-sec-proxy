@@ -6,6 +6,7 @@ use tokio::process::Command;
 use tokio::time as tokio_time;
 
 use crate::osv::severity_from_text_or_score;
+use crate::vulnerability::normalized_fixed_versions;
 use crate::{Reference, ScanTarget, SecurityError, Vulnerability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +176,8 @@ fn trivy_to_vulnerability(
 	target: &ScanTarget,
 	vulnerability: TrivyVulnerability,
 ) -> Vulnerability {
+	let component_name = (!vulnerability.pkg_name.trim().is_empty())
+		.then(|| vulnerability.pkg_name.clone());
 	let mut aliases = vulnerability.cve_ids;
 	for id in vulnerability
 		.references
@@ -225,6 +228,9 @@ fn trivy_to_vulnerability(
 			.as_deref()
 			.and_then(severity_from_text_or_score),
 		references,
+		component_name,
+		component_version: vulnerability.installed_version,
+		fixed_versions: normalized_fixed_versions(vulnerability.fixed_version),
 	}
 }
 
@@ -256,6 +262,10 @@ struct TrivyVulnerability {
 	vulnerability_id: String,
 	#[serde(default, rename = "PkgName")]
 	pkg_name: String,
+	#[serde(rename = "InstalledVersion")]
+	installed_version: Option<String>,
+	#[serde(rename = "FixedVersion")]
+	fixed_version: Option<String>,
 	#[serde(rename = "Title")]
 	title: Option<String>,
 	#[serde(rename = "Description")]

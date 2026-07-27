@@ -17,8 +17,20 @@ The Requester's Nexus email address, used as the full Yandex login when addressi
 _Avoid_: Basic Auth username, Nexus user ID
 
 **Trust Report**:
-A persisted explanation of an enforced artifact block. Its creation and availability do not depend on notification delivery.
+A persisted explanation of one enforced artifact block, including its verified Requester when available and scanner-supported Mitigation. Repeated blocked requests produce distinct Trust Reports, and report creation does not depend on notification delivery.
 _Avoid_: Notification, message
+
+**Reporting Engagement**:
+The pre-existing DefectDojo container that owns the Trust Reports produced by one proxy deployment.
+_Avoid_: Product, Test, dynamically created engagement
+
+**Mitigation**:
+A scanner-supported action that addresses a vulnerability, such as upgrading to a reported fixed version. Missing mitigation data means unknown, not that no fix exists.
+_Avoid_: Guessed remediation, policy exception
+
+**Policy Finding**:
+An issue recorded because an artifact could not be evaluated under the active policy, rather than because a vulnerability was identified.
+_Avoid_: Vulnerability, scanner finding
 
 **Security Notification**:
 A best-effort Yandex message that alerts a Recipient to an enforced block and links to its Trust Report. Its delivery never affects the block or report.

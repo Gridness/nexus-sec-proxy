@@ -87,7 +87,7 @@ struct YandexRetryMockState {
 	attempts: Arc<AtomicUsize>,
 }
 
-async fn spawn_server(app: Router) -> Url {
+pub(crate) async fn spawn_server(app: Router) -> Url {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
 	tokio::spawn(async move {
@@ -1268,7 +1268,7 @@ async fn blocked_package_without_basic_auth_skips_yandex_notification() {
 
 	assert_eq!(response.status(), StatusCode::FORBIDDEN);
 	assert_eq!(yandex_records.lock().unwrap().len(), 0);
-	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert!(nexus_records.lock().unwrap().is_empty());
 	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
 }
 
@@ -1417,9 +1417,11 @@ async fn rejected_basic_credentials_return_nexus_response_without_report_or_mess
 	assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 	assert!(state.decision_log.list(10).is_empty());
 	assert_eq!(
-		std::fs::read_dir(state.report_store.directory())
-			.unwrap()
-			.count(),
+		std::fs::read_dir(
+			state.report_backend.local_store().unwrap().directory(),
+		)
+		.unwrap()
+		.count(),
 		0
 	);
 	assert!(yandex_records.lock().unwrap().is_empty());
@@ -1490,8 +1492,31 @@ async fn yandex_config_is_ignored_when_feature_disabled() {
 
 	assert_eq!(response.status(), StatusCode::FORBIDDEN);
 	assert_eq!(yandex_records.lock().unwrap().len(), 0);
-	assert_eq!(nexus_records.lock().unwrap().len(), 0);
+	assert_eq!(nexus_records.lock().unwrap().len(), 1);
+	assert_eq!(nexus_records.lock().unwrap()[0].method, Method::HEAD);
 	assert_eq!(osv_count.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(not(feature = "defectdojo"))]
+#[test]
+fn defectdojo_activation_requires_the_compiled_feature() {
+	let mut config = test_config(
+		None,
+		None,
+		PolicySet::default(),
+		"http://127.0.0.1:9",
+		"http://127.0.0.1:9/osv",
+		UnsupportedTargetPolicy::Allow,
+	);
+	config.defectdojo_enabled = true;
+
+	let error = validate_compiled_integrations(&config).unwrap_err();
+
+	assert!(
+		error
+			.to_string()
+			.contains("built without the defectdojo feature")
+	);
 }
 
 #[tokio::test]
@@ -1551,9 +1576,11 @@ async fn report_only_package_forwards_to_nexus_once() {
 	);
 	assert_eq!(state.decision_log.list(10)[0].report_url, None);
 	assert_eq!(
-		std::fs::read_dir(state.report_store.directory())
-			.unwrap()
-			.count(),
+		std::fs::read_dir(
+			state.report_backend.local_store().unwrap().directory(),
+		)
+		.unwrap()
+		.count(),
 		0
 	);
 }
@@ -3121,7 +3148,12 @@ async fn policy_evaluation_records_blocked_and_report_only_decisions() {
 #[tokio::test]
 async fn report_write_failure_returns_503_without_recording_block() {
 	let state = test_state(None, None, PolicySet::default());
-	let report_directory = state.report_store.directory().to_owned();
+	let report_directory = state
+		.report_backend
+		.local_store()
+		.unwrap()
+		.directory()
+		.to_owned();
 	std::fs::remove_dir_all(&report_directory).unwrap();
 	std::fs::write(&report_directory, "not a directory").unwrap();
 	let active_policy = state.active_policy();
@@ -3316,7 +3348,12 @@ async fn healthz_fails_when_trust_report_storage_is_unwritable() {
 		UnsupportedTargetPolicy::Allow,
 		vec![test_repository("npm-proxy", "npm", Some("npm"))],
 	);
-	let report_directory = state.report_store.directory().to_owned();
+	let report_directory = state
+		.report_backend
+		.local_store()
+		.unwrap()
+		.directory()
+		.to_owned();
 	std::fs::remove_dir_all(&report_directory).unwrap();
 	std::fs::write(&report_directory, "not a directory").unwrap();
 
@@ -3643,7 +3680,7 @@ JSON
 	std::fs::set_permissions(path, permissions).unwrap();
 }
 
-async fn response_text(response: Response<Body>) -> String {
+pub(crate) async fn response_text(response: Response<Body>) -> String {
 	let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
 	String::from_utf8(bytes.to_vec()).unwrap()
@@ -3848,7 +3885,11 @@ fn test_config(
 		yandex_messenger_api_url: "https://botapi.messenger.yandex.net"
 			.to_owned(),
 		yandex_messenger_enabled: false,
-		trust_base_url: "https://proxy.example.invalid".to_owned(),
+		defectdojo_enabled: false,
+		defectdojo_url: None,
+		defectdojo_token: None,
+		defectdojo_engagement_id: None,
+		trust_base_url: Some("https://proxy.example.invalid".to_owned()),
 		trust_report_dir: "/tmp/nexus-sec-proxy-test-reports".to_owned(),
 		trust_report_retention_days: 30,
 		log_json: false,
@@ -3871,7 +3912,7 @@ fn test_config(
 	}
 }
 
-fn test_state(
+pub(crate) fn test_state(
 	admin_token: Option<&str>,
 	policy_file: Option<String>,
 	policy_set: PolicySet,
@@ -3949,14 +3990,14 @@ fn test_state_from_config(
 		))),
 		repository_catalog_reload: Arc::new(AsyncMutex::new(())),
 		decision_log: DecisionLog::new(100),
-		report_store: {
+		report_backend: crate::trust_reports::ReportBackend::Local({
 			let directory = tempfile::tempdir().unwrap().keep();
 			crate::trust_reports::ReportStore::for_test(
 				directory,
 				"https://proxy.example.invalid",
 				30,
 			)
-		},
+		}),
 		started_at: Instant::now(),
 		started_at_rfc3339: now_rfc3339(),
 	})
@@ -3970,5 +4011,8 @@ fn vulnerability(id: &str, severity: Severity) -> Vulnerability {
 		details: None,
 		severity: Some(severity),
 		references: Vec::new(),
+		component_name: None,
+		component_version: None,
+		fixed_versions: Vec::new(),
 	}
 }

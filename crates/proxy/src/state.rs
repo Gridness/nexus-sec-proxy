@@ -16,7 +16,7 @@ use url::Url;
 use crate::catalog::{RepositoryCatalog, load_repository_catalog};
 use crate::decisions::DecisionLog;
 use crate::time_utils::now_rfc3339;
-use crate::trust_reports::ReportStore;
+use crate::trust_reports::ReportBackend;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -32,7 +32,7 @@ pub(crate) struct AppState {
 	pub(crate) repository_catalog: Arc<RwLock<Arc<RepositoryCatalog>>>,
 	pub(crate) repository_catalog_reload: Arc<Mutex<()>>,
 	pub(crate) decision_log: DecisionLog,
-	pub(crate) report_store: ReportStore,
+	pub(crate) report_backend: ReportBackend,
 	pub(crate) started_at: Instant,
 	pub(crate) started_at_rfc3339: String,
 }

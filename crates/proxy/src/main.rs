@@ -17,6 +17,8 @@ mod trust_reports;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+#[cfg(feature = "defectdojo")]
+use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use nexus_sec_proxy_cache::MokaScanCache;
 use nexus_sec_proxy_config::{AppConfig, ArtifactScannerKind};
+#[cfg(feature = "defectdojo")]
+use nexus_sec_proxy_defectdojo::{DefectDojoClient, DefectDojoConfig};
 use nexus_sec_proxy_security::OsvClient;
 #[cfg(feature = "yandex-messenger")]
 use nexus_sec_proxy_yandex_messenger::{
@@ -56,7 +60,7 @@ use crate::scanner_db::{ScannerDbStatus, scanner_db_summary_from_env};
 use crate::state::{ActivePolicy, AppState};
 use crate::time_utils::now_rfc3339;
 use crate::tracing_setup::{env_log_json, init_tracing};
-use crate::trust_reports::{ReportStore, serve_report};
+use crate::trust_reports::{ReportBackend, ReportStore, serve_report};
 
 #[cfg(test)]
 pub(crate) use crate::catalog::{
@@ -90,25 +94,10 @@ async fn main() -> anyhow::Result<()> {
 		error!(%error, "failed to load configuration");
 		anyhow::Error::new(error).context("failed to load configuration")
 	})?;
-	#[cfg(not(feature = "yandex-messenger"))]
-	if config.yandex_messenger_enabled {
-		anyhow::bail!(
-			"Yandex Messenger is enabled but this binary was built without the yandex-messenger feature"
-		);
-	}
+	validate_compiled_integrations(&config)?;
+
 	let bind_addr = config.bind_addr;
-	let report_store = ReportStore::initialize(
-		&config.trust_report_dir,
-		&config.trust_base_url,
-		config.trust_report_retention_days,
-	)
-	.await
-	.with_context(|| {
-		format!(
-			"failed to initialize Trust report directory {}",
-			config.trust_report_dir
-		)
-	})?;
+
 	let nexus_base_url =
 		Url::parse(&config.nexus_base_url).with_context(|| {
 			format!("invalid Nexus base URL: {}", config.nexus_base_url)
@@ -117,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
 		.timeout(Duration::from_secs(config.request_timeout_secs))
 		.build()
 		.context("failed to build HTTP client")?;
+	let report_backend =
+		report_backend_from_config(&config, http_client.clone()).await?;
 	let repository_catalog =
 		load_repository_catalog(&http_client, &nexus_base_url, &config, 1)
 			.await
@@ -153,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
 		repository_catalog: Arc::new(RwLock::new(Arc::new(repository_catalog))),
 		repository_catalog_reload: Arc::new(Mutex::new(())),
 		decision_log: DecisionLog::new(100),
-		report_store,
+		report_backend,
 		started_at,
 		started_at_rfc3339,
 	});
@@ -176,7 +167,11 @@ async fn main() -> anyhow::Result<()> {
 		unsupported_target_policy = ?state.config.unsupported_target_policy,
 		artifact_scanner_formats = ?state.config.artifact_scanner_formats,
 		cache_max_capacity = state.config.cache_max_capacity,
-		trust_base_url = %state.config.trust_base_url,
+		defectdojo_available = cfg!(feature = "defectdojo"),
+		defectdojo_enabled = state.config.defectdojo_enabled,
+		defectdojo_url = ?state.config.defectdojo_url,
+		defectdojo_engagement_id = ?state.config.defectdojo_engagement_id,
+		trust_base_url = ?state.config.trust_base_url,
 		trust_report_dir = %state.config.trust_report_dir,
 		trust_report_retention_days = state.config.trust_report_retention_days,
 		"starting nexus security proxy"
@@ -215,6 +210,73 @@ async fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+fn validate_compiled_integrations(_config: &AppConfig) -> anyhow::Result<()> {
+	#[cfg(not(feature = "yandex-messenger"))]
+	if _config.yandex_messenger_enabled {
+		anyhow::bail!(
+			"Yandex Messenger is enabled but this binary was built without the yandex-messenger feature"
+		);
+	}
+	#[cfg(not(feature = "defectdojo"))]
+	if _config.defectdojo_enabled {
+		anyhow::bail!(
+			"DefectDojo is enabled but this binary was built without the defectdojo feature"
+		);
+	}
+	Ok(())
+}
+
+async fn report_backend_from_config(
+	config: &AppConfig,
+	_http_client: reqwest::Client,
+) -> anyhow::Result<ReportBackend> {
+	if config.defectdojo_enabled {
+		#[cfg(feature = "defectdojo")]
+		{
+			let base_url = Url::parse(
+				config
+					.defectdojo_url
+					.as_deref()
+					.context("DefectDojo URL is missing")?,
+			)
+			.context("invalid DefectDojo URL")?;
+			let token = config
+				.defectdojo_token
+				.clone()
+				.context("DefectDojo token is missing")?;
+			let engagement_id = NonZeroU64::new(
+				config
+					.defectdojo_engagement_id
+					.context("DefectDojo Engagement ID is missing")?,
+			)
+			.context("DefectDojo Engagement ID must be positive")?;
+			return Ok(ReportBackend::DefectDojo(DefectDojoClient::new(
+				DefectDojoConfig::new(base_url, token, engagement_id),
+				_http_client,
+			)));
+		}
+		#[cfg(not(feature = "defectdojo"))]
+		unreachable!("featureless DefectDojo activation was rejected");
+	}
+
+	let store = ReportStore::initialize(
+		&config.trust_report_dir,
+		config
+			.trust_base_url
+			.as_deref()
+			.context("Trust report base URL is missing")?,
+		config.trust_report_retention_days,
+	)
+	.await
+	.with_context(|| {
+		format!(
+			"failed to initialize Trust report directory {}",
+			config.trust_report_dir
+		)
+	})?;
+	Ok(ReportBackend::Local(store))
+}
+
 #[cfg(feature = "yandex-messenger")]
 async fn yandex_messenger_from_config(
 	config: &AppConfig,
@@ -246,9 +308,12 @@ async fn yandex_messenger_from_config(
 }
 
 fn build_app(state: Arc<AppState>) -> Router {
-	let app = Router::new()
-		.route("/healthz", get(healthz))
-		.route("/trust/reports/{id}", get(serve_report));
+	let app = Router::new().route("/healthz", get(healthz));
+	let app = if state.report_backend.local_store().is_some() {
+		app.route("/trust/reports/{id}", get(serve_report))
+	} else {
+		app
+	};
 	let app = if state.config.admin_token.is_some() {
 		app.route("/admin", get(admin_ui))
 			.route("/admin/api/status", get(admin_status))
@@ -331,7 +396,14 @@ fn timed_out_health_checks(
 
 	BTreeMap::from([
 		("nexus", "failed"),
-		("trust_reports", "failed"),
+		(
+			"trust_reports",
+			if state.report_backend.local_store().is_some() {
+				"failed"
+			} else {
+				"unused"
+			},
+		),
 		(
 			"docker_registry",
 			if state.config.docker_registry_configured() {
@@ -369,7 +441,10 @@ async fn check_nexus(state: Arc<AppState>) -> &'static str {
 }
 
 async fn check_trust_reports(state: Arc<AppState>) -> &'static str {
-	match state.report_store.verify_writable().await {
+	let Some(store) = state.report_backend.local_store() else {
+		return "unused";
+	};
+	match store.verify_writable().await {
 		Ok(()) => "ok",
 		Err(error) => {
 			error!(%error, "Trust report storage health check failed");
@@ -572,5 +647,8 @@ async fn shutdown_signal() {
 	}
 }
 
+#[cfg(all(test, feature = "defectdojo"))]
+#[path = "defectdojo_tests.rs"]
+mod defectdojo_tests;
 #[cfg(test)]
 mod tests;

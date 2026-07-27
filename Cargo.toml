@@ -2,6 +2,7 @@
 members = [
 	"crates/cache",
 	"crates/config",
+	"crates/defectdojo",
 	"crates/proxy",
 	"crates/security",
 	"crates/yandex-messenger",
@@ -21,6 +22,7 @@ base64 = "0.22.1"
 futures-util = "0.3.31"
 moka = { version = "0.12.10", features = ["future"] }
 percent-encoding = "2.3.1"
+pretty_assertions = "1.4.1"
 reqwest = { version = "0.12.20", default-features = false, features = [
 	"json",
 	"rustls-tls",
@@ -57,7 +59,7 @@ tracing-subscriber = { version = "0.3.19", features = [
 	"json",
 ] }
 url = "2.5.4"
-uuid = { version = "1.23.3", features = ["v4"] }
+uuid = { version = "1.23.3", features = ["serde", "v4", "v5"] }
 
 [profile.release]
 opt-level = "s"

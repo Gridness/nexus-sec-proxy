@@ -5,6 +5,7 @@ mod osv;
 mod policy;
 mod severity;
 mod target;
+mod trust_report;
 mod vulnerability;
 
 pub use error::SecurityError;
@@ -16,6 +17,7 @@ pub use target::{
 	ArtifactTarget, PackageCoordinate, PackageIdentity, ScanTarget,
 	default_osv_ecosystem_for_format,
 };
+pub use trust_report::{SeverityCounts, TrustReport};
 pub use vulnerability::{Reference, Vulnerability};
 
 #[cfg(test)]

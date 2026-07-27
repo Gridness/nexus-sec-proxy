@@ -16,8 +16,8 @@ Request flow:
    through.
 5. `GET` and `HEAD` package downloads are classified from the stripped
    repository path and checked through OSV plus the active policy.
-6. Enforced blocks create a self-contained Trust report and return
-   `403 Forbidden` with its secret URL before Nexus receives the request.
+6. Enforced blocks create an authoritative local or DefectDojo Trust Report
+   and return `403 Forbidden` with its URL before Nexus receives the request.
 7. Report-only and allowed package requests are forwarded to Nexus.
 8. When Docker registry mode is configured, root `/v2/...` pull requests are
    sent to the Nexus Docker connector. Ping, tag, blob, and manifest-list
@@ -45,9 +45,9 @@ curl http://127.0.0.1:3000/healthz
 ```
 
 `/healthz` returns readiness JSON with `200 OK` when Nexus catalog access,
-Trust report storage, the configured Docker registry connector, and every
-active mapped scanner are healthy. It returns `503 Service Unavailable` when
-any required check fails. OSV is not probed.
+local Trust Report storage, the configured Docker registry connector, and
+every active mapped scanner are healthy. It returns `503 Service Unavailable`
+when any required check fails. OSV and DefectDojo are not probed.
 
 The binary reports the Cargo workspace version without loading runtime
 configuration:
@@ -66,7 +66,7 @@ Choose an exact release and configure the required endpoints before starting:
 
 ```bash
 cp .env.example .env
-# Edit .env, especially NEXUS_SEC_PROXY_VERSION and both required URLs.
+# Edit .env, especially the version, Nexus URL, and reporting backend settings.
 docker compose pull
 docker compose up -d
 ```
@@ -108,10 +108,15 @@ See [the release process and one-time repository settings](docs/releases.md).
 
 ## Core Configuration
 
-Required:
+Always required:
 
 ```bash
 NEXUS_SEC_PROXY_NEXUS_BASE_URL=http://nexus:8081
+```
+
+Required in local-report mode:
+
+```bash
 NEXUS_SEC_PROXY_TRUST_BASE_URL=https://proxy.example.com
 ```
 
@@ -134,6 +139,11 @@ NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_TEMPLATE_FILE=
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_API_URL=https://botapi.messenger.yandex.net
 NEXUS_SEC_PROXY_YANDEX_MESSENGER_ENABLED=false
+NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED=false
+NEXUS_SEC_PROXY_DEFECTDOJO_URL=
+NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN=
+NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN_FILE=
+NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID=
 NEXUS_SEC_PROXY_TRUST_REPORT_DIR=/var/lib/nexus-sec-proxy/trust-reports
 NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS=30
 NEXUS_SEC_PROXY_LOG_JSON=false
@@ -185,15 +195,17 @@ Configuration notes:
   `--no-default-features` rejects runtime activation instead of silently
   ignoring it.
 - `NEXUS_SEC_PROXY_NEXUS_PASSWORD_FILE` and
-  `NEXUS_SEC_PROXY_YANDEX_MESSENGER_TOKEN_FILE` read Docker/Kubernetes-style
-  mounted secret files. Do not set a direct value and its `_FILE` form at the
-  same time. One trailing LF or CRLF is removed; other bytes are preserved.
-- `NEXUS_SEC_PROXY_TRUST_BASE_URL` is the public HTTP(S) origin or base path
-  used in report links. Query strings and fragments are rejected.
-- `NEXUS_SEC_PROXY_TRUST_REPORT_DIR` must be writable. Startup fails if the
-  directory cannot be created and tested. Runtime write failures deny the
-  download with `503 Service Unavailable`.
-- Trust reports expire after
+  the Yandex and DefectDojo token `_FILE` settings read
+  Docker/Kubernetes-style mounted secret files. Do not set a direct value and
+  its `_FILE` form at the same time. One trailing LF or CRLF is removed; other
+  bytes are preserved.
+- `NEXUS_SEC_PROXY_TRUST_BASE_URL` is required only in local-report mode. It is
+  the public HTTP(S) origin or base path used in report links. Query strings
+  and fragments are rejected.
+- In local-report mode, `NEXUS_SEC_PROXY_TRUST_REPORT_DIR` must be writable.
+  Startup fails if the directory cannot be created and tested. Runtime write
+  failures deny the download with `503 Service Unavailable`.
+- Local Trust reports expire after
   `NEXUS_SEC_PROXY_TRUST_REPORT_RETENTION_DAYS` (minimum `1`, default `30`).
   Replicas on different hosts must mount the same external shared filesystem
   at the configured report directory.
@@ -385,30 +397,70 @@ name, vulnerability IDs, and exception metadata when present.
 
 ## Trust Reports
 
-Every enforced policy or unsupported-target block creates a new UUID v4 report
-at `GET /trust/reports/{uuid}`. The route does not use admin authentication:
-possession of the unguessable URL grants access until retention expiry.
-Responses disable caching and send restrictive browser security headers.
+Every enforced policy or unsupported-target block creates a new UUID v4
+report. In local mode it is served at `GET /trust/reports/{uuid}`. The route
+does not use admin authentication: possession of the unguessable URL grants
+access until retention expiry. Responses disable caching and send restrictive
+browser security headers.
 
 Reports contain the block context, policy violations, severity counts, and only
-the vulnerabilities relevant to the block. Scanner-provided text is escaped;
-only HTTP and HTTPS references become links. Report-only decisions do not
-create Trust pages. Repeated blocks from cache receive distinct URLs.
+the vulnerabilities relevant to the block, including the verified Nexus
+Requester and scanner-supported fixed versions and Mitigation. Scanner-provided
+text is escaped; only HTTP and HTTPS references become links. Report-only
+decisions do not create Trust Reports. Repeated blocks receive distinct reports.
+
+## DefectDojo Trust Reports
+
+Default builds include the `defectdojo` feature but keep it inactive. Enable it
+at runtime with:
+
+```bash
+NEXUS_SEC_PROXY_DEFECTDOJO_ENABLED=true
+NEXUS_SEC_PROXY_DEFECTDOJO_URL=https://defectdojo.example.com
+NEXUS_SEC_PROXY_DEFECTDOJO_TOKEN_FILE=/run/secrets/defectdojo-token
+NEXUS_SEC_PROXY_DEFECTDOJO_ENGAGEMENT_ID=17
+```
+
+The URL must use HTTPS; loopback HTTP is accepted for tests. The token and
+token file are mutually exclusive, and the Engagement ID must identify an
+existing Reporting Engagement. A binary built without the feature rejects
+runtime activation.
+
+For DefectDojo Open Source 3.x:
+
+1. Create the Reporting Engagement and grant the API token permission to
+   import scans into it.
+2. Trigger one test import, then configure the generated
+   `Nexus Security Proxy Scan (Generic Findings Import)` Test Type to use the
+   `Unique ID From Tool` deduplication algorithm.
+3. Confirm that setting against the exact deployed release using the
+   [Open Source deduplication guide](https://docs.defectdojo.com/triage_findings/finding_deduplication/os__deduplication_tuning/).
+
+Each enforced block synchronously posts one Generic Findings import with
+background import disabled and links the denial, decision, audit event, and
+optional Yandex message to the returned Test. Repeated blocks create separate
+Tests while stable vulnerability identities deduplicate remediation work.
+Unsupported targets create one informational Policy Finding. Import failure
+keeps the artifact denied, returns `503`, creates no local fallback, and sends
+no notification. Startup and `/healthz` never contact DefectDojo; delivery
+counters and the latest failure category are exposed through admin status.
+
+DefectDojo owns report authorization, retention, and deletion while active.
+Local report directory, base URL, and retention settings are ignored.
 
 ## Yandex Messenger Notifications
 
-Default builds include Yandex Messenger support through the
-`yandex-messenger` Cargo feature. To compile the proxy without this integration:
+Default builds include Yandex Messenger and DefectDojo support. To compile the
+proxy without either integration:
 
 ```bash
 cargo build -p nexus-sec-proxy --no-default-features
 ```
 
-The standard Docker image also includes the feature. Build a hardened image
-without it using
-`docker build --build-arg YANDEX_MESSENGER_FEATURE=false .`. In Compose, set
-`NEXUS_SEC_PROXY_YANDEX_MESSENGER_FEATURE=false` while building the image.
-Attempting to enable Messenger at runtime in that image fails startup.
+The standard Docker image also includes both features. The
+`YANDEX_MESSENGER_FEATURE` and `DEFECTDOJO_FEATURE` Boolean build arguments
+support all four combinations. Attempting to activate an integration omitted
+from the binary fails startup.
 
 When enabled, enforced block decisions trigger a best-effort private message.
 For Basic authentication, the proxy first sends `HEAD` for the exact requested
